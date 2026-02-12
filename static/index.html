@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Clinical Intake Demo</title>
+
+  <link rel="stylesheet" href="/static/styles.css" />
+  <script defer src="/static/app.js"></script>
+</head>
+
+<body>
+  <div class="wrap">
+
+    <header class="topbar">
+      <div class="title">
+        <h1>Clinical Intake Demo</h1>
+        <p>Verification → OPQRST → Clinical history → Report (with escalation support)</p>
+      </div>
+
+      <div class="controls">
+        <span class="pill" title="Session status">
+          <span id="dot" class="dot"></span>
+          <span id="statusText">No session</span>
+        </span>
+        <button class="btn primary" id="startBtn">Start Session</button>
+      </div>
+    </header>
+
+    <main class="grid">
+
+      <!-- Chat -->
+      <section class="card">
+        <header class="card-header">
+          <h2>Chat</h2>
+          <div class="meta">
+            <span>thread_id:</span>
+            <code id="tid">—</code>
+            <button class="btn small" id="copyTidBtn">Copy</button>
+          </div>
+        </header>
+
+        <div id="chat" class="chat"></div>
+
+        <form class="composer" id="composer">
+          <input id="msg" placeholder="Type your answer…" autocomplete="off" />
+          <button class="btn primary" type="submit">Send</button>
+        </form>
+      </section>
+
+      <!-- Side panel -->
+      <section class="card">
+        <header class="card-header">
+          <h2>Session</h2>
+        </header>
+
+        <div class="panel">
+          <div class="kv">
+            <div><b>Status:</b> <span id="sessStatus">—</span></div>
+            <div><b>Phase:</b> <span id="phase">—</span></div>
+            <div><b>Client msg id:</b> <span id="cmid">0</span></div>
+          </div>
+
+          <div class="actions">
+            <button class="btn" id="viewReportBtn">View Report</button>
+            <button class="btn warn" id="pendingBtn">Clinician Pending</button>
+          </div>
+
+          <div class="block">
+            <div class="label">Doctor Note (latest)</div>
+            <pre id="report">Start a session, finish intake, then click “View Report”.</pre>
+          </div>
+
+          <div class="block">
+            <div class="label">Clinician pending escalations</div>
+            <pre id="pending">Click “Clinician Pending” to load.</pre>
+          </div>
+
+          <!-- Optional resolve UI -->
+          <div class="block">
+            <div class="label">Resolve escalation (optional)</div>
+            <div class="resolve">
+              <input id="escThreadId" placeholder="thread_id" />
+              <input id="escId" placeholder="esc_id" />
+              <input id="escNote" placeholder="nurse note (optional)" />
+              <button class="btn" id="resolveBtn">Resolve</button>
+            </div>
+            <div class="hint">Use this after loading “Clinician Pending” and copying ids.</div>
+          </div>
+
+        </div>
+      </section>
+
+    </main>
+  </div>
+</body>
+</html>
