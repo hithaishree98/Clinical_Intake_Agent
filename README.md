@@ -38,7 +38,7 @@ The final output is a structured report ready for clinician review.
 
 ## How It Works 
 
-The system is built like a guided intake form with intelligence layered on top.
+### The system is built like a guided intake form with intelligence layered on top.
 
 Instead of letting AI decide what to ask next, the system moves through clearly defined phases:
 
@@ -54,7 +54,7 @@ done
 
 handoff (for emergency)
 
-Each phase is controlled by a state machine (implemented using LangGraph). This ensures:
+### Each phase is controlled by a state machine (implemented using LangGraph). This ensures:
 
 No skipped steps
 
