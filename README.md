@@ -1,9 +1,9 @@
-## Clinical_Intake_Agent
+# Clinical_Intake_Agent
 
 An AI-powered, state-driven clinical intake system designed to safely collect structured patient information, detect emergency conditions deterministically, and generate clinician-ready reports.
 This project demonstrates how to responsibly integrate LLMs into a safety-sensitive workflow using deterministic control, validation, normalization, and fallback strategies.
 
-# Why I Built This
+## Why I Built This
 
 Most AI chat systems are free-form and conversational. That approach works for general chat, but in healthcare intake, it can be unsafe.
 If a patient mentions something like chest pain or difficulty breathing, the system cannot rely on probabilistic interpretation. It must respond correctly every single time.
@@ -16,7 +16,7 @@ All AI outputs are validated before affecting state
 
 The goal was to combine AI flexibility with engineering-level reliability.
 
-# What This System Does
+## What This System Does
 
 The Clinical Intake Agent guides a patient through a structured intake flow:
 
@@ -36,7 +36,7 @@ Creates clinician review escalations when needed
 
 The final output is a structured report ready for clinician review.
 
-# How It Works 
+## How It Works 
 
 The system is built like a guided intake form with intelligence layered on top.
 
