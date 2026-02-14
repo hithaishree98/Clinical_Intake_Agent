@@ -8,31 +8,25 @@ This project demonstrates how to responsibly integrate LLMs into a safety-sensit
 Most AI chat systems are free-form and conversational. That approach works for general chat, but in healthcare intake, it can be unsafe.
 If a patient mentions something like chest pain or difficulty breathing, the system cannot rely on probabilistic interpretation. It must respond correctly every single time.
 
-So instead of building just a chatbot, I built a controlled intake workflow system where:
-
-Deterministic logic controls safety and progression
-The LLM is used only for structured language understanding
-All AI outputs are validated before affecting state
-
-The goal was to combine AI flexibility with engineering-level reliability.
+So instead of building just a chatbot, I built a controlled intake workflow system where the goal was to combine AI flexibility with engineering-level reliability.
 
 ## What This System Does
 
 The Clinical Intake Agent guides a patient through a structured intake flow:
 
-Collects identity information
+1)Collects identity information
 
-Verifies identity against stored records
+2)Verifies identity against stored records
 
-Captures chief complaint and symptom details
+3)Captures chief complaint and symptom details
 
-Collects allergies, medications, and medical history
+4)Collects allergies, medications, and medical history
 
-Detects emergencies immediately
+5)Detects emergencies immediately
 
-Generates a structured intake report
+6)Generates a structured intake report
 
-Creates clinician review escalations when needed
+7)Creates clinician review escalations when needed
 
 The final output is a structured report ready for clinician review.
 
