@@ -4,7 +4,7 @@ This project is a workflow-based clinical intake assistant built using FastAPI, 
 
 Instead of building a generic medical chatbot, I designed this as a controlled intake system that safely collects patient information step-by-step, performs deterministic triage checks, and generates a structured clinician-ready report.
 
-A typical intake process requires:
+## A typical intake process requires:
 
 Collecting identity information
 
