@@ -6,19 +6,19 @@ Instead of building a generic medical chatbot, I designed this as a controlled i
 
 ## A typical intake process requires:
 
-Collecting identity information
+- Collecting identity information
 
-Capturing symptoms in a standardized format
+- Capturing symptoms in a standardized format
 
-Recording medications and allergies
+- Recording medications and allergies
 
-Detecting urgent red flags
+- Detecting urgent red flags
 
-Confirming correctness
+- Confirming correctness
 
-Generating a usable report
+- Generating a usable report
 
-Escalating risky cases for clinician review
+- Escalating risky cases for clinician review
 
 ## Application Workflow
 
@@ -64,21 +64,21 @@ Clinicians can review the case and resolve it.
 
 ## How a User Would Use It
 
-The user starts a session.
+- The user starts a session.
 
-The assistant asks for basic identity information.
+- The assistant asks for basic identity information.
 
-The user describes symptoms in natural language.
+- The user describes symptoms in natural language.
 
-The assistant extracts structured details.
+- The assistant extracts structured details.
 
-The assistant asks one clarifying question at a time.
+- The assistant asks one clarifying question at a time.
 
-The user confirms the summary.
+- The user confirms the summary.
 
-A final report is generated.
+- A final report is generated.
 
-If urgent symptoms were detected, the case is escalated.
+- If urgent symptoms were detected, the case is escalated.
 
 The experience feels conversational, but under the hood it is controlled by a structured workflow.
 
