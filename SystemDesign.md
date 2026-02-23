@@ -1,41 +1,16 @@
 
-# Architecture
+# System Design & Architecture
 
-User
-↓
-FastAPI API Layer
-↓
-LangGraph Workflow Engine
-↓
-SQLite (WAL mode) Persistence
-↓
-LLM (Extraction + Report)
-↓
-Clinician Escalation Interface
+The system has four main layers:
 
-## Clinical intake has clear phases:
+- API Layer (FastAPI)
 
-identity → symptoms → medications → confirm → report → done
+- Workflow Layer (LangGraph state machine)
 
-## Using LangGraph allowed me to define:
+- Business Logic Nodes
 
-Explicit phases
+- Persistence Layer (SQLite + WAL)
 
-Routing logic
+- LLM Integration Layer
 
-Interrupt points
-
-Controlled transitions
-
-## I intentionally separated safety logic from model reasoning.
-
-Before any LLM call:
-
-The system runs deterministic red-flag checks
-
-If high-risk patterns are detected, escalation is triggered
-
-The normal intake flow is paused
-
-This ensures urgent routing decisions are not dependent on model interpretation.
-
+Everything revolves around a thread_id, which represents a single intake session.
