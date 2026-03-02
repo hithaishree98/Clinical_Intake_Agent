@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Clinical Intake</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/styles.css" />
+  <script defer src="/static/app.js"></script>
+</head>
+
+<body>
+  <div class="layout">
+
+    <header class="header">
+      <div class="header-left">
+        <span class="app-name">Clinical Intake</span>
+        <span class="divider"></span>
+        <span id="statusText" class="status-text">No active session</span>
+      </div>
+      <div class="header-right">
+        <span id="sessionLabel" class="session-label hidden">
+          Session: <span id="tid">—</span>
+          <button class="copy-btn" id="copyTidBtn">Copy</button>
+        </span>
+        <button class="btn primary" id="startBtn">New Session</button>
+      </div>
+    </header>
+
+    <div class="body">
+
+      <!-- Left: Chat -->
+      <section class="panel chat-panel">
+        <div class="panel-header">
+          <h2>Patient Chat</h2>
+          <div id="phaseIndicator" class="phase-indicator hidden">
+            <span class="phase-label">Phase</span>
+            <span id="phase" class="phase-value">—</span>
+          </div>
+        </div>
+
+        <div id="chat" class="chat">
+          <div class="chat-empty">
+            <p>Start a new session to begin the patient intake.</p>
+          </div>
+        </div>
+
+        <div id="typing" class="typing hidden">
+          <span></span><span></span><span></span>
+        </div>
+
+        <form class="composer" id="composer">
+          <input id="msg" placeholder="Type your response here..." autocomplete="off" disabled />
+          <button class="btn primary" id="sendBtn" type="submit" disabled>Send</button>
+        </form>
+      </section>
+
+      <!-- Right: Info panels -->
+      <aside class="sidebar">
+
+        <!-- Session status -->
+        <div class="card" id="sessionCard">
+          <div class="card-title">Session</div>
+          <div class="info-row">
+            <span class="info-label">Status</span>
+            <span id="sessStatus" class="status-badge">No session</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">Current phase</span>
+            <span id="sidePhase" class="info-value">—</span>
+          </div>
+          <button class="btn full" id="viewReportBtn">View Report</button>
+        </div>
+
+        <!-- Clinician note -->
+        <div class="card">
+          <div class="card-title">Clinician Note</div>
+          <div id="report" class="report-box">Complete the intake to generate the clinician note.</div>
+        </div>
+
+        <!-- Clinician access -->
+        <div class="card">
+          <div class="card-title">Clinician Access</div>
+
+          <div id="clinician-login">
+            <div class="input-row">
+              <input id="clinicianPwd" type="password" placeholder="Enter clinician password" />
+              <button class="btn" id="loginBtn">Login</button>
+            </div>
+          </div>
+
+          <div id="clinician-tools" class="hidden">
+            <div class="auth-badge">Authenticated as clinician</div>
+
+            <button class="btn full" id="pendingBtn">View Pending Escalations</button>
+
+            <div id="escalations-list" class="escalations hidden"></div>
+
+            <div id="resolve-form" class="resolve-form hidden">
+              <div class="form-label">Resolve Escalation</div>
+              <input id="escThreadId" placeholder="Thread ID" />
+              <input id="escId" placeholder="Escalation ID" />
+              <input id="escNote" placeholder="Nurse note (optional)" />
+              <button class="btn primary" id="resolveBtn">Resolve</button>
+            </div>
+          </div>
+        </div>
+
+      </aside>
+    </div>
+
+    <div id="toast" class="toast hidden"></div>
+
+  </div>
+</body>
+</html>
