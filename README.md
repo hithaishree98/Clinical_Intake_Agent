@@ -1,4 +1,4 @@
-# Production-Safe Clinical AI Workflow
+# Clinical AI Workflow
 
 A conversational patient intake system for clinical environments.
 
