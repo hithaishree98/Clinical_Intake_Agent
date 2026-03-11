@@ -1,20 +1,22 @@
 # Clinical AI Workflow
 
-A conversational patient intake system for clinical environments.
+A state-machine-driven conversational agent that guides patients through structured clinical intake, extracts information from natural language, triages urgency, and outputs a clinician note and FHIR R4 health record.
 
-The agent guides patients through a structured intake conversation, extracts clinical information from natural language, and generates a formatted clinician note along with a FHIR R4 Bundle ready for EHR import.
+Built on a core principle: LLM handles language, state machine handles control. 
+
+The AI extracts what patients say, it cannot skip phases, override clinical logic, or advance the workflow without deterministic validation at every step.
 
 ## Problem Context
 
-Most clinical intake today is either a paper form or a rigid dropdown-based tablet app. Both have the same problem that patients don't speak in structured fields. 
+Most clinical intake today is a paper form or a dropdown-based tablet app. Both share the same flaw that patients don't speak in structured fields.
 
-The gap between how patients naturally describe symptoms and how clinical documentation needs to be structured. This leads to errors like information gets lost, fields get left blank, clinicians spend time reformatting instead of treating.
+A patient says for example "it's been hurting on and off since Tuesday, worse when I breathe in". In this case a dropdown gives them "chest pain: yes/no". Information gets lost, fields are left blank, and clinicians spend time reformatting notes. And a static form can't detect mid-conversation that a patient is describing a medical emergency and flag it immediately.
+
+This project bridges that gap by converting natural patient language into structured clinical documentation while continuously monitoring for urgency, without forcing patients to adapt to the system.
 
 ## Why this approach
 
-In a clinical setting, an LLM alone cannot be allowed to decide what to ask, when intake is complete, or whether something is serious.
-
-A model might skip allergies, treat escalations as routine or mark intake complete while key fields are missing. These risks are unacceptable in healthcare.
+In a clinical setting, an LLM alone cannot be allowed to decide what to ask, when intake is complete or whether something is serious. A model might skip allergies, treat escalations as routine or mark intake complete while key fields are missing. In healthcare, these are not acceptable failure modes.
 
 The architecture of this system is specifically designed to prevent those failure modes. The LLM handles language understanding and extracting structure from natural text. 
 
@@ -24,46 +26,50 @@ Everything else like what to ask, what order, what constitutes an emergency, whe
 
 - Full conversational intake covering identity, chief complaint, OPQRST symptom assessment, allergies, medications, past medical history, and recent labs.
 - Emergency detection that runs before the LLM on every message. If a patient mentions chest pain or a seizure, they get immediate escalation regardless of what else they said.
-- Identity verification against an EHR record where discrepancies are flagged for nurse review automatically
-- Session crash recovery, if the server goes down mid-intake. The patient resumes exactly where they left off on their next message.
-- Structured clinician note generated at completion
-- FHIR R4 Bundle output directly compatible FHIR-compliant EHR systems.
+- Patients confirm AI-assisted intake before any data is collected.
+- Identity verification against an EHR record where discrepancies are flagged for nurse review automatically.
+- If the server goes down mid-intake, the patient resumes exactly where they left off.
+- Generates a structured clinician note and a FHIR R4 Bundle compatible with FHIR-compliant EHR systems.
 - Clinician portal for reviewing and resolving escalations.
-- Slack notifications for emergencies, identity mismatches, and completed intakes.
-- Configurable emergency phrases via admin API (when clinical protocols change)
+- Push notifications to ntfy.sh, Discord, and Slack for emergencies, identity mismatches, and completed intakes.
 
 ## How it works
 
 ```
 Patient opens the app and clicks New Session
          ↓
-Identity phase
+Consent
+  Patient is shown an AI disclosure before any data is collected
+  Must explicitly agree to continue — declining ends the session
+         ↓
+Identity
   Agent asks for name, date of birth, phone, address
-  Extracted using regex — no LLM, no silent transformation of identity data
-  Name looked up in EHR — if record found, patient asked to confirm or update
+  Extracted using regex. No LLM or no transformation of identity data
+  Name looked up in EHR. If record found, patient asked to confirm or update
   Discrepancy → escalation flagged for nurse review
          ↓
 Symptom collection
-  Red flag check runs on every message BEFORE the LLM
-  "Chest pain", "seizure", "can't breathe" → immediate handoff, Slack alert
+  Emergency check runs on every message
+  "Chest pain", "seizure", "can't breathe" → immediate escalation
+  Crisis check also runs. If self-harm phrases → 988 Lifeline response
   If clear → LLM extracts chief complaint and OPQRST fields
-  Agent asks follow-up questions until onset, severity, and chief complaint are captured
+  Agent asks follow-up questions until all key fields are captured
          ↓
 Clinical history
-  Allergies → Medications (LLM extraction) → Past medical history → Recent labs
-  Each step is sequential — none can be skipped
+  Allergies → Medications → Past medical history → Recent labs
+  Each step is sequential so none can be skipped
          ↓
 Confirm
-  Patient sees full summary of everything collected
-  Can correct any section — routes back to that phase
+  Patient reviews full summary of everything collected
+  Can correct any section, routes back to that phase
   Must explicitly confirm before proceeding
          ↓
 Report generation
   LLM generates plain text clinician note
   FHIR R4 Bundle built from the same state data
   Both saved to database
-  Slack notification fired
-  Outbound webhook posted to configured URL
+  Notifications fired to ntfy.sh, Discord, and Slack
+  FHIR Bundle posted to configured webhook URL
          ↓
 Clinician receives complete note and FHIR Bundle
 ```
@@ -85,17 +91,20 @@ Set these variables in .env
 As a patient:
 
 - Click New Session
-- Answer the agent's questions naturally — don't worry about formatting
-- At the end, review the summary and confirm
+- Read the AI disclosure and type yes to begin
+- Answer the agent's questions naturally, no need to worry about formatting
+- If you need to correct something, say so the agent will route back to that section
+- Review the full summary at the end and confirm
 - The clinician note generates automatically
 
 As a clinician:
 
-- Enter your password in the Clinician Access section of the sidebar
-- Click View Pending Escalations to see flagged cases
+- Enter your password in the Clinician Access section of the sidebar and click Auth
+- Click Pull Clinician Note to load the report for the current session
+- Click View Escalations to see all flagged cases
 - Click an escalation to populate the resolve form
-- Add a nurse note and resolve it
-
+- Add a nurse note and click Resolve
+  
 ## Tech stack
 
-FastAPI · LangGraph · Pydantic v2 · Gemini · SQLite WAL · FHIR R4 · JWT · Docker · pytest · slowapi
+FastAPI · LangGraph · Pydantic v2 · Google Gemini (google-genai) · SQLite WAL · FHIR R4 · JWT · HMAC-SHA256 · Docker · pytest · slowapi · ntfy.sh · Discord · Slack
