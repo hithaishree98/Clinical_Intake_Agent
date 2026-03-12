@@ -73,3 +73,34 @@ LangGraph is specifically helpful here - multi-stage conversations where you pau
 For a clinical intake that's collecting allergy and medication data, that reliability isn't optional. If a patient completes the allergy phase and the server crashes before the next step saves, those allergies cannot be lost. That's not a convenience argument, it's a patient safety one.
 
 One thing LangGraph makes easy to enforce is that the LLM has no control over the flow. It extracts information inside a phase but the decision of what phase comes next, when a phase is complete, and when to escalate is all deterministic code. That separation is important in a clinical context where you can't have a model deciding when enough has been collected.
+
+## System design concepts in this project
+
+**Circuit Breaker over and Exponential fallback** 
+
+I had used exponential fallback for LLM call failures before.
+
+In exponential backoff instead of retrying immediately it waits 1 second, then 2 then 4 then 8. The idea is to give API time to recover before sending requests again. If we have multiple clients sending request for this API, all the requests go through the full retry sequence of waiting, retrying, waiting, retrying before getting the fallback. But in case there's a Gemini outage then every request is still considered with complete retries with backoff before getting a response.
+
+The circuit breaker solves this. It tracks consecutive Gemini failures across all requests. After 5 failures it stops sending requests entirely and returns fallback immediately for requests after that. After 60 seconds it allows one request through, if that succeeds it detects the external service is working again and allows requests as usual else it closes again. 
+
+In production with multiple workers this matters more. Without a circuit breaker every worker independently retries every failing request. With one, the pattern is detected quickly and all workers stop retrying until the service recovers.
+
+**Retry with Full Jitter**
+
+For transient errors(429, timeout, 503) the system retries with jitter. It waits for a random amount of time between 0 and the cap before retrying.
+
+Without jitter, if 50 patients hit a rate limit at the same moment, all 50 retry at the same moment causing a second rate limit. Randomness spreads them out so they stop hitting the API simultaneously.
+
+**Graceful Degradation**
+
+Three layers inside run_json_step:
+
+If Gemini responded and the JSON is valid — return real data.
+
+If Gemini responded but the JSON failed validation — send a repair prompt back to Gemini naming the exact error and showing it its own bad output. One attempt only.
+
+If Gemini didn't respond at all, or repair also failed — use the hardcoded fallback. This preserves whatever data was already collected in state, returns a safe generic question to the patient, and keeps is_complete = False so the phase doesn't accidentally advance. 
+
+If the failure happens at report generation specifically, the report still generates directly from state data without Gemini. Allergies and medications are always included and clearly marked.
+
