@@ -1,118 +1,110 @@
-# Production-Safe Clinical AI Workflow
+# Clinical AI Workflow
 
-A state-machine-driven patient intake agent for clinical environments where AI failure has real consequences.
+A state-machine-driven conversational agent that guides patients through structured clinical intake, extracts information from natural language, triages urgency, and outputs a clinician note and FHIR R4 health record.
 
-The core design principle: **LLM handles language, state machine handles control.** The AI extracts what patients say — but it cannot skip mandatory intake fields, override clinical logic, or advance the workflow without deterministic validation at every step.
+Built on a core principle: LLM handles language, state machine handles control. 
 
----
+The AI extracts what patients say, it cannot skip phases, override clinical logic, or advance the workflow without deterministic validation at every step.
+
+## Problem Context
+
+Most clinical intake today is a paper form or a dropdown-based tablet app. Both share the same flaw that patients don't speak in structured fields.
+
+A patient says for example "it's been hurting on and off since Tuesday, worse when I breathe in". In this case a dropdown gives them "chest pain: yes/no". Information gets lost, fields are left blank, and clinicians spend time reformatting notes. And a static form can't detect mid-conversation that a patient is describing a medical emergency and flag it immediately.
+
+This project bridges that gap by converting natural patient language into structured clinical documentation while continuously monitoring for urgency, without forcing patients to adapt to the system.
+
+## Why this approach
+
+In a clinical setting, an LLM alone cannot be allowed to decide what to ask, when intake is complete or whether something is serious. A model might skip allergies, treat escalations as routine or mark intake complete while key fields are missing. In healthcare, these are not acceptable failure modes.
+
+The architecture of this system is specifically designed to prevent those failure modes. The LLM handles language understanding and extracting structure from natural text. 
+
+Everything else like what to ask, what order, what constitutes an emergency, when to escalate is deterministic code. 
 
 ## What it does
 
-A patient opens the app and is guided through a structured clinical intake:
+- Full conversational intake covering identity, chief complaint, OPQRST symptom assessment, allergies, medications, past medical history, and recent labs.
+- Emergency detection that runs before the LLM on every message. If a patient mentions chest pain or a seizure, they get immediate escalation regardless of what else they said.
+- Patients confirm AI-assisted intake before any data is collected.
+- Identity verification against an EHR record where discrepancies are flagged for nurse review automatically.
+- If the server goes down mid-intake, the patient resumes exactly where they left off.
+- Generates a structured clinician note and a FHIR R4 Bundle compatible with FHIR-compliant EHR systems.
+- Clinician portal for reviewing and resolving escalations.
+- Push notifications to ntfy.sh, Discord, and Slack for emergencies, identity mismatches, and completed intakes.
 
-1. **Identity** — name, DOB, phone, address (deterministic extraction + EHR lookup)
-2. **Symptom collection** — chief complaint + OPQRST via LLM extraction
-3. **Emergency triage** — red-flag phrase detection with negation handling (e.g. "no chest pain" does not trigger)
-4. **Clinical history** — allergies, medications (dose/freq/last taken), PMH, recent labs
-5. **Confirm** — patient reviews a summary and can correct any section
-6. **Report** — clinician note generated as plain text + FHIR R4 Bundle
-
-When complete, the clinician gets a structured note and a FHIR R4 Bundle ready for EHR import. Emergency escalations fire a Slack alert and route to a clinician review queue immediately.
-
----
-
-## Architecture
+## How it works
 
 ```
-Patient (browser)
-      │  HTTP
-      ▼
-FastAPI  ──► LangGraph state machine  ──► Gemini (LLM extraction only)
-      │            │
-      │            └── SQLite WAL (crash-safe checkpointing)
-      │
-      ├── /report/{id}        plain text clinician note
-      ├── /report/{id}/fhir   FHIR R4 Bundle (application/fhir+json)
-      ├── /clinician/pending  escalation queue (JWT-protected)
-      └── /jobs/{id}          async report generation status
+Patient opens the app and clicks New Session
+         ↓
+Consent
+  Patient is shown an AI disclosure before any data is collected
+  Must explicitly agree to continue — declining ends the session
+         ↓
+Identity
+  Agent asks for name, date of birth, phone, address
+  Extracted using regex. No LLM or no transformation of identity data
+  Name looked up in EHR. If record found, patient asked to confirm or update
+  Discrepancy → escalation flagged for nurse review
+         ↓
+Symptom collection
+  Emergency check runs on every message
+  "Chest pain", "seizure", "can't breathe" → immediate escalation
+  Crisis check also runs. If self-harm phrases → 988 Lifeline response
+  If clear → LLM extracts chief complaint and OPQRST fields
+  Agent asks follow-up questions until all key fields are captured
+         ↓
+Clinical history
+  Allergies → Medications → Past medical history → Recent labs
+  Each step is sequential so none can be skipped
+         ↓
+Confirm
+  Patient reviews full summary of everything collected
+  Can correct any section, routes back to that phase
+  Must explicitly confirm before proceeding
+         ↓
+Report generation
+  LLM generates plain text clinician note
+  FHIR R4 Bundle built from the same state data
+  Both saved to database
+  Notifications fired to ntfy.sh, Discord, and Slack
+  FHIR Bundle posted to configured webhook URL
+         ↓
+Clinician receives complete note and FHIR Bundle
 ```
 
-**Why a state machine instead of pure LLM?**
-In regulated environments, "the AI decides what happens next" is not acceptable. Every phase transition is a deterministic code path. The LLM is sandboxed to extraction — it fills fields, never drives flow.
+## Setup Instructions
 
----
+Docker and Docker Compose installed on your machine
 
-## Safety features
+Set these variables in .env
+- GEMINI_API_KEY
+- JWT_SECRET
+- CLINICIAN_PASSWORD
+- SLACK_URL
 
-| Feature | How it works |
-|---|---|
-| Pydantic validation | Every LLM output is schema-validated before it touches state |
-| SQLite WAL | Crash recovery — interrupted intakes resume exactly where they left off |
-| Emergency escalation | Red-flag detection fires before LLM sees the message; routes to clinician queue |
-| Idempotent chat | client_msg_id + request hash prevents double-processing on retry |
-| JWT clinician auth | /clinician/* routes require a signed token (24hr expiry) |
-| Rate limiting | 10 sessions/hr, 60 chat messages/min per IP via slowapi |
-| Audit trail | Every message, state snapshot, and escalation written to SQLite |
+### docker compose up --build
 
----
+## Using the app
 
-## FHIR R4 output
+As a patient:
 
-After intake completes, `GET /report/{thread_id}/fhir` returns a FHIR R4 Bundle containing:
+- Click New Session
+- Read the AI disclosure and type yes to begin
+- Answer the agent's questions naturally, no need to worry about formatting
+- If you need to correct something, say so the agent will route back to that section
+- Review the full summary at the end and confirm
+- The clinician note generates automatically
 
-- `Patient` — identity (name, DOB, phone, address)
-- `Condition` — chief complaint + OPQRST as clinical note
-- `AllergyIntolerance` — one resource per allergy
-- `MedicationStatement` — one resource per medication (dose, frequency, last taken)
-- `Observation` — triage risk level and visit type
+As a clinician:
 
-```json
-{
-  "resourceType": "Bundle",
-  "type": "document",
-  "entry": [
-    { "resource": { "resourceType": "Patient", ... } },
-    { "resource": { "resourceType": "Condition", ... } },
-    ...
-  ]
-}
-```
-
-This output is drop-in compatible with EHR systems like Epic and Cerner — no transformation required on the receiving end.
-
----
-
-## Running locally
-
-```bash
-# 1. Clone and install
-git clone https://github.com/hithaishree98/Clinical_Intake_Agent.git
-cd Clinical_Intake_Agent
-
-# 2. Set environment variables
-cp .env.example .env
-# Edit .env: add GEMINI_API_KEY, JWT_SECRET, CLINICIAN_PASSWORD
-
-# 3. Run with Docker Compose
-docker compose up
-
-# App at http://localhost:8000
-# Clinician portal: POST /clinician/token to authenticate
-```
-
-**Note:** Not deployed due to free-tier memory constraints. All functionality verified locally via Docker and pytest.
-
----
-
-## Running tests
-
-```bash
-pip install -r requirements.txt
-pytest tests/ -v
-```
-
----
-
+- Enter your password in the Clinician Access section of the sidebar and click Auth
+- Click Pull Clinician Note to load the report for the current session
+- Click View Escalations to see all flagged cases
+- Click an escalation to populate the resolve form
+- Add a nurse note and click Resolve
+  
 ## Tech stack
 
-FastAPI · LangGraph · Pydantic v2 · Gemini · SQLite WAL · FHIR R4 · JWT · Docker · pytest · slowapi
+FastAPI · LangGraph · Pydantic v2 · Google Gemini (google-genai) · SQLite WAL · FHIR R4 · JWT · HMAC-SHA256 · Docker · pytest · slowapi · ntfy.sh · Discord · Slack
