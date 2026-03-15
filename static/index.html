@@ -5,113 +5,125 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Clinical Intake</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Instrument+Serif:ital@0;1&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/styles.css" />
   <script defer src="/static/app.js"></script>
 </head>
-
 <body>
   <div class="layout">
 
     <header class="header">
-      <div class="header-left">
-        <span class="app-name">Clinical Intake</span>
-        <span class="divider"></span>
-        <span id="statusText" class="status-text">No active session</span>
+      <div class="header-brand">
+        <div class="brand-mark">+</div>
+        <span class="brand-name">Clinical<em>Intake</em></span>
       </div>
-      <div class="header-right">
-        <span id="sessionLabel" class="session-label hidden">
-          Session: <span id="tid">—</span>
-          <button class="copy-btn" id="copyTidBtn">Copy</button>
+
+      <nav class="phase-track" id="phaseTrack">
+        <div class="phase-step" data-phase="consent">Consent</div>
+        <div class="phase-step" data-phase="identity">Identity</div>
+        <div class="phase-step" data-phase="subjective">Symptoms</div>
+        <div class="phase-step" data-phase="clinical_history">History</div>
+        <div class="phase-step" data-phase="confirm">Confirm</div>
+        <div class="phase-step" data-phase="done">Complete</div>
+      </nav>
+
+      <div class="header-actions">
+        <span id="sessionLabel" class="session-id hidden">
+          <span id="tid">—</span>
+          <button class="icon-btn" id="copyTidBtn" title="Copy session ID">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+          </button>
         </span>
-        <button class="btn primary" id="startBtn">New Session</button>
+        <div id="statusDot" class="status-dot" title="No session"></div>
+        <button class="btn-primary" id="startBtn">New Session</button>
       </div>
     </header>
 
     <div class="body">
 
-      <!-- Left: Chat -->
-      <section class="panel chat-panel">
-        <div class="panel-header">
-          <h2>Patient Chat</h2>
-          <div id="phaseIndicator" class="phase-indicator hidden">
-            <span class="phase-label">Phase</span>
-            <span id="phase" class="phase-value">—</span>
-          </div>
+      <section class="chat-panel">
+        <div class="chat-meta">
+          <span class="chat-label">Patient</span>
+          <span id="statusText" class="status-text">No active session</span>
         </div>
 
         <div id="chat" class="chat">
           <div class="chat-empty">
-            <p>Start a new session to begin the patient intake.</p>
+            <div class="empty-icon">
+              <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+            </div>
+            <p>Begin a new session to start<br>the patient intake flow.</p>
           </div>
         </div>
 
         <div id="typing" class="typing hidden">
           <span></span><span></span><span></span>
+          <span class="typing-label">Processing</span>
         </div>
 
-        <form class="composer" id="composer">
-          <input id="msg" placeholder="Type your response here..." autocomplete="off" disabled />
-          <button class="btn primary" id="sendBtn" type="submit" disabled>Send</button>
-        </form>
+        <div class="composer">
+          <input id="msg" placeholder="Type your response…" autocomplete="off" disabled />
+          <button class="btn-send" id="sendBtn" type="button" disabled>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+          </button>
+        </div>
       </section>
 
-      <!-- Right: Info panels -->
       <aside class="sidebar">
 
-        <!-- Session status -->
-        <div class="card" id="sessionCard">
-          <div class="card-title">Session</div>
-          <div class="info-row">
-            <span class="info-label">Status</span>
-            <span id="sessStatus" class="status-badge">No session</span>
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title">Session</span>
+            <span id="sessStatus" class="badge">inactive</span>
           </div>
-          <div class="info-row">
-            <span class="info-label">Current phase</span>
-            <span id="sidePhase" class="info-value">—</span>
+          <div class="info-grid">
+            <span class="ig-label">Phase</span>
+            <span id="sidePhase" class="ig-value">—</span>
           </div>
-          <button class="btn full" id="viewReportBtn">View Report</button>
+          <button class="btn-outline full mt" id="viewReportBtn">Pull Clinician Note</button>
         </div>
 
-        <!-- Clinician note -->
-        <div class="card">
-          <div class="card-title">Clinician Note</div>
-          <div id="report" class="report-box">Complete the intake to generate the clinician note.</div>
+        <div class="card card-report">
+          <div class="card-header">
+            <span class="card-title">Clinician Note</span>
+            <span class="card-tag">DRAFT</span>
+          </div>
+          <pre id="report" class="report-box">Complete the intake to generate the clinician note.</pre>
         </div>
 
-        <!-- Clinician access -->
         <div class="card">
-          <div class="card-title">Clinician Access</div>
+          <div class="card-header">
+            <span class="card-title">Clinician Access</span>
+          </div>
 
           <div id="clinician-login">
-            <div class="input-row">
-              <input id="clinicianPwd" type="password" placeholder="Enter clinician password" />
-              <button class="btn" id="loginBtn">Login</button>
+            <div class="field-row">
+              <input id="clinicianPwd" type="password" placeholder="Clinician password" class="field-input" />
+              <button class="btn-outline" id="loginBtn">Auth</button>
             </div>
           </div>
 
           <div id="clinician-tools" class="hidden">
-            <div class="auth-badge">Authenticated as clinician</div>
-
-            <button class="btn full" id="pendingBtn">View Pending Escalations</button>
-
-            <div id="escalations-list" class="escalations hidden"></div>
-
+            <div class="auth-badge">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+              Clinician authenticated
+            </div>
+            <button class="btn-outline full mt-sm" id="pendingBtn">View Escalations</button>
+            <div id="escalations-list" class="esc-list hidden"></div>
             <div id="resolve-form" class="resolve-form hidden">
-              <div class="form-label">Resolve Escalation</div>
-              <input id="escThreadId" placeholder="Thread ID" />
-              <input id="escId" placeholder="Escalation ID" />
-              <input id="escNote" placeholder="Nurse note (optional)" />
-              <button class="btn primary" id="resolveBtn">Resolve</button>
+              <div class="resolve-title">Resolve Escalation</div>
+              <input class="field-input" id="escThreadId" placeholder="Thread ID" />
+              <input class="field-input" id="escId" placeholder="Escalation ID" />
+              <input class="field-input" id="escNote" placeholder="Nurse note (optional)" />
+              <button class="btn-primary small" id="resolveBtn">Resolve</button>
             </div>
           </div>
         </div>
 
       </aside>
     </div>
-
-    <div id="toast" class="toast hidden"></div>
-
   </div>
+
+  <div id="toast" class="toast hidden"></div>
 </body>
 </html>

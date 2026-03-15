@@ -15,13 +15,15 @@ PATIENTS = [
         "data_json": {
             "identity": {
                 "phone": "4125550199",
-                "address": "100 Forbes Ave, Pittsburgh, PA"
+                "address": "100 Forbes Ave, Pittsburgh, PA",
             },
             "allergies": ["penicillin"],
-            "medications": ["lisinopril 10mg daily (last dose: this morning)"],
+            "medications": [
+                {"name": "lisinopril", "dose": "10mg", "freq": "once daily", "last_taken": "this morning"},
+            ],
             "pmh": ["hypertension"],
-            "recent_results": ["CBC normal (2025-11-10)"]
-        }
+            "recent_results": ["CBC normal (2025-11-10)"],
+        },
     },
     {
         "patient_id": "demo-marcus",
@@ -30,13 +32,15 @@ PATIENTS = [
         "data_json": {
             "identity": {
                 "phone": "5550388844",
-                "address": "12 Market St, Pittsburgh, PA"
+                "address": "12 Market St, Pittsburgh, PA",
             },
             "allergies": [],
-            "medications": ["atorvastatin 40mg nightly"],
+            "medications": [
+                {"name": "atorvastatin", "dose": "40mg", "freq": "nightly", "last_taken": ""},
+            ],
             "pmh": ["coronary artery disease", "cardiac stent (2023)"],
-            "recent_results": []
-        }
+            "recent_results": [],
+        },
     },
     {
         "patient_id": "demo-nina",
@@ -45,14 +49,14 @@ PATIENTS = [
         "data_json": {
             "identity": {
                 "phone": "5557772222",
-                "address": "44 Walnut St, Chicago, IL"
+                "address": "44 Walnut St, Chicago, IL",
             },
             "allergies": [],
             "medications": [],
             "pmh": ["anxiety"],
-            "recent_results": []
-        }
-    }
+            "recent_results": [],
+        },
+    },
 ]
 
 
@@ -68,27 +72,15 @@ def _connect(db_path: str) -> sqlite3.Connection:
 def seed_patients():
     db.init_schema()
     db_path = settings.app_db_path
-
     print(f"[seed_patients] Using DB: {db_path}")
 
     with _connect(db_path) as c:
-        # Remove ONLY demo patients
         c.execute("DELETE FROM mock_ehr WHERE patient_id LIKE 'demo-%'")
-
         for p in PATIENTS:
             c.execute(
-                """
-                INSERT INTO mock_ehr (patient_id, name, history, data_json)
-                VALUES (?,?,?,?)
-                """,
-                (
-                    p["patient_id"],
-                    p["name"],
-                    p["history"],
-                    json.dumps(p["data_json"]),
-                ),
+                "INSERT INTO mock_ehr (patient_id, name, history, data_json) VALUES (?,?,?,?)",
+                (p["patient_id"], p["name"], p["history"], json.dumps(p["data_json"])),
             )
-
         c.commit()
 
     print("[seed_patients] Seeded patients:")

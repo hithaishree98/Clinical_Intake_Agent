@@ -69,7 +69,6 @@ def extract_identity_deterministic(text: str) -> Dict[str, str]:
     if any(k in t.lower() for k in [" st", " street", " ave", " avenue", " rd", " road", " blvd", " lane", " ln", " dr", " drive"]):
         out["address"] = t
 
-    # 2-3 word alphabetic string with no other fields, likely a name
     if len(t.split()) in (2, 3) and not out["address"] and not out["phone"]:
         if all(re.match(r"^[A-Za-z\-\']+$", w) for w in t.split()):
             out["name"] = t
@@ -78,10 +77,6 @@ def extract_identity_deterministic(text: str) -> Dict[str, str]:
 
 
 def _load_phrases() -> List[str]:
-    """
-    Load emergency phrases from the database.
-    Falls back to DEFAULT_EMERGENCY_PHRASES if the DB has none yet
-    """
     try:
         from . import sqlite_db as db
         phrases = db.get_emergency_phrases()
@@ -162,3 +157,126 @@ def extract_list_simple(text: str) -> List[str]:
             seen.add(k)
             out.append(it)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Prompt injection check
+# Why here: same as detect_emergency_red_flags — regex scan on patient text.
+# Called in api.py once per message before the graph sees it.
+# ---------------------------------------------------------------------------
+
+_INJECTION_PATTERNS = [
+    r"ignore\s+(previous|above|all|prior)\s+instructions?",
+    r"you\s+are\s+now\s+(a|an)\s+",
+    r"act\s+as\s+(a\s+|an\s+)?(unrestricted|unfiltered|jailbroken|different)",
+    r"forget\s+(everything|your\s+training|all\s+instructions)",
+]
+_INJECTION_RE = re.compile("|".join(_INJECTION_PATTERNS), re.IGNORECASE)
+
+
+def check_prompt_injection(text: str) -> bool:
+    """Returns True if the input looks like a prompt injection attempt."""
+    return bool(_INJECTION_RE.search(text or ""))
+
+
+# ---------------------------------------------------------------------------
+# Crisis / self-harm detection
+# Why here: same pattern as detect_emergency_red_flags — phrase list scan.
+# Kept separate from emergency phrases because the response is different
+# (988 Lifeline, not "call 911") and managed independently.
+# ---------------------------------------------------------------------------
+
+_CRISIS_PHRASES = [
+    "want to die", "kill myself", "end my life", "suicidal",
+    "don't want to live", "dont want to live", "hurt myself",
+    "self harm", "self-harm", "overdose on purpose", "no reason to live",
+    "better off dead", "can't go on", "cant go on", "not worth living",
+    "thinking about suicide", "taking my own life",
+]
+
+CRISIS_RESOURCE = (
+    "I noticed what you shared, and I want to make sure you're okay. "
+    "If you're having thoughts of hurting yourself, please reach out to the "
+    "988 Suicide & Crisis Lifeline by calling or texting 988 — they're available "
+    "24/7. A clinician at this facility has also been notified. "
+    "You don't have to go through this alone."
+)
+
+
+def detect_crisis(text: str) -> List[str]:
+    """
+    Returns list of matched crisis phrases (empty = no crisis).
+    Caller should return CRISIS_RESOURCE to patient and create a 'crisis' escalation.
+    Session should NOT be terminated — patient may still want to complete intake.
+    """
+    t = (text or "").lower()
+    return [p for p in _CRISIS_PHRASES if p in t]
+
+
+# ---------------------------------------------------------------------------
+# Consent helpers
+# Why here: is_consent_accepted / is_consent_declined are the same kind of
+# thing as is_yes / is_no / is_ack already in this file.
+# ---------------------------------------------------------------------------
+
+CONSENT_MESSAGE = (
+    "Before we begin: this intake form is assisted by AI. "
+    "Your responses will be securely stored and reviewed by a licensed clinician. "
+    "No diagnosis will be made here — this is for data collection only. "
+    "Do you consent to continue? (yes / no)"
+)
+
+
+def is_consent_accepted(text: str) -> bool:
+    t = (text or "").strip().lower()
+    return t in {"yes", "y", "yeah", "yep", "ok", "okay", "sure", "i agree", "agree", "consent"}
+
+
+def is_consent_declined(text: str) -> bool:
+    t = (text or "").strip().lower()
+    return t in {"no", "n", "nope", "nah", "decline", "i decline", "cancel", "stop"}
+
+
+# ---------------------------------------------------------------------------
+# Phone and DOB validation
+# Why here: normalize_phone already lives here. validate_dob extends
+# extract_identity_deterministic which is also here. Same family.
+# ---------------------------------------------------------------------------
+
+from datetime import datetime, date as _date
+
+
+def validate_phone(raw: str):
+    """
+    Returns (cleaned_10_digits, error_str). error_str="" means ok.
+    Strips formatting, handles +1 country code.
+    """
+    digits = re.sub(r"\D", "", raw or "")
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    if len(digits) != 10:
+        return "", "Phone number must be 10 digits (US format). Example: 412-555-0199"
+    return digits, ""
+
+
+def validate_dob(raw: str):
+    """
+    Returns (normalised_MM/DD/YYYY, error_str). error_str="" means ok.
+    Rejects future dates and ages over 130 years.
+    """
+    raw = (raw or "").strip()
+    parsed = None
+    for fmt in ("%m/%d/%Y", "%m-%d-%Y", "%Y-%m-%d", "%m/%d/%y", "%m-%d-%y"):
+        try:
+            parsed = datetime.strptime(raw, fmt).date()
+            break
+        except ValueError:
+            continue
+    if parsed is None:
+        return "", "Date of birth must be in MM/DD/YYYY format. Example: 03/15/1985"
+    today = _date.today()
+    if parsed > today:
+        return "", "Date of birth cannot be in the future."
+    if (today - parsed).days // 365 > 130:
+        return "", "Date of birth appears invalid. Please check and re-enter."
+    return parsed.strftime("%m/%d/%Y"), ""

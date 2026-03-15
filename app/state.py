@@ -9,6 +9,7 @@ class Message(TypedDict):
     text: str
 
 Phase = Literal[
+    "consent",
     "identity",
     "identity_review",
     "subjective",
@@ -24,6 +25,7 @@ class IntakeState(TypedDict, total=False):
     current_phase: Phase
     mode: Literal["clinic", "ed"]
     triage_attempts: int
+    consent_given: bool
 
 
     identity: Dict[str, str]                 

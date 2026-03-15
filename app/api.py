@@ -18,6 +18,7 @@ from .logging_utils import log_event
 from .llm import get_gemini
 from . import sqlite_db as db
 from .settings import settings
+from .extract import check_prompt_injection
 
 limiter = Limiter(key_func=get_remote_address)
 
@@ -36,22 +37,23 @@ graph = build_graph()
 
 def _compact_snapshot(output: dict) -> dict:
     return {
-        "current_phase": output.get("current_phase"),
-        "identity": output.get("identity"),
-        "stored_identity": output.get("stored_identity"),
-        "identity_status": output.get("identity_status"),
-        "needs_identity_review": output.get("needs_identity_review"),
-        "chief_complaint": output.get("chief_complaint"),
-        "opqrst": output.get("opqrst"),
-        "allergies": output.get("allergies"),
-        "medications": output.get("medications"),
-        "pmh": output.get("pmh"),
-        "recent_results": output.get("recent_results"),
-        "triage": output.get("triage"),
-        "needs_emergency_review": output.get("needs_emergency_review"),
-        "clinical_step": output.get("clinical_step"),
-        "mode": output.get("mode"),
-        "triage_attempts": output.get("triage_attempts"),
+        "current_phase":        output.get("current_phase"),
+        "identity":             output.get("identity"),
+        "stored_identity":      output.get("stored_identity"),
+        "identity_status":      output.get("identity_status"),
+        "needs_identity_review":output.get("needs_identity_review"),
+        "consent_given":        output.get("consent_given"),
+        "chief_complaint":      output.get("chief_complaint"),
+        "opqrst":               output.get("opqrst"),
+        "allergies":            output.get("allergies"),
+        "medications":          output.get("medications"),
+        "pmh":                  output.get("pmh"),
+        "recent_results":       output.get("recent_results"),
+        "triage":               output.get("triage"),
+        "needs_emergency_review":output.get("needs_emergency_review"),
+        "clinical_step":        output.get("clinical_step"),
+        "mode":                 output.get("mode"),
+        "triage_attempts":      output.get("triage_attempts"),
     }
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -62,7 +64,7 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 def _startup():
     logging.basicConfig(
         level=logging.INFO,
-        format="%(message)s", 
+        format="%(message)s",  # log_event already formats as JSON
     )
     db.init_schema()
     # Seed default emergency phrases on first boot if the table is empty.
@@ -84,7 +86,9 @@ def start_session(request: Request, mode: str = Form("clinic")):
 
     initial_state = {
         "thread_id": thread_id,
-        "current_phase": "identity",
+
+        "current_phase": "consent" if settings.require_consent else "identity",
+        "consent_given": not settings.require_consent,  # pre-granted when consent gate is off
         "mode": "ed" if (mode or "").strip().lower() == "ed" else "clinic",
         "triage_attempts": 0,
         "identity": {"name": "", "phone": "", "address": "", "dob": ""},
@@ -182,6 +186,8 @@ def chat(request: Request, background_tasks: BackgroundTasks,
         raise HTTPException(status_code=400, detail="Message cannot be empty.")
     if len(message) > 1200:
         raise HTTPException(status_code=400, detail="Message too long (max 1200 chars).")
+    if check_prompt_injection(message, thread_id=thread_id):
+        return {"reply": "I can only collect intake information for your visit. If you have a question for your care team, they'll be happy to help when you arrive.", "status": "active", "phase": "unknown"}
 
     request_hash = hashlib.sha256(message.encode("utf-8")).hexdigest()
 

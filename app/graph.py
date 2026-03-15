@@ -6,18 +6,21 @@ from .settings import settings
 from .state import IntakeState
 from . import nodes
 
+
 def route(state: IntakeState):
     phase = state.get("current_phase") or "identity"
     return {
-        "identity": "identity_node",
-        "identity_review": "identity_review_node",
-        "subjective": "subjective_node",
+        "consent":          "consent_node",
+        "identity":         "identity_node",
+        "identity_review":  "identity_review_node",
+        "subjective":       "subjective_node",
         "clinical_history": "clinical_history_node",
-        "report": "report_node",
-        "handoff": "handoff_node",
-        "confirm": "confirm_node",
-        "done": END,
+        "report":           "report_node",
+        "handoff":          "handoff_node",
+        "confirm":          "confirm_node",
+        "done":             END,
     }.get(phase, "identity_node")
+
 
 def build_graph():
     Path(settings.checkpoint_db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -28,16 +31,25 @@ def build_graph():
     checkpointer = SqliteSaver(cp)
 
     g = StateGraph(IntakeState)
-    g.add_node("identity_node", nodes.identity_node)
-    g.add_node("identity_review_node", nodes.identity_review_node)
-    g.add_node("subjective_node", nodes.subjective_node)
+    g.add_node("consent_node",          nodes.consent_node)
+    g.add_node("identity_node",         nodes.identity_node)
+    g.add_node("identity_review_node",  nodes.identity_review_node)
+    g.add_node("subjective_node",       nodes.subjective_node)
     g.add_node("clinical_history_node", nodes.clinical_history_node)
-    g.add_node("report_node", nodes.report_node)
-    g.add_node("handoff_node", nodes.handoff_node)
-    g.add_node("confirm_node", nodes.confirm_node)
+    g.add_node("report_node",           nodes.report_node)
+    g.add_node("handoff_node",          nodes.handoff_node)
+    g.add_node("confirm_node",          nodes.confirm_node)
+
     g.add_conditional_edges(START, route)
 
-    for n in ["identity_node", "identity_review_node", "subjective_node", "clinical_history_node", "confirm_node"]:
+    for n in [
+        "consent_node",
+        "identity_node",
+        "identity_review_node",
+        "subjective_node",
+        "clinical_history_node",
+        "confirm_node",
+    ]:
         g.add_conditional_edges(n, route)
 
     g.add_edge("handoff_node", END)
@@ -46,10 +58,11 @@ def build_graph():
     return g.compile(
         checkpointer=checkpointer,
         interrupt_after=[
+            "consent_node",
             "identity_node",
             "identity_review_node",
             "subjective_node",
             "clinical_history_node",
-            "confirm_node"
+            "confirm_node",
         ],
     )

@@ -5,32 +5,57 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+
 class Settings(BaseSettings):
-    app_db_path: str = str(BASE_DIR / "data" / "app.db")
+    # ── Database ──────────────────────────────────────────────────────
+    app_db_path:        str = str(BASE_DIR / "data" / "app.db")
     checkpoint_db_path: str = str(BASE_DIR / "data" / "checkpoints.db")
 
-    gemini_api_key: str
+    # ── Gemini ────────────────────────────────────────────────────────
+    gemini_api_key:     str
     gemini_flash_model: str = "gemini-2.0-flash"
 
-    max_retries: int = 3
-    base_retry_delay: float = 1.0
-    max_retry_delay: float = 10.0
+    # ── Retry / reliability ───────────────────────────────────────────
+    max_retries:       int   = 3
+    base_retry_delay:  float = 1.0
+    max_retry_delay:   float = 10.0
 
-    debug_mode: bool = False
-    max_upload_size_mb: int = 10
+    # ── App behaviour ─────────────────────────────────────────────────
+    debug_mode:         bool = False
+    max_upload_size_mb: int  = 10
 
-    jwt_secret: str = "Replace"
-    clinician_password: str = "Replace"
+    # ── Auth ──────────────────────────────────────────────────────────
+    jwt_secret:          str = "CHANGE_ME_jwt_secret"
+    clinician_password:  str = "CHANGE_ME_password"
 
-    # Optional outbound webhook fired when an intake report is ready.
-    # If set, the FHIR Bundle is POSTed here with an HMAC-SHA256 signature.
-    completion_webhook_url: str = ""
-    completion_webhook_secret: str = ""
+    # ── Consent gate ─────────────────────────────────────────────────
+    # When True, patients must explicitly consent before intake begins.
+    # Disable only for internal testing / demo environments.
+    require_consent: bool = True
 
-    # Slack incoming webhook URL for emergency alerts and intake completion.
-    # Get one at: https://api.slack.com/messaging/webhooks — free, no library needed.
+    # ── Notifications: ntfy.sh (free, open-source push notifications) ─
+    # Get a topic at https://ntfy.sh — no account needed.
+    # Subscribe via browser or the ntfy mobile app (iOS/Android).
+    # Emergency alerts use priority=urgent (bypasses DND on mobile app).
     # Leave blank to disable.
+    ntfy_topic: str = ""
+
+    # ── Notifications: Discord webhook ────────────────────────────────
+    # In Discord: Edit Channel → Integrations → Webhooks → New Webhook → Copy URL
+    # Emergency alerts appear as red embeds; completions as green.
+    # Leave blank to disable.
+    discord_webhook_url: str = ""
+
+    # ── Notifications: Slack ──────────────────────────────────────────
+    # Existing integration — https://api.slack.com/messaging/webhooks
     slack_webhook_url: str = ""
+
+    # ── Notifications: Generic FHIR webhook ──────────────────────────
+    # POST of the FHIR R4 Bundle, signed with HMAC-SHA256.
+    # For local testing: set to https://webhook.site/your-uuid (free, no signup).
+    # Leave blank to disable.
+    completion_webhook_url:    str = ""
+    completion_webhook_secret: str = ""
 
     model_config = SettingsConfigDict(
         env_file=str(BASE_DIR / ".env"),
@@ -38,7 +63,7 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    API_KEY: ClassVar[str] = "api key here"
+    API_KEY:ClassVar[str] = "api key here"
 
     @field_validator("gemini_api_key")
     @classmethod
@@ -49,5 +74,6 @@ class Settings(BaseSettings):
                 "Add it to your .env file: GEMINI_API_KEY=your_key_here"
             )
         return v
+
 
 settings = Settings()
