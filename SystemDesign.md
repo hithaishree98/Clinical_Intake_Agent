@@ -85,13 +85,13 @@ The circuit breaker solves this. It tracks consecutive Gemini failures across al
 
 In production with multiple workers this matters more. Without a circuit breaker every worker independently retries every failing request. With one, the pattern is detected quickly and all workers stop retrying until the service recovers.
 
-This project runs as a single-process SQLite app, so the circuit breaker doesn't have multiple workers to protect. I built it this way because the pattern is the same regardless of scale, and if this moved to Gunicorn with 4 workers behind a load balancer, it would work without changes. The alternative was to leave it out and retrofit it later, which in practice means it never gets added until the first outage.
+This project runs as a single-process SQLite app, so the circuit breaker doesn't have multiple workers to protect. I built it this way because the pattern is the same regardless of scale, and if this moved to system with 4 workers behind a load balancer, it would work without changes. 
 
 **Retry with Full Jitter**
 
 For transient errors (429, timeout, 503) the system retries with jitter. It waits for a random amount of time between 0 and the cap before retrying.
 
-Without jitter, if 50 patients hit a rate limit at the same moment, all 50 retry at the same moment causing a second rate limit. Randomness spreads them out so they stop hitting the API simultaneously.
+Without jitter, if 10 patients hit a rate limit at the same moment, all 10 retry at the same moment causing a second rate limit. Randomness spreads them out so they stop hitting the API simultaneously.
 
 **Per-Request LLM Timeout**
 
@@ -105,11 +105,11 @@ The google-genai SDK doesn't reliably respect HTTP-level timeouts (it overrides 
 
 Three layers inside run_json_step:
 
-If Gemini responded and the JSON is valid — return real data.
+If Gemini responded and the JSON is valid, return real data.
 
-If Gemini responded but the JSON failed validation — send a repair prompt back to Gemini naming the exact error and showing it its own bad output. One attempt only.
+If Gemini responded but the JSON failed validation, send a repair prompt back to Gemini naming the exact error and showing it its own bad output. One attempt only.
 
-If Gemini didn't respond at all, or repair also failed — use the hardcoded fallback. This preserves whatever data was already collected in state, returns a safe generic question to the patient, and keeps is_complete = False so the phase doesn't accidentally advance.
+If Gemini didn't respond at all, or repair also failed, use the hardcoded fallback. This preserves whatever data was already collected in state, returns a safe generic question to the patient, and keeps is_complete = False so the phase doesn't accidentally advance.
 
 If the failure happens at report generation specifically, the report still generates directly from state data without Gemini. Allergies and medications are always included and clearly marked.
 
@@ -119,9 +119,9 @@ State is stored in two places: LangGraph checkpoints (checkpoints.db) and a sess
 
 LangGraph checkpoints are opaque blobs. They're serialized snapshots of the full graph state, and the only way to read them is to replay through LangGraph's checkpointer API. That works for resuming a conversation, but it's slow and awkward for the API layer that just needs to know "what phase is this session in?" to return it in a response.
 
-The session_state table stores a compact snapshot of the fields the API actually needs — current_phase, identity, triage, clinical_step, etc. When `GET /resume/{thread_id}` is called, it reads one row instead of deserializing a checkpoint. During normal flow, the phase comes from the graph output in the `/chat` response; the session_state table is the fallback for resumption after a crash.
+The session_state table stores a compact snapshot of the fields the API actually needs that is current_phase, identity, triage, clinical_step, etc. When `GET /resume/{thread_id}` is called, it reads one row instead of deserializing a checkpoint. During normal flow, the phase comes from the graph output in the `/chat` response; the session_state table is the fallback for resumption after a crash.
 
-If I had to pick one, LangGraph checkpoints are the source of truth for conversation continuity. The session_state table is a read-optimized projection for the API layer.
+LangGraph checkpoints are the source of truth for conversation continuity. The session_state table is a read-optimized projection for the API layer.
 
 **Background Report Generation**
 
@@ -145,7 +145,7 @@ The SHA256 hash is there to catch a different edge case: client_msg_id reuse. If
 
 Two notification channels, each demonstrating a different integration pattern:
 
-Slack is a simple JSON POST to an Incoming Webhook. It's the most common pattern for internal team alerts. Emergency escalations, crisis detections, and intake completions all post to the configured Slack channel so the care team gets immediate visibility without polling the dashboard.
+Slack is for internal team alerts. Emergency escalations, crisis detections, and intake completions all post to the configured Slack channel so the care team gets immediate visibility without polling the dashboard.
 
 The FHIR webhook is a different pattern entirely. It's a cryptographically signed payload delivery. The FHIR R4 Bundle is POSTed with an HMAC-SHA256 signature in the X-Signature header. The receiving system (an EHR, a data pipeline, a compliance logger) can verify the signature to confirm the payload wasn't tampered with in transit and actually came from this system. This is how real healthcare integrations work — you can't just POST patient data to an endpoint without authentication and integrity verification.
 
@@ -181,7 +181,7 @@ Patient message arrives
 5. Diagnosis language filter (llm.py)
    Regex scan on LLM output for "you have", "consistent with", etc.
    If triggered, replaces LLM reply with a safe generic response
-   Legal necessity — intake assistants cannot diagnose
+   intake assistants cannot diagnose
     │
     ▼
 Safe response delivered to patient
@@ -203,9 +203,9 @@ This project is built as a single-process app with SQLite. That's appropriate fo
 
 **Database: SQLite → PostgreSQL**
 
-SQLite is single-writer. With WAL mode and busy_timeout it handles moderate concurrency, but under real load (50+ concurrent intakes) writes would bottleneck. PostgreSQL handles concurrent writes natively, supports row-level locking, and doesn't need the threading lock or retry wrapper that SQLite requires.
+SQLite is single-writer. With WAL mode and busy_timeout it handles moderate concurrency, but under real load writes would bottleneck. PostgreSQL handles concurrent writes natively, supports row-level locking.
 
-The LangGraph checkpointer would switch from SqliteSaver to PostgresSaver (langgraph ships both). The application DB queries are standard SQL and would migrate with minimal changes.
+The LangGraph checkpointer would switch from SqliteSaver to PostgresSaver. The application DB queries are standard SQL and would migrate with minimal changes.
 
 **Task queue: BackgroundTasks → Celery + Redis**
 
@@ -215,7 +215,7 @@ Report generation would become a Celery task. The job table already tracks statu
 
 **Circuit breaker: in-memory → Redis-backed**
 
-The current circuit breaker tracks failures in a Python object. It works within a single process but if there are 4 Gunicorn workers, each has its own breaker with its own failure count. Worker A might have the breaker open while workers B, C, D are still hammering a dead API.
+The current circuit breaker tracks failures in a Python object. It works within a single process but if there are 4 workers, each has its own breaker with its own failure count. Worker A might have the breaker open while workers B, C, D are still hammering a dead API.
 
 A Redis-backed breaker shares state across all workers. After 5 total failures (not 5 per worker), every worker stops sending requests simultaneously. The recovery probe also coordinates so only one worker tests the API, not all four.
 
@@ -225,8 +225,6 @@ With PostgreSQL and Redis in place, the web layer becomes stateless. Multiple Fa
 
 The LLM timeout and circuit breaker patterns are already designed for this. The idempotency layer already uses the database, so it works across instances without modification.
 
-**HTTPS and authentication hardening**
-
-The current setup uses HTTP with JWT for clinician auth. Production would add TLS termination (nginx or a cloud load balancer), CSRF tokens on form submissions, rate limiting per authenticated user instead of per IP, and token refresh rotation instead of a 24-hour expiry.
+**Authentication hardening**
 
 Patient sessions would also need authentication once real PHI is involved. The current model (anonymous sessions with a UUID) is acceptable for intake but not for accessing or modifying existing medical records.
