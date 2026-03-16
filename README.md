@@ -31,7 +31,7 @@ Everything else like what to ask, what order, what constitutes an emergency, whe
 - If the server goes down mid-intake, the patient resumes exactly where they left off.
 - Generates a structured clinician note and a FHIR R4 Bundle compatible with FHIR-compliant EHR systems.
 - Clinician portal for reviewing and resolving escalations.
-- Slack notifications for emergencies, identity mismatches, and completed intakes. FHIR Bundle posted via HMAC-signed webhook on completion.
+- Slack notifications for emergencies, crisis language, and completed intakes. FHIR Bundle posted via HMAC-signed webhook on completion.
 
 ## How it works
 
