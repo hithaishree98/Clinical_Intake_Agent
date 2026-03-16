@@ -25,13 +25,13 @@ Everything else like what to ask, what order, what constitutes an emergency, whe
 ## What it does
 
 - Full conversational intake covering identity, chief complaint, OPQRST symptom assessment, allergies, medications, past medical history, and recent labs.
-- Emergency detection that runs before the LLM on every message. If a patient mentions chest pain or a seizure, they get immediate escalation regardless of what else they said.
+- Emergency detection that runs before the LLM during the symptom collection phase. If a patient mentions chest pain or a seizure, they get immediate escalation regardless of what else they said.
 - Patients confirm AI-assisted intake before any data is collected.
 - Identity verification against an EHR record where discrepancies are flagged for nurse review automatically.
 - If the server goes down mid-intake, the patient resumes exactly where they left off.
 - Generates a structured clinician note and a FHIR R4 Bundle compatible with FHIR-compliant EHR systems.
 - Clinician portal for reviewing and resolving escalations.
-- Push notifications to ntfy.sh, Discord, and Slack for emergencies, identity mismatches, and completed intakes.
+- Slack notifications for emergencies, identity mismatches, and completed intakes. FHIR Bundle posted via HMAC-signed webhook on completion.
 
 ## How it works
 
@@ -68,8 +68,8 @@ Report generation
   LLM generates plain text clinician note
   FHIR R4 Bundle built from the same state data
   Both saved to database
-  Notifications fired to ntfy.sh, Discord, and Slack
-  FHIR Bundle posted to configured webhook URL
+  Slack notification sent to clinician channel
+  FHIR Bundle posted to configured webhook URL (HMAC-signed)
          ↓
 Clinician receives complete note and FHIR Bundle
 ```
@@ -82,7 +82,7 @@ Set these variables in .env
 - GEMINI_API_KEY
 - JWT_SECRET
 - CLINICIAN_PASSWORD
-- SLACK_URL
+- SLACK_WEBHOOK_URL
 
 ### docker compose up --build
 
@@ -104,7 +104,15 @@ As a clinician:
 - Click View Escalations to see all flagged cases
 - Click an escalation to populate the resolve form
 - Add a nurse note and click Resolve
+
+Admin API (all require clinician token):
+
+- GET /analytics — operational metrics for the last 7 days
+- POST /demo/reset — wipes session data and re-seeds mock EHR patients
+- GET /admin/emergency-phrases — lists active emergency phrases
+- POST /admin/emergency-phrases — adds a new phrase, takes effect immediately
+- DELETE /admin/emergency-phrases — removes a phrase
   
 ## Tech stack
 
-FastAPI · LangGraph · Pydantic v2 · Google Gemini (google-genai) · SQLite WAL · FHIR R4 · JWT · HMAC-SHA256 · Docker · pytest · slowapi · ntfy.sh · Discord · Slack
+FastAPI · LangGraph · Pydantic v2 · Google Gemini (google-genai) · SQLite WAL · FHIR R4 · JWT · HMAC-SHA256 · Docker · pytest · slowapi · Slack

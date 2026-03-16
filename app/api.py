@@ -186,7 +186,7 @@ def chat(request: Request, background_tasks: BackgroundTasks,
         raise HTTPException(status_code=400, detail="Message cannot be empty.")
     if len(message) > 1200:
         raise HTTPException(status_code=400, detail="Message too long (max 1200 chars).")
-    if check_prompt_injection(message, thread_id=thread_id):
+    if check_prompt_injection(message):
         return {"reply": "I can only collect intake information for your visit. If you have a question for your care team, they'll be happy to help when you arrive.", "status": "active", "phase": "unknown"}
 
     request_hash = hashlib.sha256(message.encode("utf-8")).hexdigest()
@@ -373,7 +373,7 @@ def demo_reset(_: None = Depends(require_clinician)):
             "name": "Ava Johnson",
             "history": "Prior visit: Hypertension. Penicillin allergy.",
             "data_json": json.dumps({
-                "identity": {"phone": "4125550199", "address": "100 Forbes Ave, Pittsburgh, PA"},
+                "identity": {"dob": "03/15/1985", "phone": "4125550199", "address": "100 Forbes Ave, Pittsburgh, PA"},
                 "allergies": ["penicillin"],
                 "medications": ["lisinopril 10mg daily"],
                 "pmh": ["hypertension"],
@@ -385,7 +385,7 @@ def demo_reset(_: None = Depends(require_clinician)):
             "name": "Marcus Thorne",
             "history": "Prior cardiac stent placement in 2023.",
             "data_json": json.dumps({
-                "identity": {"phone": "5550388844", "address": "12 Market St, Pittsburgh, PA"},
+                "identity": {"dob": "07/22/1970", "phone": "5550388844", "address": "12 Market St, Pittsburgh, PA"},
                 "allergies": [],
                 "medications": ["atorvastatin 40mg nightly"],
                 "pmh": ["coronary artery disease", "cardiac stent (2023)"],
@@ -397,7 +397,7 @@ def demo_reset(_: None = Depends(require_clinician)):
             "name": "Nina Shah",
             "history": "Prior visit: Anxiety. No known drug allergies.",
             "data_json": json.dumps({
-                "identity": {"phone": "5557772222", "address": "44 Walnut St, Chicago, IL"},
+                "identity": {"dob": "11/03/1992", "phone": "5557772222", "address": "44 Walnut St, Chicago, IL"},
                 "allergies": [],
                 "medications": [],
                 "pmh": ["anxiety"],

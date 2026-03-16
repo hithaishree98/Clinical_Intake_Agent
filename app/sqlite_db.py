@@ -4,7 +4,6 @@ import time
 import json
 import uuid
 import threading
-import os
 from pathlib import Path
 
 from .settings import settings
@@ -117,6 +116,7 @@ def get_stored_identity_by_name(name: str):
     ident = data.get("identity") or {}
     return {
         "name": row.get("name") or "",
+        "dob": ident.get("dob", "") or "",
         "phone": ident.get("phone", "") or "",
         "address": ident.get("address", "") or "",
     }
@@ -177,9 +177,6 @@ def get_latest_report(thread_id: str):
         "SELECT rowid, * FROM reports WHERE thread_id=? ORDER BY rowid DESC LIMIT 1",
         (thread_id,),
     )
-
-def max_upload_bytes() -> int:
-    return int(settings.max_upload_size_mb) * 1024 * 1024
 
 def create_job(thread_id: str, kind: str) -> str:
     job_id = str(uuid.uuid4())

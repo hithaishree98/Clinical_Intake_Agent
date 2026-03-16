@@ -22,7 +22,6 @@ class Settings(BaseSettings):
 
     # ── App behaviour ─────────────────────────────────────────────────
     debug_mode:         bool = False
-    max_upload_size_mb: int  = 10
 
     # ── Auth ──────────────────────────────────────────────────────────
     jwt_secret:          str = "CHANGE_ME_jwt_secret"
@@ -33,21 +32,10 @@ class Settings(BaseSettings):
     # Disable only for internal testing / demo environments.
     require_consent: bool = True
 
-    # ── Notifications: ntfy.sh (free, open-source push notifications) ─
-    # Get a topic at https://ntfy.sh — no account needed.
-    # Subscribe via browser or the ntfy mobile app (iOS/Android).
-    # Emergency alerts use priority=urgent (bypasses DND on mobile app).
-    # Leave blank to disable.
-    ntfy_topic: str = ""
-
-    # ── Notifications: Discord webhook ────────────────────────────────
-    # In Discord: Edit Channel → Integrations → Webhooks → New Webhook → Copy URL
-    # Emergency alerts appear as red embeds; completions as green.
-    # Leave blank to disable.
-    discord_webhook_url: str = ""
-
     # ── Notifications: Slack ──────────────────────────────────────────
-    # Existing integration — https://api.slack.com/messaging/webhooks
+    # https://api.slack.com/messaging/webhooks
+    # Emergency, crisis, and completion alerts are posted here.
+    # Leave blank to disable.
     slack_webhook_url: str = ""
 
     # ── Notifications: Generic FHIR webhook ──────────────────────────
@@ -57,13 +45,16 @@ class Settings(BaseSettings):
     completion_webhook_url:    str = ""
     completion_webhook_secret: str = ""
 
+    # ── LLM timeout ──────────────────────────────────────────────────
+    llm_timeout_seconds: float = 15.0
+
     model_config = SettingsConfigDict(
         env_file=str(BASE_DIR / ".env"),
         env_file_encoding="utf-8",
         extra="ignore",
     )
 
-    API_KEY:ClassVar[str] = "api key here"
+    API_KEY:ClassVar[str] = "your_gemini_api_key_here"
 
     @field_validator("gemini_api_key")
     @classmethod

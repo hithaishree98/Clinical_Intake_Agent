@@ -5,6 +5,7 @@ import time
 import random
 import json
 import threading
+import concurrent.futures
 from dataclasses import dataclass
 from typing import Callable, Optional, Type, Tuple
 
@@ -192,17 +193,23 @@ class GeminiClient:
         max_tokens: int = 900,
         response_mime_type: str | None = "application/json",
     ) -> LLMResult:
+        timeout = settings.llm_timeout_seconds
+
         def _call() -> str:
-            resp = self.client.models.generate_content(
-                model=settings.gemini_flash_model,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=system,
-                    response_mime_type=response_mime_type,
-                    temperature=temperature,
-                    max_output_tokens=max_tokens,
-                ),
-            )
+            # google-genai SDK ignores HTTP timeouts, so we enforce our own.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(
+                    self.client.models.generate_content,
+                    model=settings.gemini_flash_model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system,
+                        response_mime_type=response_mime_type,
+                        temperature=temperature,
+                        max_output_tokens=max_tokens,
+                    ),
+                )
+                resp = future.result(timeout=timeout)
             return resp.text or ""
 
         return self._retry(_call, op="generate_text")
@@ -333,13 +340,7 @@ def run_json_step(
 
 
 # ---------------------------------------------------------------------------
-# LLM response validation — diagnosis language detector
-# Why here: this is post-processing of LLM output, same as JSON repair and
-# length capping above. It belongs with the LLM layer, not in a separate file.
-#
-# Clinical reason: LLMs occasionally drift into diagnosis language despite
-# explicit instructions. If output contains "you have X" or "consistent with Y"
-# we replace it before it reaches the patient. Legal necessity.
+# Diagnosis language filter — catches LLM output that drifts into diagnosing
 # ---------------------------------------------------------------------------
 
 import re as _re
@@ -361,11 +362,7 @@ _SAFE_REPLACEMENT = (
 
 
 def validate_llm_response(text: str) -> tuple[str, bool]:
-    """
-    Scan LLM output for forbidden diagnosis language.
-    Returns (safe_text, was_modified).
-    Call this on every LLM reply before it reaches the patient.
-    """
+    """Returns (safe_text, was_modified). Replaces diagnosis language with a safe fallback."""
     if _DIAGNOSIS_RE.search(text or ""):
         log_event("guardrail_diagnosis_blocked", level="warning", preview=(text or "")[:200])
         return _SAFE_REPLACEMENT, True

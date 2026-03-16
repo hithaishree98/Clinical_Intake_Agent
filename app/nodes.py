@@ -3,14 +3,6 @@ nodes.py — LangGraph conversation nodes.
 
 Each node corresponds to one phase of the intake state machine.
 All nodes return a dict of state fields to update (LangGraph merges them).
-
-Changes from base version:
-  - Guardrails integrated: prompt injection check, crisis detection,
-    LLM response validation, PHI audit logging
-  - New webhook module used for all outbound notifications
-  - Validators used for DOB and phone before storing in state
-  - Consent phase added (controlled by settings.require_consent)
-  - _slack() removed — all notifications go through webhook.dispatch_*
 """
 from __future__ import annotations
 
@@ -35,7 +27,6 @@ from .extract import (
     detect_emergency_red_flags,
     extract_allergies_simple,
     extract_list_simple,
-    check_prompt_injection,
     detect_crisis,
     CRISIS_RESOURCE,
     CONSENT_MESSAGE,
@@ -131,7 +122,10 @@ def consent_node(state: IntakeState):
         }
 
     if is_consent_declined(user):
-        log_event("patient_declined_consent", thread_id=state.get("thread_id"))
+        thread_id = state.get("thread_id", "")
+        log_event("patient_declined_consent", thread_id=thread_id)
+        if thread_id:
+            db.set_session_status(thread_id, "done")
         return {
             "consent_given": False,
             "messages": [{"role": "assistant", "text":
@@ -547,7 +541,9 @@ def _confirm_summary(state: IntakeState) -> str:
         "Symptoms",
         f"- Chief complaint: {cc}",
         f"- Onset: {op.get('onset') or '—'}",
+        f"- Provocation: {op.get('provocation') or '—'}",
         f"- Quality: {op.get('quality') or '—'}",
+        f"- Radiation: {op.get('radiation') or '—'}",
         f"- Severity: {op.get('severity') or '—'}",
         f"- Timing: {op.get('timing') or '—'}",
         "",
@@ -808,7 +804,7 @@ def report_node(state: IntakeState):
     triage = state.get("triage") or {}
     db.save_report(thread_id, triage.get("risk_level") or "low",
                    triage.get("visit_type") or "routine", report_text, fhir_json)
-    db.set_session_status(thread_id, "active")
+    db.set_session_status(thread_id, "done")
 
 
     log_event(

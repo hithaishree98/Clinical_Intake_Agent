@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls:*)",
+      "Bash(dir:*)",
+      "Bash(findstr:*)",
+      "Bash(find:*)",
+      "WebSearch",
+      "Bash(python -m pytest:*)",
+      "Bash(pip install:*)",
+      "Bash(docker build:*)"
+    ]
+  }
+}
