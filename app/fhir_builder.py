@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 import uuid
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, List
 
 
 def _uid() -> str:
@@ -166,6 +166,32 @@ def _triage_observation(patient_id: str, triage: dict) -> dict:
         "valueString": risk_level,
         "note": [{"text": note_text}] if note_text else [],
     }
+
+
+def validate_fhir_input(state: dict) -> List[str]:
+    """
+    Validate that state contains the fields needed for a meaningful FHIR bundle.
+
+    Returns a list of warning codes (empty = all clear).  The caller logs
+    these before calling build_bundle so every gap is observable.
+
+    Codes:
+      fhir_missing_patient_name    — identity.name is blank or absent
+      fhir_missing_dob             — identity.dob is blank or absent
+      fhir_missing_chief_complaint — chief_complaint is blank or absent
+      fhir_allergies_not_collected — allergies list is None (step not reached)
+    """
+    warnings: List[str] = []
+    identity = state.get("identity") or {}
+    if not (identity.get("name") or "").strip():
+        warnings.append("fhir_missing_patient_name")
+    if not (identity.get("dob") or "").strip():
+        warnings.append("fhir_missing_dob")
+    if not (state.get("chief_complaint") or "").strip():
+        warnings.append("fhir_missing_chief_complaint")
+    if state.get("allergies") is None:
+        warnings.append("fhir_allergies_not_collected")
+    return warnings
 
 
 def build_bundle(state: dict) -> dict:

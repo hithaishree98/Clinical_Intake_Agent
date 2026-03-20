@@ -13,6 +13,7 @@ Phase = Literal[
     "identity",
     "identity_review",
     "subjective",
+    "validate",           # agentic: validation gate before phase transitions
     "clinical_history",
     "confirm",
     "report",
@@ -51,5 +52,28 @@ class IntakeState(TypedDict, total=False):
     triage: Dict[str, Any]
     needs_emergency_review: bool
 
+    # --- Agentic fields ---
+    # Feature 1: intake classification
+    intake_classification: Optional[str]    # "emergency_visit"|"routine_checkup"|"specialist_referral"|"mental_health"|"pediatric"
+    classification_confidence: Optional[str]  # "high"|"medium"|"low"
+
+    # Feature 3: extraction quality retry
+    extraction_quality_score: Optional[float]  # 0.0–1.0
+    extraction_retry_count: int                 # increments on each quality-gate retry
+
+    # Feature 4: validation gate
+    validation_errors: List[str]                # error keys from validate_node; empty = passed
+    validation_target_phase: Optional[str]      # phase to advance to if validation passes
+
+    # --- Safety fields ---
+    crisis_detected: bool                       # True if crisis language was detected in this session
+    human_review_required: bool                 # True if SafetyChecker blocked or flagged this session
+    human_review_reasons: List[str]             # reasons from preflight check
+    safety_score: Optional[float]               # weighted safety score from SafetyChecker
+    extraction_confidence: Optional[str]        # LLM self-assessment: "high" | "medium" | "low"
+
+    # --- Failure tracking fields ---
+    last_failed_phase: Optional[str]            # phase where last LLM fallback/failure occurred
+    last_failure_reason: Optional[str]          # brief reason string (parse_error, fallback_used, etc.)
 
     messages: Annotated[List[Message], operator.add]

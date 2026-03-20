@@ -52,6 +52,12 @@ def init_schema() -> None:
             }
             if "fhir_bundle" not in existing:
                 c.execute("ALTER TABLE reports ADD COLUMN fhir_bundle TEXT")
+            # Migration: add pending_review column for "report pending review" mode.
+            # Default 0 (false) for all pre-existing rows.
+            if "pending_review" not in existing:
+                c.execute(
+                    "ALTER TABLE reports ADD COLUMN pending_review INTEGER NOT NULL DEFAULT 0"
+                )
             c.commit()
 
     _retry_db_operation(_init)
@@ -154,11 +160,21 @@ def save_report(
     visit_type: str,
     report_text: str,
     fhir_bundle: str | None = None,
+    pending_review: bool = False,
 ):
+    """
+    Persist a completed clinician report.
+
+    pending_review=True means human review is advised before acting on this
+    report (e.g. soft safety signals were present).  Does NOT mean the report
+    is blocked — it was generated and saved, but clinicians should double-check.
+    """
     exec_one(
-        "INSERT INTO reports (report_id, thread_id, risk_level, visit_type, report_text, fhir_bundle)"
-        " VALUES (?,?,?,?,?,?)",
-        (str(uuid.uuid4()), thread_id, risk_level, visit_type, report_text, fhir_bundle),
+        "INSERT INTO reports"
+        " (report_id, thread_id, risk_level, visit_type, report_text, fhir_bundle, pending_review)"
+        " VALUES (?,?,?,?,?,?,?)",
+        (str(uuid.uuid4()), thread_id, risk_level, visit_type, report_text,
+         fhir_bundle, int(pending_review)),
     )
 
 
@@ -194,6 +210,80 @@ def update_job(job_id: str, status: str, error: str | None = None):
 
 def get_job(job_id: str):
     return fetch_one("SELECT * FROM jobs WHERE job_id=?", (job_id,))
+
+def get_jobs_for_thread(thread_id: str) -> list:
+    return fetch_all("SELECT * FROM jobs WHERE thread_id=? ORDER BY created_at DESC", (thread_id,))
+
+def mark_stale_jobs_failed(stale_minutes: int = 10) -> int:
+    """
+    Mark jobs that have been 'running' for longer than stale_minutes as failed.
+    Called on job-status reads so stale background tasks are always surfaced.
+    Returns the number of rows updated.
+    """
+    def _mark():
+        with _db_lock:
+            c = conn()
+            cur = c.execute(
+                "UPDATE jobs SET status='failed', "
+                "error='stale: job exceeded time limit without completing', "
+                "updated_at=datetime('now') "
+                "WHERE status='running' AND updated_at <= datetime('now', ?)",
+                (f"-{stale_minutes} minutes",),
+            )
+            c.commit()
+            return cur.rowcount
+    return _retry_db_operation(_mark)
+
+
+def record_llm_failure(
+    thread_id: str,
+    node: str,
+    failure_type: str,
+    raw_snippet: str | None = None,
+    error_detail: str | None = None,
+) -> None:
+    """
+    Persist one LLM failure event to llm_failure_log.
+
+    failure_type must be one of:
+      "fallback_used"  — parse failed; hardcoded fallback was returned
+      "repair_used"    — first parse failed; repair attempt succeeded
+      "parse_error"    — parse failed; repair also failed
+      "api_error"      — LLM API call itself returned an error
+    """
+    exec_one(
+        "INSERT INTO llm_failure_log (thread_id, node, failure_type, raw_snippet, error_detail) "
+        "VALUES (?,?,?,?,?)",
+        (thread_id, node, failure_type, (raw_snippet or "")[:300], error_detail),
+    )
+
+
+def get_llm_failure_stats(days: int = 7) -> dict:
+    """Return LLM failure counts by type over the last N days."""
+    date_bound = f"-{days} days"
+    rows = fetch_all(
+        "SELECT failure_type, COUNT(*) AS n FROM llm_failure_log "
+        "WHERE created_at >= date('now', ?) GROUP BY failure_type",
+        (date_bound,),
+    )
+    by_type = {r["failure_type"]: r["n"] for r in rows}
+    total = fetch_one(
+        "SELECT COUNT(*) AS n FROM llm_failure_log WHERE created_at >= date('now', ?)",
+        (date_bound,),
+    ) or {}
+    top_node = fetch_one(
+        "SELECT node, COUNT(*) AS n FROM llm_failure_log "
+        "WHERE created_at >= date('now', ?) GROUP BY node ORDER BY n DESC LIMIT 1",
+        (date_bound,),
+    )
+    return {
+        "total_llm_failures": total.get("n", 0),
+        "fallbacks_used":     by_type.get("fallback_used", 0),
+        "repairs_used":       by_type.get("repair_used", 0),
+        "parse_errors":       by_type.get("parse_error", 0),
+        "api_errors":         by_type.get("api_error", 0),
+        "most_failing_node":  (top_node or {}).get("node"),
+    }
 
 
 def save_session_state(thread_id: str, state_obj: dict):
@@ -249,6 +339,71 @@ def seed_emergency_phrases(phrases: list[str]) -> None:
         add_emergency_phrase(p)
 
 
+# ---------------------------------------------------------------------------
+# Webhook delivery tracking
+# ---------------------------------------------------------------------------
+
+def create_webhook_delivery(
+    delivery_id: str,
+    thread_id: str,
+    event_type: str,
+    url_hash: str,
+    payload_hash: str,
+) -> None:
+    """Insert a new delivery record in 'pending' status."""
+    exec_one(
+        "INSERT INTO webhook_deliveries"
+        " (delivery_id, thread_id, event_type, url_hash, payload_hash, status, attempts)"
+        " VALUES (?,?,?,?,?,'pending',0)",
+        (delivery_id, thread_id, event_type, url_hash, payload_hash),
+    )
+
+
+def update_webhook_delivery(
+    delivery_id: str,
+    *,
+    status: str,
+    attempts: int,
+    last_http_status: int | None = None,
+    last_error: str | None = None,
+    next_retry_at: str | None = None,
+) -> None:
+    exec_one(
+        "UPDATE webhook_deliveries"
+        " SET status=?, attempts=?, last_http_status=?, last_error=?,"
+        "     next_retry_at=?, updated_at=datetime('now')"
+        " WHERE delivery_id=?",
+        (status, attempts, last_http_status, last_error, next_retry_at, delivery_id),
+    )
+
+
+def get_webhook_delivery_by_hash(
+    thread_id: str,
+    event_type: str,
+    payload_hash: str,
+) -> dict | None:
+    """Return the delivery record if an identical payload was already dispatched."""
+    return fetch_one(
+        "SELECT * FROM webhook_deliveries"
+        " WHERE thread_id=? AND event_type=? AND payload_hash=?"
+        " ORDER BY created_at DESC LIMIT 1",
+        (thread_id, event_type, payload_hash),
+    )
+
+
+def get_webhook_deliveries(thread_id: str | None = None, limit: int = 50) -> list:
+    """Return recent delivery records, optionally filtered to one thread."""
+    if thread_id:
+        return fetch_all(
+            "SELECT * FROM webhook_deliveries WHERE thread_id=?"
+            " ORDER BY created_at DESC LIMIT ?",
+            (thread_id, limit),
+        )
+    return fetch_all(
+        "SELECT * FROM webhook_deliveries ORDER BY created_at DESC LIMIT ?",
+        (limit,),
+    )
+
 
 def reset_demo_data() -> None:
     """Wipe all session data. Does not touch emergency_phrases or checkpoint DB."""
@@ -257,11 +412,67 @@ def reset_demo_data() -> None:
             c = conn()
             for table in [
                 "sessions", "messages", "reports", "escalations",
-                "jobs", "session_state", "idempotency",
+                "jobs", "session_state", "idempotency", "llm_failure_log",
+                "webhook_deliveries",
             ]:
                 c.execute(f"DELETE FROM {table}")
             c.commit()
     _retry_db_operation(_reset)
+
+
+_DEMO_PATIENTS = [
+    {
+        "patient_id": "demo-ava",
+        "name": "Ava Johnson",
+        "history": "Prior visit: Hypertension. Penicillin allergy.",
+        "data_json": json.dumps({
+            "identity": {"dob": "03/15/1985", "phone": "4125550199", "address": "100 Forbes Ave, Pittsburgh, PA"},
+            "allergies": ["penicillin"],
+            "medications": ["lisinopril 10mg daily"],
+            "pmh": ["hypertension"],
+            "recent_results": ["CBC normal (2025-11-10)"],
+        }),
+    },
+    {
+        "patient_id": "demo-marcus",
+        "name": "Marcus Thorne",
+        "history": "Prior cardiac stent placement in 2023.",
+        "data_json": json.dumps({
+            "identity": {"dob": "07/22/1970", "phone": "5550388844", "address": "12 Market St, Pittsburgh, PA"},
+            "allergies": [],
+            "medications": ["atorvastatin 40mg nightly"],
+            "pmh": ["coronary artery disease", "cardiac stent (2023)"],
+            "recent_results": [],
+        }),
+    },
+    {
+        "patient_id": "demo-nina",
+        "name": "Nina Shah",
+        "history": "Prior visit: Anxiety. No known drug allergies.",
+        "data_json": json.dumps({
+            "identity": {"dob": "11/03/1992", "phone": "5557772222", "address": "44 Walnut St, Chicago, IL"},
+            "allergies": [],
+            "medications": [],
+            "pmh": ["anxiety"],
+            "recent_results": [],
+        }),
+    },
+]
+
+
+def seed_demo_patients() -> None:
+    """Re-seed mock EHR demo patients, replacing any existing demo rows."""
+    def _seed():
+        with _db_lock:
+            c = conn()
+            c.execute("DELETE FROM mock_ehr WHERE patient_id LIKE 'demo-%'")
+            for p in _DEMO_PATIENTS:
+                c.execute(
+                    "INSERT INTO mock_ehr (patient_id, name, history, data_json) VALUES (?,?,?,?)",
+                    (p["patient_id"], p["name"], p["history"], p["data_json"]),
+                )
+            c.commit()
+    _retry_db_operation(_seed)
 
 
 
@@ -301,6 +512,8 @@ def get_analytics() -> dict:
     done_week = completed.get("n") or 0
     completion_rate = round(done_week / total_week * 100, 1) if total_week else 0.0
 
+    llm_stats = get_llm_failure_stats(days=7)
+
     return {
         "sessions_today": rows_today.get("n", 0),
         "sessions_last_7_days": total_week,
@@ -311,4 +524,5 @@ def get_analytics() -> dict:
         "pending_escalations": pending_esc.get("n", 0),
         "reports_generated_last_7_days": reports_week.get("n", 0),
         "failed_report_jobs_last_7_days": failed_jobs.get("n", 0),
+        "llm_failures_last_7_days": llm_stats,
     }

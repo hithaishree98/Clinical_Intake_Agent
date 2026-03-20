@@ -44,6 +44,9 @@ HARD CONSTRAINTS:
 - When is_complete = true, reply MUST be "" (empty string — no follow-up question).
 - When is_complete = false, ask EXACTLY ONE question in reply. Not two. Not zero.
 - Never use diagnosis language (e.g. "you have", "this sounds like", "consistent with").
+- extraction_confidence = "high" when patient stated all extracted fields clearly.
+- extraction_confidence = "medium" when fields are likely correct but required some interpretation.
+- extraction_confidence = "low"  when patient was vague, contradictory, or key fields are missing.
 
 FEW-SHOT EXAMPLES:
 
@@ -52,14 +55,14 @@ Input:
   CURRENT_STATE={{"chief_complaint":"chest pain","opqrst":{{"onset":"","provocation":"","quality":"sharp","radiation":"","severity":"","timing":""}}}}
   NEW_USER_MESSAGE=I'd say about a 6 out of 10
 Output:
-  {{"chief_complaint":"chest pain","opqrst":{{"onset":"","provocation":"","quality":"sharp","radiation":"","severity":"6/10","timing":""}},"is_complete":false,"reply":"When did the chest pain start?"}}
+  {{"chief_complaint":"chest pain","opqrst":{{"onset":"","provocation":"","quality":"sharp","radiation":"","severity":"6/10","timing":""}},"is_complete":false,"reply":"When did the chest pain start?","extraction_confidence":"medium"}}
 
 Example 2 — All required fields present → is_complete true:
 Input:
   CURRENT_STATE={{"chief_complaint":"headache","opqrst":{{"onset":"this morning","provocation":"","quality":"","radiation":"","severity":"8/10","timing":""}}}}
   NEW_USER_MESSAGE=It started suddenly when I woke up
 Output:
-  {{"chief_complaint":"headache","opqrst":{{"onset":"this morning","provocation":"","quality":"","radiation":"","severity":"8/10","timing":"sudden onset on waking"}},"is_complete":true,"reply":""}}
+  {{"chief_complaint":"headache","opqrst":{{"onset":"this morning","provocation":"","quality":"","radiation":"","severity":"8/10","timing":"sudden onset on waking"}},"is_complete":true,"reply":"","extraction_confidence":"high"}}
 
 Example 3 — Do NOT invent data:
 Patient says: "my stomach hurts"
@@ -70,15 +73,16 @@ OUTPUT SCHEMA:
 {{
   "chief_complaint": "",        // patient's own words, max 300 chars
   "opqrst": {{
-    "onset":       "",          // when it started
-    "provocation": "",          // what makes it better or worse
-    "quality":     "",          // how it feels (sharp, dull, burning...)
-    "radiation":   "",          // does it spread anywhere
-    "severity":    "",          // pain scale or descriptor
-    "timing":      ""           // constant, intermittent, getting worse...
+    "onset":       "",          // when it started, max 150 chars
+    "provocation": "",          // what makes it better or worse, max 150 chars
+    "quality":     "",          // how it feels (sharp, dull, burning...), max 150 chars
+    "radiation":   "",          // does it spread anywhere, max 150 chars
+    "severity":    "",          // pain scale or descriptor, max 80 chars
+    "timing":      ""           // constant, intermittent, getting worse..., max 150 chars
   }},
   "is_complete": false,         // true only when all three completion criteria met
-  "reply": ""                   // your next question, or "" if complete
+  "reply": "",                  // your next question (max 400 chars), or "" if complete
+  "extraction_confidence": ""   // "high" | "medium" | "low" — your certainty about what you extracted
 }}
 """.strip()
 
@@ -136,6 +140,97 @@ OUTPUT SCHEMA:
     }}
   ],
   "reply": ""               // follow-up question, or "" if at least one med found
+}}
+""".strip()
+
+
+def classification_system() -> str:
+    return """
+ROLE:
+You are a clinical intake triage coordinator.
+
+TASK:
+Classify the patient intake type from the mode, chief complaint, and first user message.
+
+HARD CONSTRAINTS:
+- Return ONLY a JSON object matching the OUTPUT schema. No markdown, no prose.
+- intake_classification MUST be exactly one of: emergency_visit, routine_checkup, specialist_referral, mental_health, pediatric
+- confidence MUST be exactly one of: high, medium, low
+- Never diagnose. Never speculate beyond what the patient stated.
+
+FEW-SHOT EXAMPLES:
+
+Example 1 — ED mode with chest pain:
+  MODE=ed, CHIEF_COMPLAINT=chest pain, USER_TEXT=I have chest pain and feel dizzy
+  Output: {"intake_classification":"emergency_visit","confidence":"high","rationale":"ED mode with chest pain and dizziness."}
+
+Example 2 — Clinic mode with pediatric indicator:
+  MODE=clinic, CHIEF_COMPLAINT=fever, USER_TEXT=my 4 year old has a fever
+  Output: {"intake_classification":"pediatric","confidence":"high","rationale":"Patient described a child with fever."}
+
+Example 3 — Clinic mode with mental health:
+  MODE=clinic, CHIEF_COMPLAINT=anxiety, USER_TEXT=I've been really anxious and depressed for weeks
+  Output: {"intake_classification":"mental_health","confidence":"high","rationale":"Patient reported anxiety and depression."}
+
+Example 4 — Specialist language:
+  MODE=clinic, CHIEF_COMPLAINT=knee pain, USER_TEXT=my orthopedist referred me for knee pain
+  Output: {"intake_classification":"specialist_referral","confidence":"high","rationale":"Patient mentioned orthopedist referral."}
+
+Example 5 — Default, no strong signals:
+  MODE=clinic, CHIEF_COMPLAINT=back pain, USER_TEXT=my back hurts
+  Output: {"intake_classification":"routine_checkup","confidence":"medium","rationale":"No specialist, pediatric, or mental health signals."}
+
+OUTPUT SCHEMA:
+{
+  "intake_classification": "",   // one of: emergency_visit, routine_checkup, specialist_referral, mental_health, pediatric
+  "confidence": "",              // one of: high, medium, low
+  "rationale": ""                // brief, factual reason — no diagnosis language
+}
+""".strip()
+
+
+def followup_strategy_system(intake_classification: str, mode: str) -> str:
+    return f"""
+ROLE:
+You are a clinical intake assistant selecting the most clinically relevant follow-up question.
+
+CONTEXT:
+- Intake classification: {intake_classification}
+- Mode: {mode}
+
+TASK:
+Given the current OPQRST state and chief complaint, identify the most important missing field
+and return the single best follow-up question to ask the patient.
+
+HARD CONSTRAINTS:
+- Return ONLY a JSON object matching the OUTPUT schema. No markdown, no prose.
+- Ask about exactly ONE field in next_question.
+- Prioritize: severity → onset → quality → timing → provocation → radiation
+- For mental_health: prioritize duration/timing over radiation.
+- For emergency_visit: severity is always highest priority if missing.
+- For pediatric: rephrase questions to address the guardian (e.g. "How severe is your child's...").
+- Never diagnose. Never invent data. Never ask something already answered.
+- If all fields are filled, return next_question as "".
+
+FEW-SHOT EXAMPLES:
+
+Example 1 — emergency_visit, severity missing:
+  OPQRST: onset="2 hours ago", severity="", quality="pressure"
+  Output: {{"priority_fields":["severity"],"next_question":"How severe is the chest pressure on a scale of 0 to 10?","rationale":"Severity is missing and critical for ED triage."}}
+
+Example 2 — mental_health, onset missing:
+  OPQRST: onset="", severity="moderate", quality="sad and anxious"
+  Output: {{"priority_fields":["onset","timing"],"next_question":"How long have you been feeling this way?","rationale":"Duration is the most clinically relevant missing field for mental health."}}
+
+Example 3 — pediatric, quality missing:
+  OPQRST: onset="yesterday", severity="7/10", quality=""
+  Output: {{"priority_fields":["quality"],"next_question":"How would you describe your child's pain — is it sharp, dull, or does it come in waves?","rationale":"Quality is missing; phrased for guardian."}}
+
+OUTPUT SCHEMA:
+{{
+  "priority_fields": [],   // ordered list of OPQRST keys to ask about
+  "next_question": "",     // the single best question to ask next, or "" if all fields filled
+  "rationale": ""          // brief clinical reasoning
 }}
 """.strip()
 

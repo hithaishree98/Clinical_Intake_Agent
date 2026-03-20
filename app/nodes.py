@@ -8,12 +8,21 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Dict
+from typing import Dict, List
 
 from .prompts import subjective_extract_system, meds_extract_system, report_system
 from .state import IntakeState
-from .schemas import SubjectiveOut, MedsOut
+from .schemas import SubjectiveOut, MedsOut, ReportInputState
 from .llm import run_json_step, get_gemini, validate_llm_response
+from .agentic import (
+    classify_intake,
+    select_followup,
+    adapt_clinical_question,
+    score_extraction_quality,
+    build_gap_fill_question,
+    build_validation_gap_message,
+)
+from .safety import SafetyChecker, build_reason_trail
 from .logging_utils import log_event
 from . import sqlite_db as db
 from . import fhir_builder
@@ -71,6 +80,8 @@ def _summary_identity(x: Dict[str, str]) -> str:
 def _check_crisis(user: str, state: IntakeState) -> str | None:
     """
     Run crisis detection. Returns crisis resource message if triggered, else None.
+    Also returns a state-patch dict as the second value so callers can set crisis_detected=True.
+    Call site must merge the patch into the return dict.
     """
     crisis_flags = detect_crisis(user)
     if not crisis_flags:
@@ -84,7 +95,9 @@ def _check_crisis(user: str, state: IntakeState) -> str | None:
     db.create_escalation(
         thread_id=thread_id,
         kind="crisis",
-        payload={"matched_phrases": crisis_flags},
+        payload=build_reason_trail(
+            "crisis", state, extra_data={"matched_phrases": crisis_flags}
+        ),
     )
     webhook.dispatch_crisis_alert(
         thread_id=thread_id,
@@ -98,6 +111,76 @@ def _safe_reply(text: str) -> str:
     """Run LLM response through the diagnosis-language guardrail."""
     safe, _ = validate_llm_response(text)
     return safe
+
+
+def _track_llm_failure(thread_id: str, node: str, meta: dict) -> None:
+    """
+    Persist one LLM failure row when run_json_step degraded.
+
+    Called whenever meta["fallback_used"] is True or meta["repair_used"] is True.
+    Does not raise — tracking failures must never break the happy path.
+    """
+    if not (meta.get("fallback_used") or meta.get("repair_used")):
+        return
+    failure_type = "fallback_used" if meta.get("fallback_used") else "repair_used"
+    try:
+        db.record_llm_failure(
+            thread_id=thread_id,
+            node=node,
+            failure_type=failure_type,
+            raw_snippet=(meta.get("raw_preview") or "")[:300],
+            error_detail=meta.get("parse_error") or meta.get("llm_error") or "",
+        )
+    except Exception as exc:
+        log_event("llm_failure_log_error", level="warning",
+                  thread_id=thread_id, node=node, error=str(exc)[:200])
+
+
+def _failure_state_patch(meta: dict, phase: str) -> dict:
+    """
+    Return a state-patch dict with last_failed_phase / last_failure_reason
+    when meta indicates an LLM degradation.  Returns {} when the LLM was clean.
+    """
+    if meta.get("fallback_used"):
+        return {
+            "last_failed_phase": phase,
+            "last_failure_reason": f"fallback_used: {(meta.get('parse_error') or 'unknown')[:120]}",
+        }
+    if meta.get("repair_used"):
+        return {
+            "last_failed_phase": phase,
+            "last_failure_reason": f"repair_used: {(meta.get('parse_error') or 'unknown')[:120]}",
+        }
+    return {}
+
+
+def _build_validated_report_state(state: IntakeState) -> ReportInputState:
+    """
+    Extract and validate all fields consumed by report_node and fhir_builder.
+
+    Constructs a ReportInputState from the raw IntakeState, applying Pydantic
+    bounds and coercion.  Both the clinician note and the FHIR bundle are built
+    from the returned model — never from raw state — proving that every artifact
+    is generated from validated structured state, not raw chat content.
+
+    Never raises: validation failures fall back to field defaults (empty strings,
+    empty lists).  Any error is logged as a warning.
+    """
+    try:
+        return ReportInputState(
+            identity=state.get("identity") or {},
+            chief_complaint=state.get("chief_complaint") or "",
+            opqrst=state.get("opqrst") or {},
+            allergies=state.get("allergies") or [],
+            medications=state.get("medications") or [],
+            pmh=state.get("pmh") or [],
+            recent_results=state.get("recent_results") or [],
+            triage=state.get("triage") or {},
+        )
+    except Exception as exc:
+        log_event("report_state_validation_error", level="warning",
+                  thread_id=state.get("thread_id", ""), error=str(exc)[:300])
+        return ReportInputState()
 
 
 # ---------------------------------------------------------------------------
@@ -262,7 +345,12 @@ def identity_review_node(state: IntakeState):
             db.create_escalation(
                 thread_id=thread_id,
                 kind="identity_review",
-                payload={"stored_identity": stored, "new_identity": identity},
+                payload=build_reason_trail(
+                    "identity_review",
+                    {**state, "identity": identity, "stored_identity": stored,
+                     "current_phase": "identity_review"},
+                    extra_data={"stored_identity": stored, "new_identity": identity},
+                ),
             )
             name = (identity or {}).get("name") or "unknown patient"
             log_event("identity_mismatch_escalated", thread_id=thread_id,
@@ -393,6 +481,8 @@ def subjective_node(state: IntakeState):
     crisis_reply = _check_crisis(user, state)
     if crisis_reply:
         return {
+            "crisis_detected": True,   # persisted so SafetyChecker can flag for human review
+            "human_review_required": True,
             "messages": [{"role": "assistant", "text": crisis_reply}],
             "current_phase": "subjective",   # don't terminate — patient may still want to complete
         }
@@ -408,7 +498,15 @@ def subjective_node(state: IntakeState):
             "confidence": "high",
             "rationale": "Red-flag phrase detected in patient input.",
         }
-        db.create_escalation(thread_id=thread_id, kind="emergency", payload={"triage": triage})
+        db.create_escalation(
+            thread_id=thread_id,
+            kind="emergency",
+            payload=build_reason_trail(
+                "emergency",
+                {**state, "triage": triage, "current_phase": "subjective"},
+                extra_data={"red_flags": flags, "triage": triage},
+            ),
+        )
         db.set_session_status(thread_id, "escalated")
         log_event("emergency_escalation", level="warning",
                   thread_id=thread_id, red_flags=flags)
@@ -440,20 +538,33 @@ def subjective_node(state: IntakeState):
         prompt=prompt,
         schema=SubjectiveOut,
         fallback={
-            "chief_complaint": cc,
-            "opqrst": op,
+            "chief_complaint": cc[:300],
+            "opqrst": {k: (v or "")[:150] for k, v in op.items()},
             "is_complete": False,
             "reply": "When did it start, and how severe is it from 0-10?",
+            "extraction_confidence": "low",
         },
         temperature=0.2,
     )
     log_event("llm_step", thread_id=thread_id, node="subjective", **meta)
+    _track_llm_failure(thread_id, "subjective", meta)
 
     out    = obj.model_dump()
     new_cc = (out.get("chief_complaint") or "").strip()
     new_op = out.get("opqrst") or {}
+    llm_extraction_confidence = out.get("extraction_confidence") or "medium"
 
+    # Feature 1: classify intake on first chief complaint extraction
+    classification = state.get("intake_classification")
+    classification_confidence = state.get("classification_confidence")
     if new_cc and not cc:
+        cc = new_cc
+        mode_for_classify = state.get("mode") or "clinic"
+        classification, classification_confidence, cls_meta = classify_intake(mode_for_classify, cc, user)
+        log_event("intake_classified", thread_id=thread_id,
+                  classification=classification, confidence=classification_confidence, **cls_meta)
+        _track_llm_failure(thread_id, "classify_intake", cls_meta)
+    elif new_cc:
         cc = new_cc
 
     for k in op.keys():
@@ -472,6 +583,8 @@ def subjective_node(state: IntakeState):
             return {
                 "chief_complaint": cc,
                 "opqrst": op,
+                "intake_classification": classification,
+                "classification_confidence": classification_confidence,
                 "subjective_complete": False,
                 "triage_attempts": attempts + 1,
                 "messages": [{"role": "assistant", "text":
@@ -480,27 +593,64 @@ def subjective_node(state: IntakeState):
                 "current_phase": "subjective",
             }
 
+        # Feature 3: quality gate — retry with targeted gap-fill before advancing
+        QUALITY_THRESHOLD = 0.75 if mode == "ed" else 0.60
+        MAX_RETRY = 2
+        retry_count = int(state.get("extraction_retry_count") or 0)
+        quality_score = score_extraction_quality(cc, op)
+
+        if quality_score < QUALITY_THRESHOLD and retry_count < MAX_RETRY:
+            gap_q = build_gap_fill_question(cc, op, classification or "routine_checkup")
+            log_event("extraction_quality_retry", thread_id=thread_id,
+                      score=quality_score, retry=retry_count + 1)
+            return {
+                "chief_complaint": cc,
+                "opqrst": op,
+                "intake_classification": classification,
+                "classification_confidence": classification_confidence,
+                "extraction_quality_score": quality_score,
+                "extraction_retry_count": retry_count + 1,
+                "extraction_confidence": llm_extraction_confidence,
+                "subjective_complete": False,
+                "messages": [{"role": "assistant", "text": gap_q}],
+                "current_phase": "subjective",
+            }
+
         triage = compute_basic_triage(mode, cc, op)
+        # Feature 4: route through validate_node before advancing to clinical_history
         return {
             "chief_complaint": cc,
             "opqrst": op,
+            "intake_classification": classification,
+            "classification_confidence": classification_confidence,
+            "extraction_quality_score": score_extraction_quality(cc, op),
+            "extraction_retry_count": retry_count,
+            "extraction_confidence": llm_extraction_confidence,
             "triage": triage,
             "needs_emergency_review": False,
             "subjective_complete": True,
             "clinical_step": "allergies",
-            "messages": [{"role": "assistant", "text":
-                "Do you have any allergies — especially to medications or latex? "
-                "If none, say 'none'."}],
-            "current_phase": "clinical_history",
+            "validation_target_phase": "clinical_history",
+            "validation_errors": [],
+            "current_phase": "validate",
         }
+
+    # Feature 2: dynamic follow-up — select the most relevant next question
+    cls = classification or "routine_checkup"
+    dynamic_q, fu_meta = select_followup(cls, state.get("mode") or "clinic", cc, op)
+    _track_llm_failure(thread_id, "select_followup", fu_meta)
+    best_reply = dynamic_q or reply or "When did it start, and how severe is it from 0-10?"
 
     return {
         "chief_complaint": cc,
         "opqrst": op,
+        "intake_classification": classification,
+        "classification_confidence": classification_confidence,
+        "extraction_confidence": llm_extraction_confidence,
         "subjective_complete": False,
-        "messages": [{"role": "assistant",
-                      "text": reply or "When did it start, and how severe is it from 0-10?"}],
+        "messages": [{"role": "assistant", "text": best_reply}],
         "current_phase": "subjective",
+        **_failure_state_patch(meta, "subjective"),
     }
 
 
@@ -568,6 +718,8 @@ def clinical_history_node(state: IntakeState):
     user = last_user(state).strip()
     step = state.get("clinical_step") or "allergies"
     thread_id = state.get("thread_id", "")
+    # Feature 2: adapt questions based on intake classification
+    cls = state.get("intake_classification") or "routine_checkup"
 
     if step == "allergies":
         if not user or is_ack(user):
@@ -579,32 +731,38 @@ def clinical_history_node(state: IntakeState):
                 "clinical_step": "allergies",
             }
         allergies = extract_allergies_simple(user)
+        meds_q = adapt_clinical_question("meds", cls) or (
+            "What medications are you currently taking? "
+            "Include the name, dose, how often, and when you last took it. "
+            "If none, say 'none'."
+        )
         return {
             "allergies": allergies,
             "clinical_step": "meds",
-            "messages": [{"role": "assistant", "text":
-                "What medications are you currently taking? "
-                "Include the name, dose, how often, and when you last took it. "
-                "If none, say 'none'."}],
+            "messages": [{"role": "assistant", "text": meds_q}],
             "current_phase": "clinical_history",
         }
 
     if step == "meds":
+        meds_q = adapt_clinical_question("meds", cls) or (
+            "What medications are you currently taking? "
+            "Include dose, frequency, and last taken time if you know. "
+            "If none, say 'none'."
+        )
         if not user or is_ack(user):
             return {
-                "messages": [{"role": "assistant", "text":
-                    "What medications are you currently taking? "
-                    "Include dose, frequency, and last taken time if you know. "
-                    "If none, say 'none'."}],
+                "messages": [{"role": "assistant", "text": meds_q}],
                 "current_phase": "clinical_history",
                 "clinical_step": "meds",
             }
+        pmh_q = adapt_clinical_question("pmh", cls) or (
+            "Any past medical conditions or surgeries? If none, say 'none'."
+        )
         if user.strip().lower() in {"none", "no", "no meds", "not taking anything", "nothing"}:
-                return {
+            return {
                 "medications": [],
                 "clinical_step": "pmh",
-                "messages": [{"role": "assistant", "text":
-                    "Any past medical conditions or surgeries? If none, say 'none'."}],
+                "messages": [{"role": "assistant", "text": pmh_q}],
                 "current_phase": "clinical_history",
             }
 
@@ -616,6 +774,7 @@ def clinical_history_node(state: IntakeState):
             temperature=0.2,
         )
         log_event("llm_step", thread_id=thread_id, node="medications", **meta)
+        _track_llm_failure(thread_id, "medications", meta)
 
         out    = obj.model_dump()
         parsed = out.get("medications") or []
@@ -627,54 +786,157 @@ def clinical_history_node(state: IntakeState):
                     reply or "Could you list the medication names you take?"}],
                 "current_phase": "clinical_history",
                 "clinical_step": "meds",
+                **_failure_state_patch(meta, "clinical_history"),
             }
         return {
             "medications": parsed,
             "clinical_step": "pmh",
-            "messages": [{"role": "assistant", "text":
-                "Any past medical conditions or surgeries? If none, say 'none'."}],
+            "messages": [{"role": "assistant", "text": pmh_q}],
             "current_phase": "clinical_history",
+            **_failure_state_patch(meta, "clinical_history"),
         }
 
     if step == "pmh":
+        pmh_q = adapt_clinical_question("pmh", cls) or (
+            "Any past medical conditions or surgeries? If none, say 'none'."
+        )
         if not user or is_ack(user):
             return {
-                "messages": [{"role": "assistant", "text":
-                    "Any past medical conditions or surgeries? If none, say 'none'."}],
+                "messages": [{"role": "assistant", "text": pmh_q}],
                 "current_phase": "clinical_history",
                 "clinical_step": "pmh",
             }
         pmh = extract_list_simple(user)
+        results_q = adapt_clinical_question("results", cls) or (
+            "Have you had any recent lab tests or imaging (bloodwork, X-ray, CT, etc.) "
+            "since your last visit? If none, say 'none'."
+        )
         return {
             "pmh": pmh,
             "clinical_step": "results",
-            "messages": [{"role": "assistant", "text":
-                "Have you had any recent lab tests or imaging (bloodwork, X-ray, CT, etc.) "
-                "since your last visit? If none, say 'none'."}],
+            "messages": [{"role": "assistant", "text": results_q}],
             "current_phase": "clinical_history",
         }
 
     if step == "results":
+        results_q = adapt_clinical_question("results", cls) or (
+            "Any recent lab tests or imaging since your last visit? If none, say 'none'."
+        )
         if not user or is_ack(user):
             return {
-                "messages": [{"role": "assistant", "text":
-                    "Any recent lab tests or imaging since your last visit? If none, say 'none'."}],
+                "messages": [{"role": "assistant", "text": results_q}],
                 "current_phase": "clinical_history",
                 "clinical_step": "results",
             }
         results = extract_list_simple(user)
         summary = _confirm_summary({**state, "recent_results": results})
+        # Feature 4: route through validate_node before confirm
         return {
             "recent_results": results,
             "clinical_complete": True,
             "clinical_step": "done",
-            "current_phase": "confirm",
+            "validation_target_phase": "confirm",
+            "validation_errors": [],
+            "current_phase": "validate",
             "messages": [{"role": "assistant", "text":
                 summary + "\n\nReply 'confirm' to generate the clinician note, "
                 "or tell me what you'd like to change."}],
         }
 
     return {"current_phase": "report"}
+
+
+# ---------------------------------------------------------------------------
+# Validate node  (Feature 4 — agentic validation gate)
+# ---------------------------------------------------------------------------
+
+# Values that an LLM might write into OPQRST fields that are not clinically
+# useful. Treated as empty for validation purposes so ambiguous extraction
+# cannot silently advance the state machine.
+_OPQRST_PLACEHOLDERS = frozenset({
+    "none", "n/a", "na", "unknown", "not provided", "not sure",
+    "unsure", "unclear", "unspecified", "not applicable", "not known",
+    "not given",
+})
+
+
+def _is_substantive(val: str) -> bool:
+    """Return True only when val is non-empty and not a known placeholder."""
+    v = (val or "").strip().lower()
+    return bool(v) and v not in _OPQRST_PLACEHOLDERS
+
+
+def validate_node(state: IntakeState):
+    """
+    Non-interactive routing node that enforces completeness before a phase transition.
+
+    Runs synchronously within the same graph.invoke() call — NOT in interrupt_after.
+    On success → routes to validation_target_phase.
+    On failure → routes back to the source phase with a targeted gap-fill message.
+
+    Guard details for target == "clinical_history":
+      - chief_complaint must be non-empty
+      - at least 2 of {onset, severity, quality} must be substantive
+        (non-empty AND not a placeholder like "unknown" / "n/a")
+      - ED mode additionally requires severity to be substantive
+    """
+    target = state.get("validation_target_phase") or "clinical_history"
+    mode   = state.get("mode") or "clinic"
+    errors: list[str] = []
+
+    if target == "clinical_history":
+        cc = (state.get("chief_complaint") or "").strip()
+        op = state.get("opqrst") or {}
+        if not cc:
+            errors.append("chief_complaint")
+        key_filled = sum(
+            1 for f in ["onset", "severity", "quality"]
+            if _is_substantive(op.get(f) or "")
+        )
+        if key_filled < 2:
+            errors.append("opqrst_incomplete")
+        # ED always requires a substantive severity, even if two other key fields pass
+        if mode == "ed" and not _is_substantive(op.get("severity") or ""):
+            if "opqrst_incomplete" not in errors:
+                errors.append("severity_required")
+
+        # If the LLM flagged its own extraction as low-confidence and the session
+        # has already been through at least one retry, ask the patient to clarify.
+        # This is NOT a hard block — it routes back to subjective for one more turn.
+        conf = state.get("extraction_confidence") or "medium"
+        retry_count = int(state.get("extraction_retry_count") or 0)
+        if conf == "low" and retry_count >= 1 and not errors:
+            # Only trigger if no other errors already caught — avoids sending
+            # the patient two different error messages in the same turn.
+            errors.append("extraction_confidence_low")
+
+    elif target == "confirm":
+        if state.get("allergies") is None:
+            errors.append("allergies_not_collected")
+        if not state.get("clinical_complete"):
+            errors.append("clinical_history_incomplete")
+
+    if not errors:
+        log_event("validation_passed", thread_id=state.get("thread_id", ""),
+                  target_phase=target)
+        return {
+            "validation_errors": [],
+            "current_phase": target,
+        }
+
+    # Validation failed — route back to source phase with gap message
+    back_phase = "subjective" if target == "clinical_history" else "clinical_history"
+    cc = (state.get("chief_complaint") or "").strip()
+    gap_msg = build_validation_gap_message(errors, cc, mode)
+    log_event("validation_failed", level="warning",
+              thread_id=state.get("thread_id", ""),
+              target_phase=target, errors=errors)
+    return {
+        "validation_errors": errors,
+        "current_phase": back_phase,
+        "subjective_complete": False if back_phase == "subjective" else state.get("subjective_complete"),
+        "messages": [{"role": "assistant", "text": gap_msg}],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -737,21 +999,91 @@ def _fmt_meds_fallback(meds: list) -> str:
     return "\n".join(lines)
 
 
+_REPORT_REQUIRED_SECTIONS = [
+    "SUBJECTIVE INTAKE",
+    "CLINICAL HISTORY",
+    "PATIENT IDENTITY",
+]
+
+
+def _validate_report_content(text: str) -> List[str]:
+    """
+    Inspect a generated report for structural and safety issues.
+
+    Returns a list of warning codes (empty = all clear).  Called before
+    db.save_report() so problems are logged before the artifact is persisted.
+
+    Codes:
+      report_too_short           — less than 150 characters (likely empty/truncated)
+      report_too_long            — exceeds 6000 characters
+      missing_section_<name>     — required section header absent
+      diagnosis_language         — LLM drifted into diagnosis language
+    """
+    warnings: List[str] = []
+    stripped = (text or "").strip()
+
+    if len(stripped) < 150:
+        warnings.append("report_too_short")
+    if len(stripped) > 6000:
+        warnings.append("report_too_long")
+
+    for section in _REPORT_REQUIRED_SECTIONS:
+        if section not in stripped:
+            warnings.append(f"missing_section_{section.lower().replace(' ', '_')}")
+
+    from .llm import validate_llm_response
+    _, modified = validate_llm_response(stripped)
+    if modified:
+        warnings.append("diagnosis_language")
+
+    return warnings
+
+
 def report_node(state: IntakeState):
-    identity = state.get("identity") or {}
-    cc       = state.get("chief_complaint") or "Unknown/Not provided"
-    op       = state.get("opqrst") or {}
-    allergies = state.get("allergies") or []
-    meds      = state.get("medications") or []
-    pmh       = state.get("pmh") or []
-    results   = state.get("recent_results") or []
     thread_id = state.get("thread_id", "")
+
+    # --- Safety preflight: block report if required fields are missing ---
+    preflight = SafetyChecker.compute(state)
+    if not preflight.ok:
+        log_event("report_blocked_preflight", level="warning",
+                  thread_id=thread_id,
+                  blocking_reasons=preflight.blocking_reasons,
+                  safety_score=preflight.safety_score)
+        db.create_escalation(
+            thread_id=thread_id,
+            kind="report_blocked",
+            payload=build_reason_trail(
+                "report_blocked", state,
+                override_reasons=preflight.blocking_reasons,
+            ),
+        )
+        db.set_session_status(thread_id, "escalated")
+        return {
+            "human_review_required": True,
+            "human_review_reasons":  preflight.blocking_reasons,
+            "safety_score":          preflight.safety_score,
+            "messages": [{"role": "assistant", "text":
+                "Some required information is missing from your intake. "
+                "A clinician has been notified and will follow up with you directly."}],
+            "current_phase": "handoff",
+        }
+
+    # Build and validate the state snapshot — both the clinician note and the
+    # FHIR bundle are generated from this validated model, never from raw state.
+    validated = _build_validated_report_state(state)
+    identity  = validated.identity.model_dump()
+    cc        = validated.chief_complaint or "Unknown/Not provided"
+    op        = validated.opqrst.model_dump()
+    allergies = validated.allergies
+    meds      = [m.model_dump() for m in validated.medications]
+    pmh       = validated.pmh
+    results   = validated.recent_results
 
     payload = {
         "identity": identity, "chief_complaint": cc,
         "opqrst": op, "allergies": allergies,
         "medications": meds, "pmh": pmh,
-        "recent_results": results, "triage": state.get("triage") or {},
+        "recent_results": results, "triage": validated.triage,
     }
 
     res = get_gemini().generate_text(
@@ -790,20 +1122,63 @@ def report_node(state: IntakeState):
     else:
         report_text = res.text.strip()
 
-    # FHIR bundle — failure never blocks the clinician note
+    content_warnings = _validate_report_content(report_text)
+    if content_warnings:
+        log_event("report_content_warnings", level="warning",
+                  thread_id=thread_id, warnings=content_warnings)
+        if "diagnosis_language" in content_warnings:
+            # Report contains diagnosis language — discard and use the safe fallback
+            log_event("report_diagnosis_language_discarded", level="warning",
+                      thread_id=thread_id)
+            allergies_line = "NKDA" if not allergies else ", ".join(allergies)
+            report_text = (
+                f"SUBJECTIVE INTAKE\n"
+                f"Chief Complaint (CC): {cc}\n\n"
+                f"History of Present Illness (HPI):\n"
+                f"  Onset:       {op.get('onset') or 'Unknown/Not provided'}\n"
+                f"  Provocation: {op.get('provocation') or 'Unknown/Not provided'}\n"
+                f"  Quality:     {op.get('quality') or 'Unknown/Not provided'}\n"
+                f"  Radiation:   {op.get('radiation') or 'Unknown/Not provided'}\n"
+                f"  Severity:    {op.get('severity') or 'Unknown/Not provided'}\n"
+                f"  Timing:      {op.get('timing') or 'Unknown/Not provided'}\n\n"
+                f"CLINICAL HISTORY & SAFETY\n"
+                f"*** ALLERGIES (IMPORTANT): {allergies_line} ***\n"
+                f"Current Medications:\n{_fmt_meds_fallback(meds)}\n"
+                f"Past Medical History: {', '.join(pmh) if pmh else 'None reported'}\n"
+                f"Recent Lab/Imaging: {', '.join(results) if results else 'None reported'}\n\n"
+                f"PATIENT IDENTITY\n"
+                f"  Name:    {identity.get('name') or 'Unknown'}\n"
+                f"  DOB:     {identity.get('dob') or 'Unknown'}\n"
+                f"  Phone:   {identity.get('phone') or 'Unknown'}\n"
+                f"  Address: {identity.get('address') or 'Unknown'}\n"
+            )
+
+    # FHIR bundle — validate input first, then build from validated state.
+    # Failure never blocks the clinician note.
     fhir_json: str | None = None
+    fhir_warnings = fhir_builder.validate_fhir_input(validated.model_dump())
+    if fhir_warnings:
+        log_event("fhir_input_warnings", level="warning",
+                  thread_id=thread_id, warnings=fhir_warnings)
     try:
-        bundle    = fhir_builder.build_bundle(dict(state))
+        bundle    = fhir_builder.build_bundle(validated.model_dump())
         fhir_json = json.dumps(bundle, indent=2)
         log_event("fhir_bundle_built", thread_id=thread_id,
-                  resource_count=len(bundle.get("entry", [])))
+                  resource_count=len(bundle.get("entry", [])),
+                  input_warnings=fhir_warnings or None)
     except Exception as e:
         log_event("fhir_bundle_error", level="warning",
                   thread_id=thread_id, error=str(e)[:200])
 
-    triage = state.get("triage") or {}
-    db.save_report(thread_id, triage.get("risk_level") or "low",
-                   triage.get("visit_type") or "routine", report_text, fhir_json)
+    triage = validated.triage
+    db.save_report(
+        thread_id,
+        triage.get("risk_level") or "low",
+        triage.get("visit_type") or "routine",
+        report_text,
+        fhir_json,
+        pending_review=preflight.review_required,
+    )
     db.set_session_status(thread_id, "done")
 
 
@@ -823,6 +1198,9 @@ def report_node(state: IntakeState):
     )
 
     return {
+        "human_review_required": preflight.review_required,
+        "human_review_reasons":  preflight.review_reasons,
+        "safety_score":          preflight.safety_score,
         "messages": [{"role": "assistant", "text":
             "Your intake is complete. Click \"View Report\" to see the clinician note."}],
         "current_phase": "done",

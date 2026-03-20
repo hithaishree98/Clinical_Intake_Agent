@@ -194,6 +194,16 @@ _CRISIS_PHRASES = [
     "thinking about suicide", "taking my own life",
 ]
 
+# Regex patterns that catch morphological variants the phrase list misses:
+#   "killing/killed myself"  (cr_002), "ending/ended my life" (cr_003),
+#   "hurting/hurts myself"   — same stem, different conjugation.
+_CRISIS_REGEX_PATTERNS = [
+    r"\bkill\w*\s+myself\b",    # killing myself, killed myself, kills myself
+    r"\bend\w*\s+my\s+life\b",  # ending my life, ended my life
+    r"\bhurt\w*\s+myself\b",    # hurting myself, hurts myself
+]
+_CRISIS_REGEX = re.compile("|".join(_CRISIS_REGEX_PATTERNS), re.IGNORECASE)
+
 CRISIS_RESOURCE = (
     "I noticed what you shared, and I want to make sure you're okay. "
     "If you're having thoughts of hurting yourself, please reach out to the "
@@ -208,9 +218,21 @@ def detect_crisis(text: str) -> List[str]:
     Returns list of matched crisis phrases (empty = no crisis).
     Caller should return CRISIS_RESOURCE to patient and create a 'crisis' escalation.
     Session should NOT be terminated — patient may still want to complete intake.
+
+    Two-pass detection:
+      Pass 1 — exact substring match against _CRISIS_PHRASES (fast, high precision).
+      Pass 2 — regex match for morphological variants (killing/ended/hurting myself).
     """
     t = (text or "").lower()
-    return [p for p in _CRISIS_PHRASES if p in t]
+    matched: List[str] = [p for p in _CRISIS_PHRASES if p in t]
+
+    for m in _CRISIS_REGEX.finditer(text):
+        phrase = m.group(0).lower()
+        # Avoid duplicates: only add if the stem isn't already covered by phrase list
+        if not any(phrase in existing or existing in phrase for existing in matched):
+            matched.append(phrase)
+
+    return matched
 
 
 # ---------------------------------------------------------------------------

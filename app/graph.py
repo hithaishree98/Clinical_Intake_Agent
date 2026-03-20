@@ -14,6 +14,7 @@ def route(state: IntakeState):
         "identity":         "identity_node",
         "identity_review":  "identity_review_node",
         "subjective":       "subjective_node",
+        "validate":         "validate_node",      
         "clinical_history": "clinical_history_node",
         "report":           "report_node",
         "handoff":          "handoff_node",
@@ -35,6 +36,7 @@ def build_graph():
     g.add_node("identity_node",         nodes.identity_node)
     g.add_node("identity_review_node",  nodes.identity_review_node)
     g.add_node("subjective_node",       nodes.subjective_node)
+    g.add_node("validate_node",         nodes.validate_node)   # agentic: non-interactive
     g.add_node("clinical_history_node", nodes.clinical_history_node)
     g.add_node("report_node",           nodes.report_node)
     g.add_node("handoff_node",          nodes.handoff_node)
@@ -47,6 +49,7 @@ def build_graph():
         "identity_node",
         "identity_review_node",
         "subjective_node",
+        "validate_node",        
         "clinical_history_node",
         "confirm_node",
     ]:
