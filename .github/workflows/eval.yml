@@ -1,0 +1,202 @@
+name: Eval
+
+# Run the extraction eval harness on every PR that touches prompts, nodes,
+# or eval definitions. A failing category (0% precision/recall on a
+# deterministic category) fails the PR check so regressions are caught before
+# merge.
+#
+# Deterministic evals (9/11 categories) run on every PR — no LLM key needed.
+# LLM evals (opqrst_extraction, llm_reliability) run only when GEMINI_API_KEY
+# is available as a repository secret (not exposed to forks).
+
+on:
+  pull_request:
+    paths:
+      - "app/prompts.py"
+      - "app/nodes.py"
+      - "app/llm.py"
+      - "app/agentic.py"
+      - "app/extract.py"
+      - "app/safety.py"
+      - "evals/**"
+
+jobs:
+  # ─── Deterministic evals — always run, no secrets needed ──────────────────
+  eval-deterministic:
+    name: Deterministic Evals (9 categories)
+    runs-on: ubuntu-latest
+
+    env:
+      GEMINI_API_KEY: "ci-placeholder-key"
+      JWT_SECRET: "eval-jwt-secret-32-chars-minimum!!"
+      CLINICIAN_PASSWORD: "eval-test-password"
+      DEBUG_MODE: "true"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run deterministic evals
+        run: |
+          mkdir -p eval-results
+          python -m evals.run_evals --output eval-results/deterministic.json
+        # Exits 1 only on import error or uncaught exception — all 9 deterministic
+        # categories must complete without crashing.
+
+      - name: Upload eval report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-deterministic-${{ github.sha }}
+          path: eval-results/deterministic.json
+          retention-days: 30
+
+      - name: Post summary to PR
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let body = '### Deterministic Eval Results\n\n';
+            try {
+              const report = JSON.parse(fs.readFileSync('eval-results/deterministic.json', 'utf8'));
+              const metrics = report.metrics || [];
+              body += `| Category | Cases | Pass | Precision | Recall | F1 |\n`;
+              body += `|---|---|---|---|---|---|\n`;
+              let totalCases = 0, totalPassed = 0;
+              for (const m of metrics) {
+                const p = (m.precision * 100).toFixed(1);
+                const r = (m.recall * 100).toFixed(1);
+                const f = (m.f1 * 100).toFixed(1);
+                const icon = m.passed === m.total ? '✅' : (m.passed / m.total >= 0.8 ? '⚠️' : '❌');
+                body += `| ${icon} ${m.category} | ${m.total} | ${m.passed} | ${p}% | ${r}% | ${f}% |\n`;
+                totalCases  += m.total;
+                totalPassed += m.passed;
+              }
+              const pct = totalCases ? ((totalPassed / totalCases) * 100).toFixed(1) : '0.0';
+              body += `\n**Overall: ${totalPassed}/${totalCases} passed (${pct}%)**`;
+              body += `\n_Elapsed: ${report.elapsed_s}s — deterministic only (no LLM calls)_`;
+            } catch (e) {
+              body += `_Could not parse eval report: ${e.message}_`;
+            }
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });
+
+  # ─── LLM evals — only when secret is available (not on forks) ────────────
+  eval-llm:
+    name: LLM Evals (opqrst + reliability)
+    runs-on: ubuntu-latest
+    # Skip if the secret is not configured (forks, contributors without access)
+    if: ${{ secrets.GEMINI_API_KEY != '' }}
+
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      JWT_SECRET: "eval-jwt-secret-32-chars-minimum!!"
+      CLINICIAN_PASSWORD: "eval-test-password"
+      DEBUG_MODE: "false"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run LLM evals
+        run: |
+          mkdir -p eval-results
+          python -m evals.run_evals --llm --output eval-results/llm.json
+
+      - name: Upload eval report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-llm-${{ github.sha }}
+          path: eval-results/llm.json
+          retention-days: 30
+
+      - name: Post LLM eval summary to PR
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let body = '### LLM Eval Results\n\n';
+            try {
+              const report = JSON.parse(fs.readFileSync('eval-results/llm.json', 'utf8'));
+              const metrics = report.metrics || [];
+              const llmMetrics = metrics.filter(m => m.extra && m.extra.cost_usd_total != null);
+              body += `| Category | Cases | Pass | Precision | Recall | F1 | Cost |\n`;
+              body += `|---|---|---|---|---|---|---|\n`;
+              for (const m of llmMetrics) {
+                const p = (m.precision * 100).toFixed(1);
+                const r = (m.recall * 100).toFixed(1);
+                const f = (m.f1 * 100).toFixed(1);
+                const cost = m.extra.cost_usd_total ? `$${m.extra.cost_usd_total.toFixed(4)}` : '-';
+                const icon = m.passed === m.total ? '✅' : (m.passed / m.total >= 0.7 ? '⚠️' : '❌');
+                body += `| ${icon} ${m.category} | ${m.total} | ${m.passed} | ${p}% | ${r}% | ${f}% | ${cost} |\n`;
+              }
+              const totalCost = report.total_cost_usd || 0;
+              const avgCost = report.avg_cost_per_case_usd || 0;
+              body += `\n**Total cost: $${totalCost.toFixed(4)} — avg $${avgCost.toFixed(4)}/case**`;
+              body += `\n_Elapsed: ${report.elapsed_s}s — ${report.llm_cases_evaluated} LLM cases_`;
+            } catch (e) {
+              body += `_Could not parse LLM eval report: ${e.message}_`;
+            }
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });
+
+  # ─── Multi-turn agent eval — requires LLM (full graph walkthrough) ────────
+  eval-multi-turn:
+    name: Multi-Turn Agent Eval (10 scenarios)
+    runs-on: ubuntu-latest
+    if: ${{ secrets.GEMINI_API_KEY != '' }}
+
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      JWT_SECRET: "eval-jwt-secret-32-chars-minimum!!"
+      CLINICIAN_PASSWORD: "eval-test-password"
+      DEBUG_MODE: "false"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run multi-turn eval
+        run: |
+          mkdir -p eval-results
+          python -m evals.multi_turn_eval --output eval-results/multi_turn.json
+
+      - name: Upload multi-turn report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-multi-turn-${{ github.sha }}
+          path: eval-results/multi_turn.json
+          retention-days: 30

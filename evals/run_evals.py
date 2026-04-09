@@ -17,12 +17,20 @@ Measures eleven dimensions:
 
 Usage:
   # From project root:
-  python -m evals.run_evals                     # deterministic evals only
+  python -m evals.run_evals                     # deterministic evals only (fast)
   python -m evals.run_evals --llm               # include LLM-based evals
   python -m evals.run_evals --llm --output out.json
   python -m evals.run_evals --category emergency_detection
 
-Requires GEMINI_API_KEY in environment (or .env) for --llm mode.
+  # Multi-turn agent eval (tests the full state machine across conversations):
+  python -m evals.multi_turn_eval
+  python -m evals.multi_turn_eval --output results/mt_eval.json
+
+Two eval layers:
+  run_evals.py        component-level, 157 cases, 9/11 deterministic, no LLM required
+  multi_turn_eval.py  agent-level, 10 conversation scenarios, requires LLM + full graph
+
+Requires GEMINI_API_KEY in environment (or .env) for --llm mode and multi_turn_eval.
 """
 from __future__ import annotations
 
@@ -260,7 +268,8 @@ def run_opqrst_evals(cases: list, verbose: bool) -> Tuple[CategoryMetrics, List[
     extra_counts = {"is_complete_correct": 0, "fields_present_hit": 0, "fields_present_total": 0,
                     "fields_absent_ok": 0, "fields_absent_total": 0,
                     "existing_preserved": 0, "existing_preserved_total": 0,
-                    "fallback_used": 0, "repair_used": 0, "latency_ms_total": 0}
+                    "fallback_used": 0, "repair_used": 0, "latency_ms_total": 0,
+                    "cost_usd_total": 0.0}
     results = []
 
     for c in cases:
@@ -288,10 +297,11 @@ def run_opqrst_evals(cases: list, verbose: bool) -> Tuple[CategoryMetrics, List[
             op_out = out.get("opqrst") or {}
 
             extra_counts["latency_ms_total"] += meta.get("latency_ms", 0)
+            extra_counts["cost_usd_total"]   += meta.get("cost_usd", 0.0)
             if meta.get("fallback_used"): extra_counts["fallback_used"] += 1
             if meta.get("repair_used"):   extra_counts["repair_used"] += 1
 
-            details["meta"] = {k: meta[k] for k in ("latency_ms", "parse_ok", "fallback_used", "repair_used")}
+            details["meta"] = {k: meta[k] for k in ("latency_ms", "parse_ok", "fallback_used", "repair_used", "cost_usd")}
 
             # is_complete check
             is_complete_exp = exp.get("is_complete")
@@ -366,7 +376,8 @@ def run_llm_reliability_evals(cases: list, verbose: bool) -> Tuple[CategoryMetri
     )
 
     metrics = CategoryMetrics(category="llm_reliability", total=len(cases))
-    extra_counts = {"parse_ok": 0, "fallback_used": 0, "repair_used": 0, "latency_ms_total": 0}
+    extra_counts = {"parse_ok": 0, "fallback_used": 0, "repair_used": 0, "latency_ms_total": 0,
+                    "cost_usd_total": 0.0}
     results = []
 
     for c in cases:
@@ -396,7 +407,8 @@ def run_llm_reliability_evals(cases: list, verbose: bool) -> Tuple[CategoryMetri
             repair_used   = meta.get("repair_used", False)
             parse_ok      = meta.get("parse_ok", False)
 
-            extra_counts["latency_ms_total"] += latency
+            extra_counts["latency_ms_total"]  += latency
+            extra_counts["cost_usd_total"]    += meta.get("cost_usd", 0.0)
             if parse_ok:      extra_counts["parse_ok"] += 1
             if fallback_used: extra_counts["fallback_used"] += 1
             if repair_used:   extra_counts["repair_used"] += 1
@@ -893,6 +905,8 @@ def render_report(
                 lines.append(f"  Avg LLM latency:        {avg_ms:.0f} ms")
             lines.append(f"  Fallback triggered:     {ex.get('fallback_used',0)}/{n} calls")
             lines.append(f"  Repair triggered:       {ex.get('repair_used',0)}/{n} calls")
+            total_cost = ex.get('cost_usd_total', 0.0)
+            lines.append(f"  Total cost:             ${total_cost:.6f}  (avg ${total_cost/n:.6f}/case)")
 
         if m.category == "llm_reliability" and ex:
             n = m.total or 1
@@ -902,6 +916,8 @@ def render_report(
             if ex.get('latency_ms_total'):
                 avg_ms = ex['latency_ms_total'] / n
                 lines.append(f"  Avg LLM latency:   {avg_ms:.0f} ms")
+            total_cost = ex.get('cost_usd_total', 0.0)
+            lines.append(f"  Total cost:        ${total_cost:.6f}  (avg ${total_cost/n:.6f}/case)")
 
         if m.category == "unsafe_output" and ex:
             fp_ids = ex.get("fp_ids", [])
@@ -934,6 +950,16 @@ def render_report(
                 else:
                     lines.append(f"    {k}: {v}")
 
+    # Aggregate LLM cost across all categories that track it
+    total_llm_cost = sum(
+        m.extra.get("cost_usd_total", 0.0)
+        for m in all_metrics
+        if m.extra.get("cost_usd_total") is not None
+    )
+    llm_case_count = sum(
+        m.total for m in all_metrics if m.extra.get("cost_usd_total") is not None
+    )
+
     # Summary
     lines.append(f"\n{'=' * 62}")
     lines.append(f"  SUMMARY")
@@ -943,6 +969,9 @@ def render_report(
     lines.append(f"  Failed      : {total_cases - total_passed}")
     lines.append(f"  Pass rate   : {_pct(total_passed / total_cases if total_cases else 0)}")
     lines.append(f"  LLM evals   : {'included' if include_llm else 'skipped (pass --llm to enable)'}")
+    if include_llm and llm_case_count:
+        avg_cost = total_llm_cost / llm_case_count
+        lines.append(f"  LLM cost    : ${total_llm_cost:.6f} total  |  ${avg_cost:.6f} avg/case  ({llm_case_count} LLM cases)")
     lines.append(f"  Elapsed     : {elapsed:.1f}s")
     lines.append("")
     return "\n".join(lines)
@@ -1072,9 +1101,20 @@ def main():
     print(report)
 
     if args.output:
+        total_llm_cost = sum(
+            m.extra.get("cost_usd_total", 0.0)
+            for m in all_metrics
+            if m.extra.get("cost_usd_total") is not None
+        )
+        llm_case_count = sum(
+            m.total for m in all_metrics if m.extra.get("cost_usd_total") is not None
+        )
         payload = {
-            "elapsed_s": round(elapsed, 2),
-            "include_llm": args.llm,
+            "elapsed_s":           round(elapsed, 2),
+            "include_llm":         args.llm,
+            "total_cost_usd":      round(total_llm_cost, 8),
+            "avg_cost_per_case_usd": round(total_llm_cost / llm_case_count, 8) if llm_case_count else 0.0,
+            "llm_cases_evaluated": llm_case_count,
             "metrics": [asdict(m) for m in all_metrics],
             "results": [
                 {

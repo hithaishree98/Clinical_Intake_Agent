@@ -1,10 +1,11 @@
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS sessions (
-  thread_id TEXT PRIMARY KEY,
-  status TEXT NOT NULL DEFAULT 'active',
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  thread_id    TEXT PRIMARY KEY,
+  status       TEXT NOT NULL DEFAULT 'active',
+  session_token TEXT,
+  created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -29,7 +30,7 @@ CREATE TABLE IF NOT EXISTS reports (
 CREATE TABLE IF NOT EXISTS escalations (
   esc_id TEXT PRIMARY KEY,
   thread_id TEXT NOT NULL,
-  kind TEXT NOT NULL,         --"identity_review" | "emergency"
+  kind TEXT NOT NULL,         -- "identity_review" | "emergency" | "crisis" | "report_blocked"
   payload_json TEXT NOT NULL,
   resolved INTEGER NOT NULL DEFAULT 0,
   nurse_note TEXT,
@@ -133,3 +134,40 @@ ON webhook_deliveries(thread_id, created_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_status
 ON webhook_deliveries(status, next_retry_at);
+
+-- LLM token usage — one row per run_json_step or generate_text call.
+-- input_tokens + output_tokens come from Gemini usage_metadata.
+-- cost_usd is computed at write time using current Gemini Flash pricing.
+-- Billing teams can aggregate by thread_id for per-session cost reporting.
+CREATE TABLE IF NOT EXISTS llm_usage (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  thread_id     TEXT    NOT NULL,
+  node          TEXT    NOT NULL,
+  input_tokens  INTEGER NOT NULL DEFAULT 0,
+  output_tokens INTEGER NOT NULL DEFAULT 0,
+  cost_usd      REAL    NOT NULL DEFAULT 0.0,
+  created_at    TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_llm_usage_thread
+ON llm_usage(thread_id, created_at);
+
+-- Prompt A/B experiments — one row per active experiment.
+-- variant_a_prompt / variant_b_prompt hold the prompt key names from prompts.py.
+-- Sessions are routed deterministically (thread_id hash % 2) so the same
+-- session always gets the same variant.  Outcomes are recorded in llm_usage.
+CREATE TABLE IF NOT EXISTS prompt_experiments (
+  experiment_id  TEXT PRIMARY KEY,
+  name           TEXT NOT NULL,                    -- human label, e.g. "subjective_v1.3_vs_v1.4"
+  prompt_key     TEXT NOT NULL,                    -- which node this targets, e.g. "subjective"
+  variant_a      TEXT NOT NULL,                    -- version string, e.g. "v1.3"
+  variant_b      TEXT NOT NULL,                    -- e.g. "v1.4"
+  status         TEXT NOT NULL DEFAULT 'active',   -- active | paused | concluded
+  sessions_a     INTEGER NOT NULL DEFAULT 0,
+  sessions_b     INTEGER NOT NULL DEFAULT 0,
+  created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_experiments_status
+ON prompt_experiments(status, prompt_key);

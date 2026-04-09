@@ -10,13 +10,11 @@ import json
 import re
 from typing import Dict, List
 
-from .prompts import subjective_extract_system, meds_extract_system, report_system
+from .prompts import subjective_extract_system, meds_extract_system, report_system, PROMPT_VERSIONS
 from .state import IntakeState
 from .schemas import SubjectiveOut, MedsOut, ReportInputState
 from .llm import run_json_step, get_gemini, validate_llm_response
 from .agentic import (
-    classify_intake,
-    select_followup,
     adapt_clinical_question,
     score_extraction_quality,
     build_gap_fill_question,
@@ -27,9 +25,9 @@ from .logging_utils import log_event
 from . import sqlite_db as db
 from . import fhir_builder
 from . import webhook
+from .integrations.fhir_client import push_bundle as _fhir_push_bundle
 from .extract import (
     extract_identity_deterministic,
-    normalize_phone,
     is_yes,
     is_no,
     is_ack,
@@ -37,6 +35,8 @@ from .extract import (
     extract_allergies_simple,
     extract_list_simple,
     detect_crisis,
+    has_soft_distress,
+    llm_crisis_score,
     CRISIS_RESOURCE,
     CONSENT_MESSAGE,
     is_consent_accepted,
@@ -44,10 +44,11 @@ from .extract import (
     validate_phone,
     validate_dob,
 )
-from .settings import settings
+from .settings import get_settings as settings
 
 RESPONSE_RULES = (
-    "Be concise and human. "
+    "Be warm, empathetic, and human — patients may be anxious or in pain. "
+    "Acknowledge what the patient shares before asking the next question. "
     "Ask ONE question only if needed. "
     "Never invent facts. "
     "No diagnosis. "
@@ -60,11 +61,32 @@ RESPONSE_RULES = (
 # ---------------------------------------------------------------------------
 
 def last_user(state: IntakeState) -> str:
-    msgs = state.get("messages") or []
+    # Scan within the window only — the most recent user message is always
+    # inside the last `messages_window_size` turns, so there is no need to
+    # walk the full (potentially unbounded) history list.
+    msgs = _window_messages(state)
     for m in reversed(msgs):
         if m["role"] == "user":
             return m["text"]
     return ""
+
+
+def _window_messages(state: IntakeState) -> list:
+    """
+    Return the last N messages from state, where N = settings.intake.messages_window_size.
+
+    Rationale: the messages list grows with every turn via LangGraph's operator.add
+    reducer.  On a 50-turn intake that is 50 dicts passed verbatim into every LLM
+    prompt.  Capping to the recent window keeps token usage predictable (O(1)
+    instead of O(n)) without losing any data — the full history is always persisted
+    in the messages DB table and the checkpointer.
+
+    Only the windowed slice is sent to the LLM; older turns are never discarded
+    from state itself.
+    """
+    n = settings().intake.messages_window_size
+    msgs = state.get("messages") or []
+    return msgs[-n:] if len(msgs) > n else msgs
 
 
 def _summary_identity(x: Dict[str, str]) -> str:
@@ -79,47 +101,127 @@ def _summary_identity(x: Dict[str, str]) -> str:
 
 def _check_crisis(user: str, state: IntakeState) -> str | None:
     """
-    Run crisis detection. Returns crisis resource message if triggered, else None.
-    Also returns a state-patch dict as the second value so callers can set crisis_detected=True.
-    Call site must merge the patch into the return dict.
-    """
-    crisis_flags = detect_crisis(user)
-    if not crisis_flags:
-        return None
+    Two-tier crisis detection.
 
+    Tier 1 — keyword/regex (detect_crisis): explicit self-harm phrases.
+              Zero latency.  High precision.  False-positive risk: low.
+
+    Tier 2 — LLM classifier (llm_crisis_score): borderline cases that Tier 1
+              misses (passive ideation, burden language, hopelessness) and
+              figurative phrases that Tier 1 would wrongly flag ("kill this
+              headache").  Only invoked when has_soft_distress() gate fires.
+              Confidence high/medium → escalate; low → soft-log only.
+
+    Returns CRISIS_RESOURCE (the 988 message) if either tier fires.
+    Callers must set crisis_detected=True when this returns a non-None value.
+    """
     thread_id    = state.get("thread_id", "")
     patient_name = (state.get("identity") or {}).get("name") or "unknown patient"
 
-    log_event("guardrail_crisis_detected", level="warning",
-              thread_id=thread_id, matched_phrases=crisis_flags)
-    db.create_escalation(
-        thread_id=thread_id,
-        kind="crisis",
-        payload=build_reason_trail(
-            "crisis", state, extra_data={"matched_phrases": crisis_flags}
-        ),
-    )
-    webhook.dispatch_crisis_alert(
-        thread_id=thread_id,
-        patient_name=patient_name,
-        matched_phrases=crisis_flags,
-    )
-    return CRISIS_RESOURCE
+    # ── Tier 1: keyword / regex ────────────────────────────────────────
+    crisis_flags = detect_crisis(user)
+    if crisis_flags:
+        log_event("crisis_detected_tier1", level="warning",
+                  thread_id=thread_id, matched_phrases=crisis_flags)
+        db.create_escalation(
+            thread_id=thread_id,
+            kind="crisis",
+            payload=build_reason_trail(
+                "crisis", state, extra_data={"matched_phrases": crisis_flags,
+                                             "detection_tier": "keyword"}
+            ),
+        )
+        webhook.dispatch_crisis_alert(
+            thread_id=thread_id,
+            patient_name=patient_name,
+            matched_phrases=crisis_flags,
+        )
+        return CRISIS_RESOURCE
+
+    # ── Tier 2: LLM classifier for borderline distress signals ─────────
+    if not has_soft_distress(user):
+        return None   # no signals at all — skip LLM call
+
+    score = llm_crisis_score(user)
+
+    if score.is_crisis_risk and score.confidence in ("high", "medium"):
+        log_event("crisis_detected_tier2", level="warning",
+                  thread_id=thread_id,
+                  confidence=score.confidence,
+                  reasoning=score.reasoning)
+        db.create_escalation(
+            thread_id=thread_id,
+            kind="crisis",
+            payload=build_reason_trail(
+                "crisis", state,
+                extra_data={
+                    "matched_phrases":  [f"llm:{score.reasoning}"],
+                    "detection_tier":   "llm",
+                    "llm_confidence":   score.confidence,
+                    "llm_reasoning":    score.reasoning,
+                },
+            ),
+        )
+        webhook.dispatch_crisis_alert(
+            thread_id=thread_id,
+            patient_name=patient_name,
+            matched_phrases=[f"llm_detected ({score.confidence}): {score.reasoning}"],
+        )
+        return CRISIS_RESOURCE
+
+    if score.is_crisis_risk and score.confidence == "low":
+        # Soft flag: not confident enough to escalate, but worth logging for
+        # clinical audit.  The intake continues; a supervisor can review.
+        log_event("soft_distress_flagged", level="info",
+                  thread_id=thread_id,
+                  reasoning=score.reasoning)
+
+    return None
+
+
+_HOLLOW_PREFIX_RE = re.compile(
+    r"^(?:yes[,!\.]*\s*|yeah[,!\.]*\s*|sure[,!\.]*\s*|absolutely[,!\.]*\s*|"
+    r"of\s+course[,!\.]*\s*|okay[,!\.]*\s*|ok[,!\.]*\s*|"
+    r"i\s+see[,!\.]*\s*|i\s+understand[,!\.]*\s*|understood[,!\.]*\s*|"
+    r"noted[,!\.]*\s*|great[,!\.]*\s*|got\s+it[,!\.]*\s*)+",
+    re.IGNORECASE,
+)
+
+
+def _clean_reply(text: str) -> str:
+    """
+    Strip hollow leading affirmatives from LLM reply.
+
+    Prevents "Yes, yes, I understand. When did it start?" → keeps only the actual question.
+    Empathy framed *within* the question (e.g. "I'm sorry to hear that — when did it start?")
+    is preserved because it doesn't match the hollow-prefix pattern.
+    """
+    cleaned = _HOLLOW_PREFIX_RE.sub("", (text or "")).strip()
+    # Capitalise after stripping prefix
+    return cleaned[0].upper() + cleaned[1:] if cleaned else text
 
 
 def _safe_reply(text: str) -> str:
-    """Run LLM response through the diagnosis-language guardrail."""
+    """Run LLM response through the diagnosis-language guardrail and hollow-affirmative strip."""
     safe, _ = validate_llm_response(text)
-    return safe
+    return _clean_reply(safe)
 
 
 def _track_llm_failure(thread_id: str, node: str, meta: dict) -> None:
     """
-    Persist one LLM failure row when run_json_step degraded.
+    Persist LLM failure + token usage for one run_json_step call.
 
-    Called whenever meta["fallback_used"] is True or meta["repair_used"] is True.
-    Does not raise — tracking failures must never break the happy path.
+    Token usage is always recorded regardless of success/failure so billing
+    can aggregate per-session costs accurately.
+    Does not raise — tracking must never break the happy path.
     """
+    # Always record token usage (even on clean runs).
+    inp = meta.get("input_tokens") or 0
+    out = meta.get("output_tokens") or 0
+    if inp or out:
+        db.record_llm_usage(thread_id=thread_id, node=node,
+                            input_tokens=inp, output_tokens=out)
+
     if not (meta.get("fallback_used") or meta.get("repair_used")):
         return
     failure_type = "fallback_used" if meta.get("fallback_used") else "repair_used"
@@ -235,8 +337,6 @@ def identity_node(state: IntakeState):
     identity = dict(state.get("identity") or {"name": "", "dob": "", "phone": "", "address": ""})
     attempts = int(state.get("identity_attempts") or 0)
 
-    thread_id = state.get("thread_id", "")
-
     if attempts == 0 and not user:
         return {
             "messages": [{"role": "assistant", "text": "What's your full name?"}],
@@ -282,6 +382,19 @@ def identity_node(state: IntakeState):
     missing = [k for k in ["name", "dob", "phone", "address"] if not (identity.get(k) or "").strip()]
 
     if missing:
+        if attempts >= 6:
+            log_event("identity_max_attempts", level="warning",
+                      thread_id=state.get("thread_id", ""))
+            return {
+                "identity": identity,
+                "identity_attempts": attempts,
+                "identity_status": "unverified",
+                "messages": [{"role": "assistant", "text":
+                    "I'm having trouble capturing your details. "
+                    "Please speak with the front desk when you arrive — "
+                    "they'll complete your intake directly."}],
+                "current_phase": "done",
+            }
         q = {
             "name":    "What's your full name?",
             "dob":     "What's your date of birth? (MM/DD/YYYY)",
@@ -327,14 +440,14 @@ def identity_node(state: IntakeState):
 # ---------------------------------------------------------------------------
 
 def identity_review_node(state: IntakeState):
-    user   = last_user(state).strip()
+    user   = last_user(state).strip().lower()
     identity = dict(state.get("identity") or {})
     stored   = state.get("stored_identity")
     thread_id = state.get("thread_id", "")
 
     if stored:
         if user.startswith("keep"):
-                return {
+            return {
                 "identity": stored,
                 "identity_status": "verified",
                 "needs_identity_review": False,
@@ -396,7 +509,7 @@ def identity_review_node(state: IntakeState):
 # Needs-ED-followup heuristic
 # ---------------------------------------------------------------------------
 
-def needs_ed_followup(cc: str, op: Dict[str, str]) -> bool:
+def needs_ed_followup(cc: str, _op: Dict[str, str]) -> bool:
     t = (cc or "").lower()
     breathing = any(k in t for k in ["shortness of breath", "sob", "difficulty breathing"])
     neuro     = any(k in t for k in ["weakness", "numbness", "slurred speech", "face droop", "confusion"])
@@ -546,7 +659,12 @@ def subjective_node(state: IntakeState):
         },
         temperature=0.2,
     )
-    log_event("llm_step", thread_id=thread_id, node="subjective", **meta)
+    resolved_version, exp_id = db.resolve_prompt_variant(
+        thread_id, "subjective", PROMPT_VERSIONS.get("subjective", "")
+    )
+    log_event("llm_step", thread_id=thread_id, node="subjective",
+              prompt_version=resolved_version,
+              experiment_id=exp_id, **meta)
     _track_llm_failure(thread_id, "subjective", meta)
 
     out    = obj.model_dump()
@@ -554,18 +672,20 @@ def subjective_node(state: IntakeState):
     new_op = out.get("opqrst") or {}
     llm_extraction_confidence = out.get("extraction_confidence") or "medium"
 
-    # Feature 1: classify intake on first chief complaint extraction
+    # Feature 1: classification is now embedded in SubjectiveOut — no second LLM call.
     classification = state.get("intake_classification")
     classification_confidence = state.get("classification_confidence")
-    if new_cc and not cc:
+    if new_cc:
         cc = new_cc
-        mode_for_classify = state.get("mode") or "clinic"
-        classification, classification_confidence, cls_meta = classify_intake(mode_for_classify, cc, user)
-        log_event("intake_classified", thread_id=thread_id,
-                  classification=classification, confidence=classification_confidence, **cls_meta)
-        _track_llm_failure(thread_id, "classify_intake", cls_meta)
-    elif new_cc:
-        cc = new_cc
+        # Use classification returned by the combined extraction call when available.
+        llm_cls = out.get("intake_classification")
+        llm_cls_conf = out.get("classification_confidence")
+        if llm_cls and not classification:
+            classification = llm_cls
+            classification_confidence = llm_cls_conf
+            log_event("intake_classified", thread_id=thread_id,
+                      classification=classification, confidence=classification_confidence,
+                      source="combined_llm_call")
 
     for k in op.keys():
         v = (new_op.get(k) or "").strip()
@@ -573,7 +693,21 @@ def subjective_node(state: IntakeState):
             op[k] = v
 
     complete = bool(out.get("is_complete"))
-    reply    = _safe_reply((out.get("reply") or "").strip())
+    raw_reply = _safe_reply((out.get("reply") or "").strip())
+    # Guard 1: a reply that contains no "?" is not a real question — use deterministic gap-fill instead.
+    # This catches cases where the LLM emits an acknowledgment ("I see." / "I understand.") with
+    # no actual question, which would leave the patient with no action to take.
+    if raw_reply and "?" not in raw_reply:
+        log_event("llm_reply_no_question", level="warning",
+                  thread_id=thread_id, preview=raw_reply[:120])
+        raw_reply = build_gap_fill_question(cc, op, classification or "routine_checkup")
+    # Guard 2: if the LLM itself reports low confidence, don't trust its reply — it likely
+    # misunderstood the patient. A deterministic gap-fill is more reliable here.
+    if llm_extraction_confidence == "low" and not complete:
+        log_event("extraction_confidence_low_gap_fill", thread_id=thread_id,
+                  llm_reply_preview=(raw_reply or "")[:80])
+        raw_reply = build_gap_fill_question(cc, op, classification or "routine_checkup")
+    reply = raw_reply
 
     if complete:
         mode     = state.get("mode") or "clinic"
@@ -594,8 +728,9 @@ def subjective_node(state: IntakeState):
             }
 
         # Feature 3: quality gate — retry with targeted gap-fill before advancing
-        QUALITY_THRESHOLD = 0.75 if mode == "ed" else 0.60
-        MAX_RETRY = 2
+        _cfg = settings().intake
+        QUALITY_THRESHOLD = _cfg.ed_quality_threshold if mode == "ed" else _cfg.clinic_quality_threshold
+        MAX_RETRY = _cfg.max_quality_retries
         retry_count = int(state.get("extraction_retry_count") or 0)
         quality_score = score_extraction_quality(cc, op)
 
@@ -629,17 +764,39 @@ def subjective_node(state: IntakeState):
             "triage": triage,
             "needs_emergency_review": False,
             "subjective_complete": True,
+            "subjective_incomplete_turns": 0,   # reset on successful completion
             "clinical_step": "allergies",
             "validation_target_phase": "clinical_history",
             "validation_errors": [],
             "current_phase": "validate",
         }
 
-    # Feature 2: dynamic follow-up — select the most relevant next question
-    cls = classification or "routine_checkup"
-    dynamic_q, fu_meta = select_followup(cls, state.get("mode") or "clinic", cc, op)
-    _track_llm_failure(thread_id, "select_followup", fu_meta)
-    best_reply = dynamic_q or reply or "When did it start, and how severe is it from 0-10?"
+    # On 3rd+ incomplete turn, generate a deterministic progress message so the
+    # patient knows exactly what was understood vs what is still missing.
+    # This prevents the LLM from asking the same generic question repeatedly.
+    incomplete_turns = int(state.get("subjective_incomplete_turns") or 0)
+    if incomplete_turns >= 2 and not complete:
+        have = []
+        if cc:                          have.append(f"complaint ({cc})")
+        if (op.get("onset") or "").strip():   have.append(f"onset ({op['onset']})")
+        if (op.get("severity") or "").strip(): have.append(f"severity ({op['severity']})")
+        if (op.get("quality") or "").strip():  have.append(f"how it feels ({op['quality']})")
+        still_need = []
+        if not (op.get("severity") or "").strip():
+            still_need.append("how severe it is (e.g. '7 out of 10', or say mild / moderate / severe)")
+        if not (op.get("onset") or "").strip() and not (op.get("timing") or "").strip():
+            still_need.append("when it started (e.g. 'this morning', '2 days ago')")
+        if not cc:
+            still_need.append("what brought you in today")
+        preamble = ("I have " + ", ".join(have) + ". ") if have else ""
+        if still_need:
+            best_reply = preamble + "I still need: " + still_need[0] + "?"
+        else:
+            best_reply = reply or build_gap_fill_question(cc, op, classification or "routine_checkup")
+        log_event("subjective_stuck_guidance", thread_id=thread_id,
+                  incomplete_turns=incomplete_turns, still_need=still_need)
+    else:
+        best_reply = reply or build_gap_fill_question(cc, op, classification or "routine_checkup")
 
     return {
         "chief_complaint": cc,
@@ -647,6 +804,7 @@ def subjective_node(state: IntakeState):
         "intake_classification": classification,
         "classification_confidence": classification_confidence,
         "extraction_confidence": llm_extraction_confidence,
+        "subjective_incomplete_turns": incomplete_turns + 1,
         "subjective_complete": False,
         "messages": [{"role": "assistant", "text": best_reply}],
         "current_phase": "subjective",
@@ -721,20 +879,43 @@ def clinical_history_node(state: IntakeState):
     # Feature 2: adapt questions based on intake classification
     cls = state.get("intake_classification") or "routine_checkup"
 
+    # Crisis detection applies in every phase — a patient may disclose suicidal
+    # ideation while answering "any past medical conditions?" rather than the
+    # chief-complaint question.
+    if user:
+        crisis_msg = _check_crisis(user, state)
+        if crisis_msg:
+            return {
+                "crisis_detected": True,
+                "messages": [{"role": "assistant", "text": crisis_msg}],
+                "current_phase": "handoff",
+            }
+
     if step == "allergies":
+        allergy_q = (
+            "I'd like to ask a few quick questions about your health history. "
+            "First — do you have any known allergies, especially to medications or latex? "
+            "If none, just say 'none'."
+        )
         if not user or is_ack(user):
             return {
+                "messages": [{"role": "assistant", "text": allergy_q}],
+                "current_phase": "clinical_history",
+                "clinical_step": "allergies",
+            }
+        # "yes" means the patient wants to list allergies but didn't yet — ask them to name them
+        if is_yes(user):
+            return {
                 "messages": [{"role": "assistant", "text":
-                    "Do you have any allergies — especially to medications or latex? "
-                    "If none, say 'none'."}],
+                    "What are you allergic to? Please list them (e.g. 'penicillin, latex')."}],
                 "current_phase": "clinical_history",
                 "clinical_step": "allergies",
             }
         allergies = extract_allergies_simple(user)
         meds_q = adapt_clinical_question("meds", cls) or (
-            "What medications are you currently taking? "
-            "Include the name, dose, how often, and when you last took it. "
-            "If none, say 'none'."
+            "Got it, thank you. What medications are you currently taking? "
+            "Please include the name, dose, how often you take it, and when you last took it. "
+            "If you're not taking anything, just say 'none'."
         )
         return {
             "allergies": allergies,
@@ -746,8 +927,8 @@ def clinical_history_node(state: IntakeState):
     if step == "meds":
         meds_q = adapt_clinical_question("meds", cls) or (
             "What medications are you currently taking? "
-            "Include dose, frequency, and last taken time if you know. "
-            "If none, say 'none'."
+            "Please include the name, dose, how often you take it, and when you last took it. "
+            "If you're not taking anything, just say 'none'."
         )
         if not user or is_ack(user):
             return {
@@ -756,9 +937,11 @@ def clinical_history_node(state: IntakeState):
                 "clinical_step": "meds",
             }
         pmh_q = adapt_clinical_question("pmh", cls) or (
-            "Any past medical conditions or surgeries? If none, say 'none'."
+            "Thank you. Do you have any past medical conditions or surgeries I should know about? "
+            "If none, just say 'none'."
         )
-        if user.strip().lower() in {"none", "no", "no meds", "not taking anything", "nothing"}:
+        from .extract import _is_none_response
+        if _is_none_response(user) or user.strip().lower() in {"no meds", "not taking anything"}:
             return {
                 "medications": [],
                 "clinical_step": "pmh",
@@ -766,14 +949,23 @@ def clinical_history_node(state: IntakeState):
                 "current_phase": "clinical_history",
             }
 
+        # Pass any already-collected partial meds so the LLM can merge new details
+        existing_meds = state.get("medications") or []
         obj, meta = run_json_step(
             system=meds_extract_system(RESPONSE_RULES),
-            prompt=f"NEW_USER_MESSAGE={user}",
+            prompt=(
+                f"CURRENT_MEDICATIONS={existing_meds}\n"
+                f"NEW_USER_MESSAGE={user}"
+            ),
             schema=MedsOut,
-            fallback={"medications": [], "reply": "Could you list the medication names you take?"},
+            fallback={"medications": [], "reply": "Could you tell me the names of the medications you take?"},
             temperature=0.2,
         )
-        log_event("llm_step", thread_id=thread_id, node="medications", **meta)
+        med_version, med_exp_id = db.resolve_prompt_variant(
+            thread_id, "medications", PROMPT_VERSIONS.get("medications", "")
+        )
+        log_event("llm_step", thread_id=thread_id, node="medications",
+                  prompt_version=med_version, experiment_id=med_exp_id, **meta)
         _track_llm_failure(thread_id, "medications", meta)
 
         out    = obj.model_dump()
@@ -783,11 +975,29 @@ def clinical_history_node(state: IntakeState):
         if not parsed:
             return {
                 "messages": [{"role": "assistant", "text":
-                    reply or "Could you list the medication names you take?"}],
+                    reply or "Could you tell me the names of the medications you take?"}],
                 "current_phase": "clinical_history",
                 "clinical_step": "meds",
                 **_failure_state_patch(meta, "clinical_history"),
             }
+
+        # Check for medications that are missing frequency — ask a targeted follow-up
+        incomplete = [m for m in parsed if (m.get("name") or "").strip() and not (m.get("freq") or "").strip()]
+        if incomplete:
+            names = ", ".join(m["name"] for m in incomplete)
+            follow_up = (
+                f"Thanks for sharing that. To make sure we have the complete picture, "
+                f"how often do you take {names}? "
+                f"And when did you last take it?"
+            )
+            return {
+                "medications": parsed,          # save partial — merged on next turn
+                "clinical_step": "meds",        # stay in meds step
+                "messages": [{"role": "assistant", "text": follow_up}],
+                "current_phase": "clinical_history",
+                **_failure_state_patch(meta, "clinical_history"),
+            }
+
         return {
             "medications": parsed,
             "clinical_step": "pmh",
@@ -798,7 +1008,8 @@ def clinical_history_node(state: IntakeState):
 
     if step == "pmh":
         pmh_q = adapt_clinical_question("pmh", cls) or (
-            "Any past medical conditions or surgeries? If none, say 'none'."
+            "Thank you. Do you have any past medical conditions or surgeries I should be aware of? "
+            "If none, just say 'none'."
         )
         if not user or is_ack(user):
             return {
@@ -808,8 +1019,8 @@ def clinical_history_node(state: IntakeState):
             }
         pmh = extract_list_simple(user)
         results_q = adapt_clinical_question("results", cls) or (
-            "Have you had any recent lab tests or imaging (bloodwork, X-ray, CT, etc.) "
-            "since your last visit? If none, say 'none'."
+            "Appreciated — almost done. Have you had any recent lab tests or imaging "
+            "(bloodwork, X-ray, CT, etc.) since your last visit? If none, just say 'none'."
         )
         return {
             "pmh": pmh,
@@ -820,7 +1031,8 @@ def clinical_history_node(state: IntakeState):
 
     if step == "results":
         results_q = adapt_clinical_question("results", cls) or (
-            "Any recent lab tests or imaging since your last visit? If none, say 'none'."
+            "Have you had any recent lab tests or imaging since your last visit? "
+            "If none, just say 'none'."
         )
         if not user or is_ack(user):
             return {
@@ -944,14 +1156,29 @@ def validate_node(state: IntakeState):
 # ---------------------------------------------------------------------------
 
 def confirm_node(state: IntakeState):
-    user = last_user(state).strip().lower()
+    user = last_user(state).strip()
+    # Crisis detection: patient may disclose self-harm intent at any phase.
+    if user:
+        crisis_msg = _check_crisis(user, state)
+        if crisis_msg:
+            return {
+                "crisis_detected": True,
+                "messages": [{"role": "assistant", "text": crisis_msg}],
+                "current_phase": "handoff",
+            }
+
+    user = user.lower()
     if user in {"confirm", "yes", "y", "ok", "okay", "looks good", "correct", "done"}:
         return {
             "current_phase": "report",
             "messages": [{"role": "assistant", "text": "Got it — generating the clinician note now."}],
         }
-    if any(k in user for k in ["allerg", "med", "medicine", "medication", "pmh",
-                                "history", "surgery", "test", "lab", "imaging"]):
+
+    def _match(patterns: list[str]) -> bool:
+        return any(re.search(p, user) for p in patterns)
+
+    if _match([r"\ballerg", r"\bmed(ication|icine|s)?\b", r"\bpmh\b",
+               r"\bhistory\b", r"\bsurgery\b", r"\btest\b", r"\blab\b", r"\bimaging\b"]):
         return {
             "current_phase": "clinical_history",
             "clinical_step": "allergies",
@@ -959,14 +1186,16 @@ def confirm_node(state: IntakeState):
                 "Sure — let's update your medical history. "
                 "Do you have any allergies?"}],
         }
-    if any(k in user for k in ["pain", "symptom", "onset", "severity", "timing",
-                                "radiat", "quality", "provocation", "complaint"]):
+    if _match([r"\bpain\b", r"\bsymptom\b", r"\bonset\b", r"\bseverity\b",
+               r"\btiming\b", r"\bradiati", r"\bquality\b", r"\bprovocation\b",
+               r"\bcomplaint\b"]):
         return {
             "current_phase": "subjective",
             "messages": [{"role": "assistant", "text":
                 "Sure — what would you like to change about your symptoms?"}],
         }
-    if any(k in user for k in ["name", "phone", "address", "dob", "date of birth"]):
+    if _match([r"\bname\b", r"\bphone\b", r"\baddress\b", r"\bdob\b",
+               r"\bdate of birth\b"]):
         return {
             "current_phase": "identity",
             "identity_attempts": 0,
@@ -984,6 +1213,33 @@ def confirm_node(state: IntakeState):
 # ---------------------------------------------------------------------------
 # Report node
 # ---------------------------------------------------------------------------
+
+def _fmt_report_text(cc: str, op: dict, allergies: list, meds: list,
+                     pmh: list, results: list, identity: dict) -> str:
+    """Build a safe structured report without LLM — used as primary fallback."""
+    allergies_line = "NKDA" if not allergies else ", ".join(allergies)
+    return (
+        f"SUBJECTIVE INTAKE\n"
+        f"Chief Complaint (CC): {cc}\n\n"
+        f"History of Present Illness (HPI):\n"
+        f"  Onset:       {op.get('onset') or 'Unknown/Not provided'}\n"
+        f"  Provocation: {op.get('provocation') or 'Unknown/Not provided'}\n"
+        f"  Quality:     {op.get('quality') or 'Unknown/Not provided'}\n"
+        f"  Radiation:   {op.get('radiation') or 'Unknown/Not provided'}\n"
+        f"  Severity:    {op.get('severity') or 'Unknown/Not provided'}\n"
+        f"  Timing:      {op.get('timing') or 'Unknown/Not provided'}\n\n"
+        f"CLINICAL HISTORY & SAFETY\n"
+        f"*** ALLERGIES (IMPORTANT): {allergies_line} ***\n"
+        f"Current Medications:\n{_fmt_meds_fallback(meds)}\n"
+        f"Past Medical History: {', '.join(pmh) if pmh else 'None reported'}\n"
+        f"Recent Lab/Imaging: {', '.join(results) if results else 'None reported'}\n\n"
+        f"PATIENT IDENTITY\n"
+        f"  Name:    {identity.get('name') or 'Unknown'}\n"
+        f"  DOB:     {identity.get('dob') or 'Unknown'}\n"
+        f"  Phone:   {identity.get('phone') or 'Unknown'}\n"
+        f"  Address: {identity.get('address') or 'Unknown'}\n"
+    )
+
 
 def _fmt_meds_fallback(meds: list) -> str:
     if not meds:
@@ -1031,7 +1287,6 @@ def _validate_report_content(text: str) -> List[str]:
         if section not in stripped:
             warnings.append(f"missing_section_{section.lower().replace(' ', '_')}")
 
-    from .llm import validate_llm_response
     _, modified = validate_llm_response(stripped)
     if modified:
         warnings.append("diagnosis_language")
@@ -1097,28 +1352,7 @@ def report_node(state: IntakeState):
     if not res.ok or not res.text.strip():
         log_event("report_fallback_used", level="warning",
                   thread_id=thread_id, error=res.error)
-        allergies_line = "NKDA" if not allergies else ", ".join(allergies)
-        report_text = (
-            f"SUBJECTIVE INTAKE\n"
-            f"Chief Complaint (CC): {cc}\n\n"
-            f"History of Present Illness (HPI):\n"
-            f"  Onset:       {op.get('onset') or 'Unknown/Not provided'}\n"
-            f"  Provocation: {op.get('provocation') or 'Unknown/Not provided'}\n"
-            f"  Quality:     {op.get('quality') or 'Unknown/Not provided'}\n"
-            f"  Radiation:   {op.get('radiation') or 'Unknown/Not provided'}\n"
-            f"  Severity:    {op.get('severity') or 'Unknown/Not provided'}\n"
-            f"  Timing:      {op.get('timing') or 'Unknown/Not provided'}\n\n"
-            f"CLINICAL HISTORY & SAFETY\n"
-            f"*** ALLERGIES (IMPORTANT): {allergies_line} ***\n"
-            f"Current Medications:\n{_fmt_meds_fallback(meds)}\n"
-            f"Past Medical History: {', '.join(pmh) if pmh else 'None reported'}\n"
-            f"Recent Lab/Imaging: {', '.join(results) if results else 'None reported'}\n\n"
-            f"PATIENT IDENTITY\n"
-            f"  Name:    {identity.get('name') or 'Unknown'}\n"
-            f"  DOB:     {identity.get('dob') or 'Unknown'}\n"
-            f"  Phone:   {identity.get('phone') or 'Unknown'}\n"
-            f"  Address: {identity.get('address') or 'Unknown'}\n"
-        )
+        report_text = _fmt_report_text(cc, op, allergies, meds, pmh, results, identity)
     else:
         report_text = res.text.strip()
 
@@ -1127,31 +1361,9 @@ def report_node(state: IntakeState):
         log_event("report_content_warnings", level="warning",
                   thread_id=thread_id, warnings=content_warnings)
         if "diagnosis_language" in content_warnings:
-            # Report contains diagnosis language — discard and use the safe fallback
             log_event("report_diagnosis_language_discarded", level="warning",
                       thread_id=thread_id)
-            allergies_line = "NKDA" if not allergies else ", ".join(allergies)
-            report_text = (
-                f"SUBJECTIVE INTAKE\n"
-                f"Chief Complaint (CC): {cc}\n\n"
-                f"History of Present Illness (HPI):\n"
-                f"  Onset:       {op.get('onset') or 'Unknown/Not provided'}\n"
-                f"  Provocation: {op.get('provocation') or 'Unknown/Not provided'}\n"
-                f"  Quality:     {op.get('quality') or 'Unknown/Not provided'}\n"
-                f"  Radiation:   {op.get('radiation') or 'Unknown/Not provided'}\n"
-                f"  Severity:    {op.get('severity') or 'Unknown/Not provided'}\n"
-                f"  Timing:      {op.get('timing') or 'Unknown/Not provided'}\n\n"
-                f"CLINICAL HISTORY & SAFETY\n"
-                f"*** ALLERGIES (IMPORTANT): {allergies_line} ***\n"
-                f"Current Medications:\n{_fmt_meds_fallback(meds)}\n"
-                f"Past Medical History: {', '.join(pmh) if pmh else 'None reported'}\n"
-                f"Recent Lab/Imaging: {', '.join(results) if results else 'None reported'}\n\n"
-                f"PATIENT IDENTITY\n"
-                f"  Name:    {identity.get('name') or 'Unknown'}\n"
-                f"  DOB:     {identity.get('dob') or 'Unknown'}\n"
-                f"  Phone:   {identity.get('phone') or 'Unknown'}\n"
-                f"  Address: {identity.get('address') or 'Unknown'}\n"
-            )
+            report_text = _fmt_report_text(cc, op, allergies, meds, pmh, results, identity)
 
     # FHIR bundle — validate input first, then build from validated state.
     # Failure never blocks the clinician note.
@@ -1162,10 +1374,16 @@ def report_node(state: IntakeState):
                   thread_id=thread_id, warnings=fhir_warnings)
     try:
         bundle    = fhir_builder.build_bundle(validated.model_dump())
+        # Structural validation — catches malformed bundles before EHR delivery.
+        struct_errors = fhir_builder.validate_fhir_bundle(bundle)
+        if struct_errors:
+            log_event("fhir_bundle_validation_errors", level="warning",
+                      thread_id=thread_id, errors=struct_errors)
         fhir_json = json.dumps(bundle, indent=2)
         log_event("fhir_bundle_built", thread_id=thread_id,
                   resource_count=len(bundle.get("entry", [])),
-                  input_warnings=fhir_warnings or None)
+                  input_warnings=fhir_warnings or None,
+                  struct_errors=struct_errors or None)
     except Exception as e:
         log_event("fhir_bundle_error", level="warning",
                   thread_id=thread_id, error=str(e)[:200])
@@ -1188,6 +1406,15 @@ def report_node(state: IntakeState):
         identity_status=state.get("identity_status") or "unverified",
         mode=state.get("mode") or "clinic",
     )
+
+    # Push to direct FHIR server (best-effort, non-blocking).
+    if fhir_json and settings().fhir_server_url:
+        import threading
+        threading.Thread(
+            target=_fhir_push_bundle,
+            kwargs={"fhir_bundle_json": fhir_json, "thread_id": thread_id},
+            daemon=True,
+        ).start()
 
     patient_name = (identity or {}).get("name") or "unknown patient"
     webhook.dispatch_intake_complete(

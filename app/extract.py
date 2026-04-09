@@ -1,4 +1,6 @@
 import re
+import threading
+import time
 from typing import Dict, List
 
 ACKS = {"ok", "okay", "k", "sure", "alright", "fine", "done", "got it", "sounds good", "thanks", "thank you"}
@@ -76,13 +78,30 @@ def extract_identity_deterministic(text: str) -> Dict[str, str]:
     return out
 
 
+_phrases_cache: List[str] = []
+_phrases_cache_at: float = 0.0
+_phrases_cache_lock = threading.Lock()
+_PHRASES_TTL = 60.0  # seconds — new phrases take effect within one minute
+
+
 def _load_phrases() -> List[str]:
-    try:
-        from . import sqlite_db as db
-        phrases = db.get_emergency_phrases()
-        return phrases if phrases else DEFAULT_EMERGENCY_PHRASES
-    except Exception:
-        return DEFAULT_EMERGENCY_PHRASES
+    global _phrases_cache, _phrases_cache_at
+    now = time.time()
+    # Fast path — avoid acquiring the lock if cache is warm.
+    if _phrases_cache and (now - _phrases_cache_at) < _PHRASES_TTL:
+        return _phrases_cache
+    with _phrases_cache_lock:
+        # Re-check inside the lock; another thread may have refreshed already.
+        if _phrases_cache and (time.time() - _phrases_cache_at) < _PHRASES_TTL:
+            return _phrases_cache
+        try:
+            from . import sqlite_db as db
+            phrases = db.get_emergency_phrases()
+            _phrases_cache = phrases if phrases else DEFAULT_EMERGENCY_PHRASES
+            _phrases_cache_at = time.time()
+        except Exception:
+            pass  # Keep stale cache on DB error; DEFAULT_EMERGENCY_PHRASES below as fallback
+    return _phrases_cache or DEFAULT_EMERGENCY_PHRASES
 
 
 def detect_emergency_red_flags(chief_complaint: str, opqrst: Dict[str, str], free_text: str = "") -> List[str]:
@@ -125,29 +144,177 @@ def detect_emergency_red_flags(chief_complaint: str, opqrst: Dict[str, str], fre
     return flags
 
 
+# ---------------------------------------------------------------------------
+# Drug / allergy synonym normalization
+# Maps common brand names and lay terms to their generic equivalents.
+# "Tylenol" → "acetaminophen", "blood thinner" → "warfarin" etc.
+# Add entries here as they surface in production — no redeploy needed for
+# this dict since it ships with the code (not DB-backed intentionally: it
+# affects clinical note content and should be code-reviewed before changes).
+# ---------------------------------------------------------------------------
+
+_DRUG_SYNONYMS: dict[str, str] = {
+    # OTC brand → generic
+    "tylenol":           "acetaminophen",
+    "advil":             "ibuprofen",
+    "motrin":            "ibuprofen",
+    "aleve":             "naproxen",
+    "benadryl":          "diphenhydramine",
+    "pepcid":            "famotidine",
+    "prilosec":          "omeprazole",
+    "nexium":            "esomeprazole",
+    "claritin":          "loratadine",
+    "zyrtec":            "cetirizine",
+    "allegra":           "fexofenadine",
+    "sudafed":           "pseudoephedrine",
+    "mucinex":           "guaifenesin",
+    "robitussin":        "guaifenesin",
+    "zantac":            "ranitidine",
+    "tagamet":           "cimetidine",
+    "mylanta":           "aluminum hydroxide/magnesium hydroxide",
+    "tums":              "calcium carbonate",
+    # Rx brand → generic
+    "lipitor":           "atorvastatin",
+    "zocor":             "simvastatin",
+    "crestor":           "rosuvastatin",
+    "norvasc":           "amlodipine",
+    "zestril":           "lisinopril",
+    "prinivil":          "lisinopril",
+    "altace":            "ramipril",
+    "toprol":            "metoprolol",
+    "lopressor":         "metoprolol",
+    "coreg":             "carvedilol",
+    "lasix":             "furosemide",
+    "glucophage":        "metformin",
+    "januvia":           "sitagliptin",
+    "lantus":            "insulin glargine",
+    "humalog":           "insulin lispro",
+    "novolog":           "insulin aspart",
+    "synthroid":         "levothyroxine",
+    "coumadin":          "warfarin",
+    "eliquis":           "apixaban",
+    "xarelto":           "rivaroxaban",
+    "pradaxa":           "dabigatran",
+    "plavix":            "clopidogrel",
+    "zithromax":         "azithromycin",
+    "amoxil":            "amoxicillin",
+    "augmentin":         "amoxicillin-clavulanate",
+    "cipro":             "ciprofloxacin",
+    "levaquin":          "levofloxacin",
+    "diflucan":          "fluconazole",
+    "valtrex":           "valacyclovir",
+    "prozac":            "fluoxetine",
+    "zoloft":            "sertraline",
+    "lexapro":           "escitalopram",
+    "celexa":            "citalopram",
+    "wellbutrin":        "bupropion",
+    "cymbalta":          "duloxetine",
+    "effexor":           "venlafaxine",
+    "abilify":           "aripiprazole",
+    "seroquel":          "quetiapine",
+    "risperdal":         "risperidone",
+    "xanax":             "alprazolam",
+    "ativan":            "lorazepam",
+    "klonopin":          "clonazepam",
+    "ambien":            "zolpidem",
+    "neurontin":         "gabapentin",
+    "lyrica":            "pregabalin",
+    "topamax":           "topiramate",
+    "depakote":          "valproate",
+    "tegretol":          "carbamazepine",
+    "singulair":         "montelukast",
+    "spiriva":           "tiotropium",
+    "symbicort":         "budesonide/formoterol",
+    "advair":            "fluticasone/salmeterol",
+    "flovent":           "fluticasone",
+    "ventolin":          "albuterol",
+    "proventil":         "albuterol",
+    # Lay terms → generic
+    "blood thinner":     "warfarin",
+    "blood thinners":    "anticoagulant",
+    "water pill":        "furosemide",
+    "water pills":       "diuretic",
+    "sugar pill":        "placebo",
+    "heart pill":        "cardiac medication",
+    "cholesterol pill":  "statin",
+    "cholesterol pills": "statin",
+    "thyroid pill":      "levothyroxine",
+    "thyroid pills":     "levothyroxine",
+    "sleeping pill":     "sedative/hypnotic",
+    "sleeping pills":    "sedative/hypnotic",
+    "pain pill":         "analgesic",
+    "pain pills":        "analgesic",
+    "nerve pill":        "anxiolytic",
+    "nerve pills":       "anxiolytic",
+    "inhaler":           "bronchodilator inhaler",
+    "puffer":            "bronchodilator inhaler",
+    "epi pen":           "epinephrine auto-injector",
+    "epipen":            "epinephrine auto-injector",
+}
+
+
+def normalize_drug_name(name: str) -> str:
+    """
+    Map a brand name or lay term to its generic equivalent.
+
+    Matching is case-insensitive and whole-word so "Tylenol PM" is caught by
+    the "tylenol" key.  The original term is kept in parentheses when a
+    substitution is made so the clinician can see what the patient actually said.
+    Returns the original string unchanged when no synonym matches.
+    """
+    key = (name or "").strip().lower()
+    if key in _DRUG_SYNONYMS:
+        return f"{_DRUG_SYNONYMS[key]} ({name.strip()})"
+    # Partial prefix match: "Tylenol PM" contains "tylenol"
+    for synonym, generic in _DRUG_SYNONYMS.items():
+        if key.startswith(synonym) or synonym in key:
+            return f"{generic} ({name.strip()})"
+    return name.strip()
+
+
+# Phrases that mean "nothing to report" — shared across allergies, PMH, meds, results.
+_NONE_SYNONYMS: frozenset[str] = frozenset({
+    "none", "no", "na", "n/a", "nil", "nka", "nkda", "nada",
+    "nothing", "nope", "not really", "negative", "none known",
+    "no known", "none that i know of", "i don't have any", "i don't have",
+})
+
+
+def _is_none_response(text: str) -> bool:
+    """Return True when the patient's text clearly means 'nothing to report'."""
+    t = (text or "").strip().lower()
+    if t in _NONE_SYNONYMS:
+        return True
+    # "no allergies", "no medications", "no history", "no surgeries", etc.
+    if t.startswith("no ") or t.startswith("none "):
+        return True
+    return False
+
+
 def extract_allergies_simple(text: str) -> List[str]:
     t = (text or "").strip().lower()
-    if not t:
-        return []
-    if any(x in t for x in ["no allergies", "none", "nka"]):
+    if not t or _is_none_response(t):
         return []
     parts = re.split(r",|;|and", text)
     items = [p.strip() for p in parts if p.strip()]
     seen = set()
     out = []
     for it in items:
-        k = it.lower()
+        normalized = normalize_drug_name(it)
+        k = normalized.lower()
         if k not in seen:
             seen.add(k)
-            out.append(it)
+            out.append(normalized)
     return out
 
 
 def extract_list_simple(text: str) -> List[str]:
-    t = (text or "").strip().lower()
-    if not t or t in {"none", "no", "na"} or t.startswith("no "):
+    if _is_none_response(text):
         return []
-    parts = re.split(r",|;|and|\n", text)
+    t = (text or "").strip()
+    if not t:
+        return []
+    parts = re.split(r",|;|and|\n", t)
     items = [p.strip() for p in parts if p.strip()]
     seen = set()
     out = []
@@ -215,24 +382,106 @@ CRISIS_RESOURCE = (
 
 def detect_crisis(text: str) -> List[str]:
     """
-    Returns list of matched crisis phrases (empty = no crisis).
-    Caller should return CRISIS_RESOURCE to patient and create a 'crisis' escalation.
-    Session should NOT be terminated — patient may still want to complete intake.
+    Tier-1 crisis detection: exact phrase + regex matching.
 
-    Two-pass detection:
-      Pass 1 — exact substring match against _CRISIS_PHRASES (fast, high precision).
-      Pass 2 — regex match for morphological variants (killing/ended/hurting myself).
+    Returns list of matched phrases (empty = no match).
+    Fast, zero-latency, high-precision for explicit self-harm language.
+
+    For borderline cases (hopelessness, passive ideation, burden language)
+    use llm_crisis_score() after checking has_soft_distress().
     """
     t = (text or "").lower()
     matched: List[str] = [p for p in _CRISIS_PHRASES if p in t]
 
     for m in _CRISIS_REGEX.finditer(text):
         phrase = m.group(0).lower()
-        # Avoid duplicates: only add if the stem isn't already covered by phrase list
         if not any(phrase in existing or existing in phrase for existing in matched):
             matched.append(phrase)
 
     return matched
+
+
+# ---------------------------------------------------------------------------
+# Tier-2: LLM-in-the-loop crisis scoring for borderline cases
+#
+# Architecture:
+#   Tier 1  detect_crisis()       — keyword/regex, explicit phrases, ~0 ms
+#   Tier 2  llm_crisis_score()    — LLM classifier, borderline ideation, ~500 ms
+#
+# The soft-distress gate (has_soft_distress) prevents unnecessary LLM calls
+# for ordinary clinical messages.  The LLM handles what keywords cannot:
+#   false negatives  "I wonder if there's any point"  (no keyword match)
+#   false positives  "kill this headache"              (keyword but figurative)
+# ---------------------------------------------------------------------------
+
+# Soft distress signals: present → run LLM classifier; absent → skip LLM call.
+# These are necessary but not sufficient for crisis — the LLM decides.
+_SOFT_DISTRESS_SIGNALS: List[str] = [
+    "no point",         "what's the point",  "whats the point",
+    "can't see the point", "dont see the point", "don't see the point",
+    "wonder if there's any", "wonder if there is any",
+    "hopeless",         "no hope",           "feel hopeless",
+    "worthless",        "feel worthless",    "i'm worthless",
+    "burden",           "i'm a burden",      "im a burden",
+    "better off without me",                 "better off without",
+    "everyone would be better off",
+    "tired of living",  "tired of life",     "tired of everything",
+    "wish i wasn't here", "wish i was dead", "wish i wasn't alive",
+    "don't want to be here", "dont want to be here",
+    "just want it to stop",  "want it all to stop",  "want everything to stop",
+    "no reason to",     "no reason anymore",
+    "giving up",        "given up on",       "feel like giving up",
+    "no future",        "don't have a future", "cant see a future",
+    "nothing matters",  "nothing will get better", "never get better",
+    "not worth it",     "no reason to get up",
+]
+
+
+def has_soft_distress(text: str) -> bool:
+    """
+    Fast heuristic gate: returns True if the message contains any soft
+    distress signal that warrants LLM crisis scoring.
+
+    Called before llm_crisis_score() to avoid unnecessary LLM calls for
+    routine clinical messages.
+    """
+    t = (text or "").lower()
+    return any(signal in t for signal in _SOFT_DISTRESS_SIGNALS)
+
+
+def llm_crisis_score(text: str) -> "CrisisScore":
+    """
+    Tier-2 LLM crisis classifier for borderline cases.
+
+    Should only be called when:
+      - detect_crisis() returned empty (Tier 1 did not fire), AND
+      - has_soft_distress() returned True (soft signals present)
+
+    Returns a CrisisScore with:
+      is_crisis_risk=True, confidence high/medium → caller should escalate
+      is_crisis_risk=True, confidence low         → log soft_distress_flagged only
+      is_crisis_risk=False                        → no action needed
+
+    Fails safe: any LLM error returns is_crisis_risk=False, confidence=low
+    so that hard-trigger detection (Tier 1) continues to be the reliable path.
+    """
+    from .llm import run_json_step
+    from .schemas import CrisisScore
+    from .prompts import crisis_score_system
+
+    try:
+        obj, _ = run_json_step(
+            system=crisis_score_system(),
+            prompt=f"PATIENT_MESSAGE={text}",
+            schema=CrisisScore,
+            fallback={"is_crisis_risk": False, "confidence": "low", "reasoning": "llm_error"},
+            temperature=0.1,
+            max_tokens=80,   # CrisisScore is 3 tiny fields — 80 tokens is ample and bounds latency
+        )
+        return obj
+    except Exception:
+        # Never let a Tier-2 failure silence Tier-1 or crash the node.
+        return CrisisScore(is_crisis_risk=False, confidence="low", reasoning="llm_error")
 
 
 # ---------------------------------------------------------------------------

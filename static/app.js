@@ -1,5 +1,6 @@
-let threadId    = null;
-let clientMsgId = 0;
+let threadId       = null;
+let sessionToken   = null;   // bearer token issued by /start, required on /chat /report /jobs
+let clientMsgId    = 0;
 let clinicianToken = null;
 
 function $(id) { return document.getElementById(id); }
@@ -74,7 +75,9 @@ function addMsg(role, text, type = "") {
 async function waitForReport(jobId) {
   while (true) {
     await new Promise(r => setTimeout(r, 1500));
-    const res = await fetch(`/jobs/${jobId}`);
+    const res = await fetch(`/jobs/${jobId}`, {
+      headers: { "Authorization": `Bearer ${sessionToken}` },
+    });
     const job = await res.json();
     if (job.status === "done")   { await loadReport(); return; }
     if (job.status === "failed") {
@@ -86,7 +89,9 @@ async function waitForReport(jobId) {
 
 async function loadReport() {
   if (!threadId) return;
-  const res = await fetch(`/report/${threadId}`);
+  const res = await fetch(`/report/${threadId}`, {
+    headers: { "Authorization": `Bearer ${sessionToken}` },
+  });
   if (!res.ok) { $("report").textContent = "Report not ready yet."; return; }
   const j    = await res.json();
   const box  = $("report");
@@ -103,8 +108,9 @@ async function start() {
     const res = await fetch("/start", { method: "POST" });
     const j   = await res.json();
 
-    threadId    = j.thread_id;
-    clientMsgId = 0;
+    threadId     = j.thread_id;
+    sessionToken = j.session_token;
+    clientMsgId  = 0;
 
     $("tid").textContent = threadId.slice(0, 12) + "…";
     $("sessionLabel").classList.remove("hidden");
@@ -146,7 +152,10 @@ async function sendMsg() {
   fd.append("client_msg_id", String(clientMsgId));
 
   try {
-    const res = await fetch("/chat", { method: "POST", body: fd });
+    const res = await fetch("/chat", {
+      method: "POST", body: fd,
+      headers: { "Authorization": `Bearer ${sessionToken}` },
+    });
     const j   = await res.json();
     const isEmergency = j.status === "escalated";
 
@@ -279,6 +288,55 @@ async function copyTid() {
   showToast("Session ID copied.", "success");
 }
 
+/* ── Demo scenarios ────────────────────────────────────── */
+let _demoScenarios = [];
+
+async function loadDemoScenarios() {
+  try {
+    const res = await fetch("/admin/demo/scenarios");
+    const j   = await res.json();
+    _demoScenarios = j.scenarios || [];
+    renderDemoScenarios();
+  } catch {
+    /* scenarios are optional — silently skip */
+  }
+}
+
+function renderDemoScenarios() {
+  const container = $("demo-scenarios");
+  if (!container || _demoScenarios.length === 0) return;
+
+  container.innerHTML = _demoScenarios.map(s => `
+    <button class="btn-demo-scenario" data-id="${escHtml(s.id)}" title="${escHtml(s.description)}">
+      ${escHtml(s.label)}
+    </button>
+  `).join("");
+
+  container.querySelectorAll(".btn-demo-scenario").forEach(btn => {
+    btn.addEventListener("click", () => runDemoScenario(btn.dataset.id));
+  });
+}
+
+async function runDemoScenario(scenarioId) {
+  const scenario = _demoScenarios.find(s => s.id === scenarioId);
+  if (!scenario) return;
+
+  showToast(`Running demo: ${scenario.label}`, "info", 2000);
+
+  // Start a fresh session first
+  await start();
+  if (!threadId) return;
+
+  // Send each message with a short delay so the UI animates naturally
+  for (const msg of scenario.messages) {
+    await new Promise(r => setTimeout(r, 900));
+    $("msg").value = msg;
+    await sendMsg();
+    // Wait for the typing indicator to clear before next message
+    await new Promise(r => setTimeout(r, 300));
+  }
+}
+
 /* ── Event bindings ────────────────────────────────────── */
 window.addEventListener("DOMContentLoaded", () => {
   $("startBtn").addEventListener("click", start);
@@ -290,4 +348,7 @@ window.addEventListener("DOMContentLoaded", () => {
   $("loginBtn").addEventListener("click", clinicianLogin);
   $("copyTidBtn").addEventListener("click", copyTid);
   $("clinicianPwd").addEventListener("keydown", e => { if (e.key === "Enter") clinicianLogin(); });
+
+  // Load demo scenarios in the background (no auth required)
+  loadDemoScenarios();
 });

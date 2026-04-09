@@ -1,116 +1,50 @@
 """
 agentic.py — Agent-level decision helpers.
 
-Implements the four agentic capabilities that elevate the system from a
-deterministic state machine to a true agent:
+  1. Intake classification   — embedded in SubjectiveOut (single extraction call)
+  2. Extraction quality      — score OPQRST completeness and build gap-fill questions
+  3. Validation messaging    — targeted messages when validate_node blocks a transition
+  4. Clinical question tuning — adapt questions by intake classification
 
-  1. Intake classification   — classify visit type from first signals
-  2. Dynamic follow-up       — select the most relevant next question
-  3. Extraction quality      — score OPQRST completeness and build gap-fill questions
-  4. Validation messaging    — targeted messages when validate_node blocks a transition
+Follow-up question selection is handled by the extraction LLM's own `reply` field,
+which is already prompted to ask exactly one relevant question when is_complete=False.
 """
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
-
-from .llm import run_json_step
-from .schemas import ClassificationOut, FollowUpStrategyOut
-from .prompts import classification_system, followup_strategy_system
+from typing import Dict, List
 
 
 # ---------------------------------------------------------------------------
-# Feature 1: Intake classification
+# Clinical history question tuning by intake classification
 # ---------------------------------------------------------------------------
-
-_VALID_CLASSIFICATIONS = {
-    "emergency_visit",
-    "routine_checkup",
-    "specialist_referral",
-    "mental_health",
-    "pediatric",
-}
-
-
-def classify_intake(mode: str, cc: str, user_text: str) -> Tuple[str, str, dict]:
-    """
-    Classify the intake type from mode, chief complaint, and first user message.
-
-    Returns (classification, confidence, meta).
-    The caller should inspect meta["fallback_used"] to decide whether to log a failure.
-    Falls back to ("routine_checkup", "low") on any LLM failure so that
-    downstream logic always has a valid classification.
-    """
-    prompt = f"MODE={mode}\nCHIEF_COMPLAINT={cc}\nUSER_TEXT={user_text}"
-    obj, meta = run_json_step(
-        system=classification_system(),
-        prompt=prompt,
-        schema=ClassificationOut,
-        fallback={"intake_classification": "routine_checkup", "confidence": "low", "rationale": ""},
-        temperature=0.2,
-    )
-    out = obj.model_dump()
-    classification = out.get("intake_classification") or "routine_checkup"
-    if classification not in _VALID_CLASSIFICATIONS:
-        classification = "routine_checkup"
-    confidence = out.get("confidence") or "low"
-    return classification, confidence, meta
-
-
-# ---------------------------------------------------------------------------
-# Feature 2: Dynamic follow-up strategy selection
-# ---------------------------------------------------------------------------
-
-def select_followup(intake_classification: str, mode: str, cc: str, opqrst: Dict[str, str]) -> Tuple[str, dict]:
-    """
-    Select the most clinically relevant follow-up question given current state.
-
-    Returns (question, meta).
-    question is "" when the fallback fired so the caller falls back to the LLM's
-    own reply from the extraction step.
-    The caller should inspect meta["fallback_used"] to decide whether to log a failure.
-    """
-    prompt = (
-        f"INTAKE_CLASSIFICATION={intake_classification}\n"
-        f"MODE={mode}\n"
-        f"CHIEF_COMPLAINT={cc}\n"
-        f"OPQRST_CURRENT={opqrst}"
-    )
-    obj, meta = run_json_step(
-        system=followup_strategy_system(intake_classification, mode),
-        prompt=prompt,
-        schema=FollowUpStrategyOut,
-        fallback={"priority_fields": [], "next_question": "", "rationale": ""},
-        temperature=0.3,
-    )
-    return (obj.model_dump().get("next_question") or "").strip(), meta
-
 
 def adapt_clinical_question(step: str, classification: str) -> str:
     """
     Return a classification-adapted clinical history question for `step`,
-    or "" to use the static default question.
+    or "" to fall back to the static default question.
     """
     if step == "meds" and classification == "pediatric":
         return (
             "What medications or vitamins is the patient currently taking? "
-            "Include the name, dose, how often, and when last taken. "
-            "Include any children's vitamins or OTC medications. If none, say 'none'."
+            "Please include the name, dose, how often, and when last taken — "
+            "including any children's vitamins or OTC medications. If none, just say 'none'."
         )
     if step == "pmh" and classification == "mental_health":
         return (
-            "Any past medical conditions, surgeries, or prior mental health diagnoses "
-            "or treatments? If none, say 'none'."
+            "Thank you for sharing. Do you have any past medical conditions, surgeries, "
+            "or prior mental health diagnoses or treatments I should know about? "
+            "If none, just say 'none'."
         )
     if step == "results" and classification == "mental_health":
         return (
-            "Any recent lab tests, imaging, or psychiatric evaluations since your last visit? "
-            "If none, say 'none'."
+            "Have you had any recent lab tests, imaging, or psychiatric evaluations "
+            "since your last visit? If none, just say 'none'."
         )
     return ""
 
 
 # ---------------------------------------------------------------------------
-# Feature 3: Extraction quality scoring and gap-fill questions
+# Extraction quality scoring and gap-fill questions
 # ---------------------------------------------------------------------------
 
 def score_extraction_quality(cc: str, opqrst: Dict[str, str]) -> float:
@@ -169,7 +103,7 @@ def build_gap_fill_question(cc: str, opqrst: Dict[str, str], classification: str
 
 
 # ---------------------------------------------------------------------------
-# Feature 4: Validation gap message builder
+# Validation gap message builder
 # ---------------------------------------------------------------------------
 
 def build_validation_gap_message(errors: List[str], cc: str, mode: str) -> str:

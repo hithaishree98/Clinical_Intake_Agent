@@ -3,7 +3,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-from app.settings import settings
+from app.settings import get_settings as settings
 from app import sqlite_db as db
 
 

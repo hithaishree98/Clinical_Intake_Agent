@@ -39,11 +39,17 @@ class OPQRSTFields(BaseModel):
 # ---------------------------------------------------------------------------
 
 class SubjectiveOut(BaseModel):
-    chief_complaint:       Annotated[str, Field(default="", max_length=300)]           = ""
-    opqrst:                OPQRSTFields                                                = Field(default_factory=OPQRSTFields)
-    is_complete:           bool                                                        = False
-    reply:                 Annotated[str, Field(default="", max_length=400)]           = ""
-    extraction_confidence: Literal["high", "medium", "low"]                           = "medium"
+    chief_complaint:         Annotated[str, Field(default="", max_length=300)]          = ""
+    opqrst:                  OPQRSTFields                                               = Field(default_factory=OPQRSTFields)
+    is_complete:             bool                                                       = False
+    reply:                   Annotated[str, Field(default="", max_length=400)]          = ""
+    extraction_confidence:   Literal["high", "medium", "low"]                          = "medium"
+    # Combined classification — avoids a second LLM round-trip on first chief complaint
+    intake_classification:   Literal[
+        "emergency_visit", "routine_checkup", "specialist_referral",
+        "mental_health", "pediatric",
+    ] | None                                                                           = None
+    classification_confidence: Literal["high", "medium", "low"] | None                = None
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +65,11 @@ class MedicationItem(BaseModel):
     @field_validator("name", mode="before")
     @classmethod
     def strip_name(cls, v: object) -> str:
-        return (str(v) if v else "").strip()
+        raw = (str(v) if v else "").strip()
+        if not raw:
+            return raw
+        from .extract import normalize_drug_name
+        return normalize_drug_name(raw)
 
 
 class MedsOut(BaseModel):
@@ -71,6 +81,29 @@ class MedsOut(BaseModel):
         """Remove any medication entries where the LLM left the name blank."""
         self.medications = [m for m in self.medications if m.name]
         return self
+
+
+# ---------------------------------------------------------------------------
+# Crisis scoring — LLM-in-the-loop safety layer
+# ---------------------------------------------------------------------------
+
+class CrisisScore(BaseModel):
+    """
+    Result of the LLM borderline-crisis classifier.
+
+    Used only when keyword/regex detection (Tier 1) did not fire but the
+    message contains soft distress signals that warrant LLM interpretation.
+    The LLM determines whether the language represents genuine suicidal or
+    self-harm ideation versus figurative speech (e.g. "kill this headache").
+
+    confidence semantics:
+      high   — LLM is certain about the verdict
+      medium — LLM is reasonably confident; borderline cases here still escalate
+      low    — LLM is uncertain; logged as soft_distress_flagged but no escalation
+    """
+    is_crisis_risk: bool                                                  = False
+    confidence:     Literal["high", "medium", "low"]                     = "low"
+    reasoning:      Annotated[str, Field(default="", max_length=300)]    = ""
 
 
 # ---------------------------------------------------------------------------

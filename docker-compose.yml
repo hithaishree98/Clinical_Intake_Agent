@@ -5,6 +5,46 @@ services:
       - "8000:8000"
     volumes:
       - ./data:/app/data
+      - ./static:/app/static
     env_file:
       - .env
+    environment:
+      # Point at the local HAPI FHIR server when running in compose.
+      # Remove or override in .env to target a remote FHIR server instead.
+      FHIR_SERVER_URL: http://hapi-fhir:8080/fhir
+    depends_on:
+      # Soft dependency — the app starts regardless of HAPI FHIR health.
+      # FHIR bundle pushes are non-blocking and fail gracefully, so the
+      # intake flow works fine if FHIR is slow to boot or unavailable.
+      hapi-fhir:
+        condition: service_started
     restart: unless-stopped
+
+  # HAPI FHIR R4 reference server — receives completed intake bundles.
+  # Admin UI: http://localhost:8080
+  # FHIR base: http://localhost:8080/fhir
+  hapi-fhir:
+    image: hapiproject/hapi:latest
+    ports:
+      - "8080:8080"
+    volumes:
+      - hapi-data:/data/hapi
+    # Run as root so the named volume is always writable on any host OS.
+    # HAPI FHIR is a reference/dev server; root is acceptable here.
+    user: root
+    environment:
+      spring.datasource.url: "jdbc:h2:file:/data/hapi/h2;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE"
+      spring.datasource.driverClassName: "org.h2.Driver"
+      spring.datasource.username: "sa"
+      spring.datasource.password: "password"
+      spring.jpa.properties.hibernate.dialect: "ca.uhn.fhir.jpa.model.dialect.HapiFhirH2Dialect"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/fhir/metadata"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    restart: unless-stopped
+
+volumes:
+  hapi-data:

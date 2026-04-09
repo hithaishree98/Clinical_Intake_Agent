@@ -10,10 +10,16 @@ from dataclasses import dataclass
 from typing import Callable, Optional, Type, Tuple
 
 from pydantic import BaseModel, ValidationError
-from google import genai
-from google.genai import types
+try:
+    from google import genai
+    from google.genai import types
+    _GENAI_AVAILABLE = True
+except ImportError:
+    genai = None
+    types = None
+    _GENAI_AVAILABLE = False
 
-from .settings import settings
+from .settings import get_settings as settings
 from .logging_utils import log_event
 
 
@@ -106,9 +112,11 @@ MAX_RESPONSE_CHARS = 8_000   # hard cap — prevents runaway tokens filling DB
 
 @dataclass(frozen=True)
 class LLMResult:
-    ok:    bool
-    text:  str
-    error: str = ""
+    ok:            bool
+    text:          str
+    error:         str = ""
+    input_tokens:  int = 0
+    output_tokens: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -118,9 +126,13 @@ class LLMResult:
 class GeminiClient:
 
     def __init__(self) -> None:
-        if not settings.gemini_api_key:
+        if not _GENAI_AVAILABLE:
+            raise RuntimeError(
+                "google-genai is not installed. Install it or mock get_gemini() in tests."
+            )
+        if not settings().gemini_api_key:
             raise RuntimeError("Missing GEMINI_API_KEY")
-        self.client = genai.Client(api_key=settings.gemini_api_key)
+        self.client = genai.Client(api_key=settings().gemini_api_key)
 
     def validate(self) -> None:
         result = self.generate_text(
@@ -133,7 +145,7 @@ class GeminiClient:
         if not result.ok:
             raise RuntimeError(
                 f"Gemini API validation failed at startup: {result.error}\n"
-                f"Model: {settings.gemini_flash_model}\n"
+                f"Model: {settings().gemini_flash_model}\n"
                 "Check your GEMINI_API_KEY and GEMINI_FLASH_MODEL in .env"
             )
 
@@ -148,9 +160,9 @@ class GeminiClient:
             log_event("circuit_breaker_rejected", level="warning", op=op)
             return LLMResult(False, "", "circuit_breaker_open")
 
-        max_retries = max_retries or settings.max_retries
-        base  = settings.base_retry_delay
-        cap   = settings.max_retry_delay
+        max_retries = max_retries or settings().max_retries
+        base  = settings().base_retry_delay
+        cap   = settings().max_retry_delay
 
         for attempt in range(max_retries):
             try:
@@ -168,7 +180,7 @@ class GeminiClient:
 
                 if permanent or last_attempt:
                     log_event("llm_error", level="error", op=op,
-                              model=settings.gemini_flash_model,
+                              model=settings().gemini_flash_model,
                               attempt=attempt + 1,
                               error_type=type(e).__name__,
                               error=str(e)[:400],
@@ -193,14 +205,17 @@ class GeminiClient:
         max_tokens: int = 900,
         response_mime_type: str | None = "application/json",
     ) -> LLMResult:
-        timeout = settings.llm_timeout_seconds
+        timeout = settings().llm_timeout_seconds
+
+        # Shared container so _call() can return both text and token counts.
+        _usage: dict = {}
 
         def _call() -> str:
             # google-genai SDK ignores HTTP timeouts, so we enforce our own.
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 future = pool.submit(
                     self.client.models.generate_content,
-                    model=settings.gemini_flash_model,
+                    model=settings().gemini_flash_model,
                     contents=prompt,
                     config=types.GenerateContentConfig(
                         system_instruction=system,
@@ -210,9 +225,21 @@ class GeminiClient:
                     ),
                 )
                 resp = future.result(timeout=timeout)
+            # Capture token counts when Gemini provides them.
+            meta = getattr(resp, "usage_metadata", None)
+            if meta:
+                _usage["input_tokens"]  = getattr(meta, "prompt_token_count", 0) or 0
+                _usage["output_tokens"] = getattr(meta, "candidates_token_count", 0) or 0
             return resp.text or ""
 
-        return self._retry(_call, op="generate_text")
+        result = self._retry(_call, op="generate_text")
+        return LLMResult(
+            ok=result.ok,
+            text=result.text,
+            error=result.error,
+            input_tokens=_usage.get("input_tokens", 0),
+            output_tokens=_usage.get("output_tokens", 0),
+        )
 
 
 _gemini: Optional[GeminiClient] = None
@@ -307,6 +334,7 @@ def run_json_step(
         parse_error = res.error or "empty_response"
 
     repair_used = False
+    res2: LLMResult | None = None
     if (not parse_ok) and res.ok:
         repair_used = True
         res2     = get_gemini().generate_text(system=system,
@@ -317,7 +345,7 @@ def run_json_step(
         if res2.ok and cleaned2:
             try:
                 obj = schema.model_validate_json(cleaned2)
-                parse_ok, parse_error, cleaned, res = True, "", cleaned2, res2
+                parse_ok, parse_error, cleaned = True, "", cleaned2
             except ValidationError as ve:
                 parse_error = f"schema_after_repair: {ve.errors()[0].get('msg', '')}"
             except Exception as e:
@@ -325,16 +353,32 @@ def run_json_step(
 
     if not parse_ok:
         log_event("llm_fallback_used", level="warning",
-                  parse_error=parse_error, repair_attempted=repair_used)
+                  parse_error=parse_error,
+                  repair_attempted=repair_used,
+                  system_preview=system[:300],
+                  prompt_preview=prompt[:200])
         obj = schema.model_validate(_clamp_fallback_strings(fallback))
 
+    # Aggregate tokens across primary + optional repair call.
+    total_input  = res.input_tokens  + (res2.input_tokens  if res2 else 0)
+    total_output = res.output_tokens + (res2.output_tokens if res2 else 0)
+
+    latency_ms = int((time.time() - t0) * 1000)
+    # cost estimate using Gemini Flash pricing (input $0.075/1M, output $0.30/1M)
+    cost_usd = round(
+        (total_input / 1_000_000) * 0.075 + (total_output / 1_000_000) * 0.30, 8
+    )
     meta = {
         "llm_ok": res.ok, "llm_error": res.error,
-        "latency_ms": int((time.time() - t0) * 1000),
+        "latency_ms": latency_ms,
         "parse_ok": parse_ok, "parse_error": parse_error,
         "repair_used": repair_used, "fallback_used": not parse_ok,
         "raw_preview": (res.text or "")[:160],
         "cleaned_preview": (cleaned or "")[:160],
+        "input_tokens": total_input,
+        "output_tokens": total_output,
+        "cost_usd": cost_usd,
+        "model": settings().gemini_flash_model,
     }
     return obj, meta
 

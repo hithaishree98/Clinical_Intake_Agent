@@ -6,8 +6,8 @@
   <title>Clinical Intake</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Instrument+Serif:ital@0;1&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/styles.css" />
-  <script defer src="/static/app.js"></script>
+  <link rel="stylesheet" href="/static/styles.css?v=2" />
+  <script defer src="/static/app.js?v=2"></script>
 </head>
 <body>
   <div class="layout">
@@ -36,6 +36,7 @@
           </button>
         </span>
         <div id="statusDot" class="status-dot" title="No session"></div>
+        <a href="/dashboard" class="btn-outline-sm" title="Operations dashboard">Dashboard</a>
         <button class="btn-primary" id="startBtn">New Session</button>
       </div>
     </header>
@@ -56,6 +57,9 @@
             <p>Begin a new session to start<br>the patient intake flow.</p>
           </div>
         </div>
+
+        <!-- Demo scenario presets — populated by JS from /demo/scenarios -->
+        <div id="demo-scenarios" class="demo-scenarios"></div>
 
         <div id="typing" class="typing hidden">
           <span></span><span></span><span></span>

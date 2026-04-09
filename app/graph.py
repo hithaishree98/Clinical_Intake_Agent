@@ -2,7 +2,7 @@ import sqlite3
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.sqlite import SqliteSaver
 from pathlib import Path
-from .settings import settings
+from .settings import get_settings as settings
 from .state import IntakeState
 from . import nodes
 
@@ -24,8 +24,8 @@ def route(state: IntakeState):
 
 
 def build_graph():
-    Path(settings.checkpoint_db_path).parent.mkdir(parents=True, exist_ok=True)
-    cp = sqlite3.connect(settings.checkpoint_db_path, timeout=30.0, check_same_thread=False)
+    Path(settings().checkpoint_db_path).parent.mkdir(parents=True, exist_ok=True)
+    cp = sqlite3.connect(settings().checkpoint_db_path, timeout=30.0, check_same_thread=False)
     cp.execute("PRAGMA journal_mode=WAL;")
     cp.execute("PRAGMA synchronous=NORMAL;")
     cp.execute("PRAGMA busy_timeout=30000;")

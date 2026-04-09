@@ -15,7 +15,7 @@ class TestIdempotency:
         response = {"reply": "hello", "status": "active", "phase": "identity"}
         db.save_idempotent_response(
             thread_id,
-            client_msg_id="msg-1",
+            key="msg-1",
             request_hash="abc123",
             response_obj=response,
         )

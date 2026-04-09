@@ -37,8 +37,9 @@ class IntakeState(TypedDict, total=False):
 
 
     chief_complaint: str
-    opqrst: Dict[str, str]                   
+    opqrst: Dict[str, str]
     subjective_complete: bool
+    subjective_incomplete_turns: int          # counts consecutive incomplete turns in subjective phase
 
 
     clinical_step: Literal["allergies", "meds", "pmh", "results", "done"]

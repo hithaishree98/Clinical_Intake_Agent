@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  test:
+    name: Lint + Tests
+    runs-on: ubuntu-latest
+
+    env:
+      # Minimal env so settings validation passes without real secrets.
+      GEMINI_API_KEY: "ci-placeholder-key"
+      JWT_SECRET: "ci-test-jwt-secret-32-chars-minimum"
+      CLINICIAN_PASSWORD: "ci-test-password"
+      DEBUG_MODE: "true"   # skips Gemini API validation at startup
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Lint (ruff)
+        run: |
+          pip install ruff --quiet
+          ruff check app/ tests/ --select E,F --ignore E501 || true
+
+      - name: Run tests
+        run: pytest tests/ -v --tb=short
+
+      - name: Verify prompt version constants exist
+        # Fails the build if someone removes the PROMPT_VERSIONS dict.
+        run: python -c "from app.prompts import PROMPT_VERSIONS; assert PROMPT_VERSIONS, 'PROMPT_VERSIONS must not be empty'"
+
+      - name: Smoke-import all app modules
+        # Catches import-time errors (missing deps, syntax errors) before tests run.
+        run: |
+          python -c "
+          from app import api, nodes, llm, agentic, extract, fhir_builder, \
+                         webhook, sqlite_db, schemas, safety, settings, \
+                         logging_utils, prompts, state, graph
+          from app.events import bus, IntakeCompletedEvent, EmergencyFlaggedEvent, CrisisDetectedEvent
+          from app.integrations.fhir_client import push_bundle
+          print('All modules imported successfully')
+          "
+
+      - name: Run deterministic evals
+        # 9 of 11 eval categories require no LLM key — run them as a regression
+        # gate on every push/PR. LLM evals (opqrst_extraction, llm_reliability)
+        # are gated on secret availability in the separate eval.yml workflow.
+        run: python -m evals.run_evals
+
+  build:
+    name: Docker Build Check
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t clinical-intake:ci .
+
+      - name: Smoke-test health endpoint
+        run: |
+          docker run -d --name ci-smoke \
+            -p 8000:8000 \
+            -e GEMINI_API_KEY=ci-placeholder \
+            -e JWT_SECRET=ci-test-jwt-secret-32-chars-minimum \
+            -e CLINICIAN_PASSWORD=ci-test-password \
+            -e DEBUG_MODE=true \
+            clinical-intake:ci
+          # Give uvicorn time to start up
+          sleep 6
+          curl --fail --retry 5 --retry-delay 2 --retry-connrefused \
+            http://localhost:8000/health
+          curl --fail http://localhost:8000/v1/health
+          docker stop ci-smoke

@@ -1,0 +1,27 @@
+# docker-compose.test.yml — Run the full test + eval suite inside Docker.
+#
+# Usage:
+#   docker-compose -f docker-compose.test.yml up --build --exit-code-from test
+#
+# The `test` service runs pytest + deterministic evals and exits.
+# Exit code 0 = everything passed.  Non-zero = failure.
+
+services:
+  test:
+    build: .
+    # Override the production CMD — run tests then exit.
+    command: >
+      sh -c "
+        echo '=== pytest ===' &&
+        pytest tests/ -v --tb=short &&
+        echo '=== Deterministic Evals ===' &&
+        python -m evals.run_evals &&
+        echo '=== All checks passed ==='
+      "
+    environment:
+      GEMINI_API_KEY: "${GEMINI_API_KEY:-ci-placeholder-key}"
+      JWT_SECRET: "${JWT_SECRET:-ci-test-jwt-secret-32-chars-minimum!!}"
+      CLINICIAN_PASSWORD: "${CLINICIAN_PASSWORD:-ci-test-password}"
+      DEBUG_MODE: "true"
+    # No ports — this container runs and exits.
+    # No volume mounts — tests use in-memory/temp DBs via conftest.py fixtures.

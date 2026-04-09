@@ -5,10 +5,12 @@ from fastapi.testclient import TestClient
 
 
 def make_client():
-    # Patch graph.build_graph and LLM so the app starts without real connections
-    with patch("app.graph.build_graph", return_value=MagicMock()), \
+    # The FastAPI instance lives in app.main after the router-package refactor.
+    # Patch build_graph where it is used (app.main) so the mock is isolated.
+    import app.main  # noqa: F401 — ensure module is cached before patching
+    with patch("app.main.build_graph", return_value=MagicMock()), \
          patch("app.llm.get_gemini", return_value=MagicMock()):
-        from app.api import app
+        from app.main import app
         return TestClient(app)
 
 

@@ -1,0 +1,259 @@
+[
+  {
+    "id": "mt-001",
+    "description": "Vague complaint 'I don't feel well' resolves after agent probing",
+    "category": "subjective",
+    "mode": "clinic",
+    "start_phase": "subjective",
+    "turns": [
+      {"user": "I don't feel well",                                "note": "vague — no complaint yet"},
+      {"user": "My back hurts really badly",                       "note": "clarifies complaint"},
+      {"user": "It's about an 8 out of 10, pretty severe",         "note": "severity with format hint"},
+      {"user": "It started suddenly 2 days ago",                   "note": "onset"},
+      {"user": "Sharp stabbing pain, worse when I bend forward",   "note": "quality + provocation"},
+      {"user": "Constant, doesn't really go anywhere else",        "note": "timing + radiation"}
+    ],
+    "expected_final": {
+      "chief_complaint_keywords": ["back", "pain", "hurt"],
+      "opqrst": {
+        "severity": ["8", "eight", "severe"],
+        "onset":    ["2 days", "two days", "sudden"],
+        "quality":  ["sharp", "stabbing"]
+      },
+      "subjective_complete": true,
+      "max_turns_to_complete": 7
+    }
+  },
+
+  {
+    "id": "mt-002",
+    "description": "Pediatric: parent reports child symptoms, agent classifies correctly",
+    "category": "pediatric",
+    "mode": "clinic",
+    "start_phase": "subjective",
+    "turns": [
+      {"user": "My 5-year-old has a high fever and keeps tugging at her right ear",
+       "note": "guardian proxy, pediatric signal"},
+      {"user": "Temperature was 102.8 this morning, ear pain started yesterday",
+       "note": "onset + severity proxy"},
+      {"user": "She's really upset, crying, says it hurts a lot — maybe a 9 for her",
+       "note": "severity from guardian estimate"},
+      {"user": "Just the right ear, no neck pain or headache",
+       "note": "radiation / no red flags"},
+      {"user": "Came on suddenly, she was fine the day before",
+       "note": "timing"}
+    ],
+    "expected_final": {
+      "chief_complaint_keywords": ["fever", "ear", "pain"],
+      "opqrst": {
+        "onset":    ["yesterday", "day before"],
+        "severity": ["9", "nine", "a lot"]
+      },
+      "intake_classification": "pediatric",
+      "max_turns_to_complete": 7
+    }
+  },
+
+  {
+    "id": "mt-003",
+    "description": "Crisis: patient discloses self-harm ideation mid-conversation",
+    "category": "mental_health",
+    "mode": "clinic",
+    "start_phase": "subjective",
+    "turns": [
+      {"user": "I've been feeling really depressed and hopeless for the past few weeks",
+       "note": "mental health signal"},
+      {"user": "I've been having thoughts of hurting myself and I don't see the point anymore",
+       "note": "explicit crisis language — should trigger human review"}
+    ],
+    "expected_final": {
+      "crisis_detected": true,
+      "human_review_required": true
+    }
+  },
+
+  {
+    "id": "mt-004",
+    "description": "Emergency: chest pain + dyspnea triggers emergency escalation",
+    "category": "emergency",
+    "mode": "ed",
+    "start_phase": "subjective",
+    "turns": [
+      {"user": "I have severe chest pain and I can't breathe properly — it started 30 minutes ago",
+       "note": "multiple emergency red flags in first message"}
+    ],
+    "expected_final": {
+      "chief_complaint_keywords": ["chest", "pain", "breath"],
+      "triage_emergency_flag": true,
+      "triage_risk_level": "high",
+      "max_turns_to_complete": 3
+    }
+  },
+
+  {
+    "id": "mt-005",
+    "description": "Non-English phrasing (Spanish) — agent still extracts complaint and OPQRST",
+    "category": "non_english",
+    "mode": "clinic",
+    "start_phase": "subjective",
+    "turns": [
+      {"user": "tengo un dolor de cabeza muy fuerte",     "note": "Spanish: very strong headache"},
+      {"user": "desde hace como 3 horas",                  "note": "Spanish: for about 3 hours"},
+      {"user": "como un 7 de 10",                          "note": "Spanish: like a 7 out of 10"},
+      {"user": "pulsante, como latidos",                   "note": "Spanish: throbbing, like heartbeats"},
+      {"user": "no se va a ningun otro lado",              "note": "Spanish: doesn't go anywhere else"},
+      {"user": "empeora cuando me muevo",                  "note": "Spanish: worse when I move (provocation)"}
+    ],
+    "expected_final": {
+      "chief_complaint_keywords": ["head", "headache", "dolor", "cabeza"],
+      "opqrst": {
+        "severity": ["7", "seven"],
+        "onset":    ["3 hour", "tres hora", "hour"]
+      },
+      "max_turns_to_complete": 8
+    }
+  },
+
+  {
+    "id": "mt-006",
+    "description": "Incomplete meds (no freq) → agent follow-up → frequency merged",
+    "category": "clinical_history",
+    "mode": "clinic",
+    "start_phase": "clinical_history",
+    "seed_state": {
+      "chief_complaint": "chest pain",
+      "clinical_step": "meds",
+      "allergies": ["NKDA"],
+      "medications": [],
+      "pmh": [],
+      "recent_results": []
+    },
+    "turns": [
+      {"user": "I take lisinopril 10mg",
+       "note": "med name given but no frequency — agent should ask"},
+      {"user": "Once a day every morning, I took it about 2 hours ago",
+       "note": "provides freq + last_taken — should merge"},
+      {"user": "No other medical history",                "note": "pmh none"},
+      {"user": "No recent labs or tests",                 "note": "results none — should reach confirm"}
+    ],
+    "expected_final": {
+      "medications": [
+        {"name": "lisinopril", "freq": "once a day"}
+      ],
+      "phase_reached": "confirm"
+    }
+  },
+
+  {
+    "id": "mt-007",
+    "description": "Allergy 'yes I have some' → agent asks which → names provided",
+    "category": "clinical_history",
+    "mode": "clinic",
+    "start_phase": "clinical_history",
+    "seed_state": {
+      "chief_complaint": "knee pain",
+      "clinical_step": "allergies",
+      "allergies": [],
+      "medications": [],
+      "pmh": [],
+      "recent_results": []
+    },
+    "turns": [
+      {"user": "Yes I have some allergies",
+       "note": "vague — agent should ask which ones"},
+      {"user": "Penicillin and sulfa drugs — both give me a rash",
+       "note": "specific allergy names provided"},
+      {"user": "No medications",                          "note": "meds none"},
+      {"user": "No medical history",                      "note": "pmh none"},
+      {"user": "No recent results",                       "note": "results none — should reach confirm"}
+    ],
+    "expected_final": {
+      "allergies": ["penicillin", "sulfa"],
+      "phase_reached": "confirm"
+    }
+  },
+
+  {
+    "id": "mt-008",
+    "description": "PMH: patient lists multiple chronic conditions across two turns",
+    "category": "clinical_history",
+    "mode": "clinic",
+    "start_phase": "clinical_history",
+    "seed_state": {
+      "chief_complaint": "shortness of breath",
+      "clinical_step": "pmh",
+      "allergies": ["NKDA"],
+      "medications": [{"name": "metformin", "dose": "500mg", "freq": "twice daily", "last_taken": "this morning"}],
+      "pmh": [],
+      "recent_results": []
+    },
+    "turns": [
+      {"user": "I have type 2 diabetes and high blood pressure",
+       "note": "two conditions at once"},
+      {"user": "Oh and I had a heart attack about 4 years ago",
+       "note": "third condition in follow-up turn"},
+      {"user": "No recent labs",                          "note": "results none — reach confirm"}
+    ],
+    "expected_final": {
+      "pmh": ["diabetes", "blood pressure", "heart attack"],
+      "phase_reached": "confirm"
+    }
+  },
+
+  {
+    "id": "mt-009",
+    "description": "Multi-symptom: patient lists several complaints, agent identifies primary",
+    "category": "multi_symptom",
+    "mode": "clinic",
+    "start_phase": "subjective",
+    "turns": [
+      {"user": "I have a headache, my knee hurts, and I've been really tired lately",
+       "note": "three complaints — agent should pick the most prominent or ask"},
+      {"user": "The headache is the worst, I'd say a 7",
+       "note": "patient confirms primary + severity"},
+      {"user": "Started about yesterday afternoon, came on gradually",
+       "note": "onset + timing"},
+      {"user": "It's throbbing, behind my eyes",
+       "note": "quality + possible radiation"},
+      {"user": "It gets worse in bright light",
+       "note": "provocation"}
+    ],
+    "expected_final": {
+      "chief_complaint_keywords": ["headache", "head"],
+      "opqrst": {
+        "severity": ["7", "seven"],
+        "onset":    ["yesterday", "afternoon"]
+      },
+      "max_turns_to_complete": 7
+    }
+  },
+
+  {
+    "id": "mt-010",
+    "description": "Vague severity → agent gives format hint → patient clarifies with number",
+    "category": "subjective",
+    "mode": "clinic",
+    "start_phase": "subjective",
+    "turns": [
+      {"user": "My stomach hurts",                        "note": "complaint stated"},
+      {"user": "It's not too bad I guess",                "note": "vague severity — agent should ask for scale"},
+      {"user": "Maybe like a 5",                          "note": "numeric after format hint"},
+      {"user": "Started after dinner last night, crampy feeling",
+       "note": "onset + quality"},
+      {"user": "Lower part of my stomach, doesn't go anywhere",
+       "note": "radiation clarified"},
+      {"user": "It comes and goes, maybe every 20 minutes",
+       "note": "timing → should complete"}
+    ],
+    "expected_final": {
+      "chief_complaint_keywords": ["stomach", "abdominal", "belly", "pain"],
+      "opqrst": {
+        "severity": ["5", "five", "not too bad"],
+        "quality":  ["cramp", "crampy", "ache"],
+        "timing":   ["comes and goes", "intermittent", "20 minutes"]
+      },
+      "subjective_complete": true,
+      "max_turns_to_complete": 8
+    }
+  }
+]

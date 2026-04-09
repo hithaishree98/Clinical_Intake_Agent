@@ -84,6 +84,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import threading
 import time
 import urllib.request
 import uuid
@@ -93,12 +94,27 @@ from typing import Any
 from .logging_utils import log_event
 
 
+def _dispatch_in_thread(target, kwargs: dict) -> None:
+    """
+    Fire-and-forget: run `target(**kwargs)` in a daemon thread.
+
+    Patient safety rationale: crisis and emergency alerts must not block graph
+    execution.  If the downstream Slack/FHIR endpoint is slow or down, the
+    synchronous retry delays (2s, 8s, 30s) would freeze the node and leave the
+    patient waiting.  Running in a daemon thread decouples alert delivery from
+    the patient-facing response path.  Delivery is still tracked and retried via
+    the webhook_deliveries table — no alert is silently dropped.
+    """
+    t = threading.Thread(target=target, kwargs=kwargs, daemon=True)
+    t.start()
+
+
 # ---------------------------------------------------------------------------
 # Retry configuration
 # ---------------------------------------------------------------------------
 
 # Seconds to wait before attempt N (0-indexed after the first).
-# The list length is the hard cap; settings.webhook_max_attempts can lower it.
+# The list length is the hard cap; settings().webhook_max_attempts can lower it.
 _RETRY_DELAYS = [2, 8, 30]
 
 
@@ -321,8 +337,8 @@ def slack_alert(
     """Send a message to a Slack channel via Incoming Webhook."""
     if not webhook_url:
         return False
-    from .settings import settings
-    cap = max_attempts if max_attempts is not None else settings.webhook_max_attempts
+    from .settings import get_settings as settings
+    cap = max_attempts if max_attempts is not None else settings().webhook_max_attempts
     payload = json.dumps({"text": text}).encode("utf-8")
     result = _post_with_retry(
         url=webhook_url,
@@ -365,12 +381,12 @@ def signed_fhir_webhook(
     Retry
     ─────
     On failure, delivery is retried up to `max_attempts` times (default from
-    settings.webhook_max_attempts = 3) with delays of 2s, 8s, and 30s.
+    settings().webhook_max_attempts = 3) with delays of 2s, 8s, and 30s.
     """
     if not url or not fhir_json:
         return False
-    from .settings import settings
-    cap = max_attempts if max_attempts is not None else settings.webhook_max_attempts
+    from .settings import get_settings as settings
+    cap = max_attempts if max_attempts is not None else settings().webhook_max_attempts
 
     payload = fhir_json.encode("utf-8")
     sig = _compute_signature(secret, payload) if secret else ""
@@ -394,6 +410,18 @@ def signed_fhir_webhook(
 # Domain dispatch functions
 # ---------------------------------------------------------------------------
 
+def _do_emergency_alert(*, thread_id: str, patient_name: str, red_flags: list[str], session_short: str) -> None:
+    from .settings import get_settings as settings
+    text = (
+        f":rotating_light: *EMERGENCY ESCALATION*\n"
+        f"Patient: {patient_name or 'Unknown'}\n"
+        f"Red flags: {', '.join(red_flags)}\n"
+        f"Session: {session_short}"
+    )
+    slack_alert(webhook_url=settings().slack_webhook_url, text=text,
+                thread_id=thread_id, event_type="slack_emergency")
+
+
 def dispatch_emergency_alert(
     *,
     thread_id: str,
@@ -401,21 +429,33 @@ def dispatch_emergency_alert(
     red_flags: list[str],
     session_short: str,
 ) -> None:
-    """Called when an emergency escalation is triggered."""
-    from .settings import settings
+    """
+    Fire emergency Slack alert in a background thread.
 
+    Patient safety: a downed Slack endpoint must never delay the "call 911"
+    message shown to the patient.  Delivery is still tracked + retried via
+    webhook_deliveries — nothing is silently dropped.
+    """
+    _dispatch_in_thread(_do_emergency_alert, {
+        "thread_id": thread_id, "patient_name": patient_name,
+        "red_flags": red_flags, "session_short": session_short,
+    })
+
+
+def _do_intake_complete(*, thread_id: str, patient_name: str, risk_level: str, fhir_json: str | None) -> None:
+    from .settings import get_settings as settings
+    session_short = thread_id[:8]
     text = (
-        f":rotating_light: *EMERGENCY ESCALATION*\n"
+        f":white_check_mark: *Intake Complete — Risk: {risk_level.upper()}*\n"
         f"Patient: {patient_name or 'Unknown'}\n"
-        f"Red flags: {', '.join(red_flags)}\n"
         f"Session: {session_short}"
     )
-    slack_alert(
-        webhook_url=settings.slack_webhook_url,
-        text=text,
-        thread_id=thread_id,
-        event_type="slack_emergency",
-    )
+    slack_alert(webhook_url=settings().slack_webhook_url, text=text,
+                thread_id=thread_id, event_type="slack_intake_complete")
+    if fhir_json:
+        signed_fhir_webhook(url=settings().completion_webhook_url,
+                            secret=settings().completion_webhook_secret,
+                            fhir_json=fhir_json, thread_id=thread_id)
 
 
 def dispatch_intake_complete(
@@ -425,28 +465,23 @@ def dispatch_intake_complete(
     risk_level: str,
     fhir_json: str | None,
 ) -> None:
-    """Called when a patient finishes the full intake flow."""
-    from .settings import settings
+    """Fire intake-complete Slack + FHIR webhook in a background thread."""
+    _dispatch_in_thread(_do_intake_complete, {
+        "thread_id": thread_id, "patient_name": patient_name,
+        "risk_level": risk_level, "fhir_json": fhir_json,
+    })
 
-    session_short = thread_id[:8]
+
+def _do_crisis_alert(*, thread_id: str, patient_name: str, matched_phrases: list[str]) -> None:
+    from .settings import get_settings as settings
     text = (
-        f":white_check_mark: *Intake Complete — Risk: {risk_level.upper()}*\n"
+        f":warning: *CRISIS LANGUAGE DETECTED*\n"
         f"Patient: {patient_name or 'Unknown'}\n"
-        f"Session: {session_short}"
+        f"Matched: {', '.join(matched_phrases)}\n"
+        f"Session: {thread_id[:8]}"
     )
-    slack_alert(
-        webhook_url=settings.slack_webhook_url,
-        text=text,
-        thread_id=thread_id,
-        event_type="slack_intake_complete",
-    )
-    if fhir_json:
-        signed_fhir_webhook(
-            url=settings.completion_webhook_url,
-            secret=settings.completion_webhook_secret,
-            fhir_json=fhir_json,
-            thread_id=thread_id,
-        )
+    slack_alert(webhook_url=settings().slack_webhook_url, text=text,
+                thread_id=thread_id, event_type="slack_crisis")
 
 
 def dispatch_crisis_alert(
@@ -455,18 +490,64 @@ def dispatch_crisis_alert(
     patient_name: str,
     matched_phrases: list[str],
 ) -> None:
-    """Called when self-harm / crisis language is detected."""
-    from .settings import settings
+    """
+    Fire crisis Slack alert in a background thread.
 
-    text = (
-        f":warning: *CRISIS LANGUAGE DETECTED*\n"
-        f"Patient: {patient_name or 'Unknown'}\n"
-        f"Matched: {', '.join(matched_phrases)}\n"
-        f"Session: {thread_id[:8]}"
+    Patient safety: the 988 Lifeline message must reach the patient immediately
+    regardless of Slack latency.
+    """
+    _dispatch_in_thread(_do_crisis_alert, {
+        "thread_id": thread_id, "patient_name": patient_name,
+        "matched_phrases": matched_phrases,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Dead-letter retry worker
+# ---------------------------------------------------------------------------
+
+def retry_exhausted_webhooks() -> int:
+    """
+    Re-queue webhook deliveries that exhausted all original retry attempts.
+
+    Call this periodically (e.g. at process startup and hourly) to give
+    transient downstream failures a second chance without operator intervention.
+
+    Design:
+      • Reads exhausted deliveries older than `dead_letter_retry_after_hours`
+        and below the lifetime attempt cap from the DB.
+      • Resets each row to 'pending' so the existing _post_with_retry loop
+        handles the actual HTTP call — no duplicate delivery logic needed here.
+      • Dispatches in a background thread to avoid blocking the caller.
+      • Emits a structured log event so the retry is observable in the audit log.
+
+    Returns the number of deliveries re-queued.
+    """
+    from . import sqlite_db as db
+    from .settings import get_settings
+
+    cfg = get_settings().intake
+    candidates = db.get_exhausted_webhooks(
+        older_than_hours=cfg.dead_letter_retry_after_hours,
+        max_lifetime_attempts=cfg.dead_letter_max_lifetime_attempts,
     )
-    slack_alert(
-        webhook_url=settings.slack_webhook_url,
-        text=text,
-        thread_id=thread_id,
-        event_type="slack_crisis",
-    )
+    if not candidates:
+        return 0
+
+    def _requeue_and_dispatch(rows: list) -> None:
+        for row in rows:
+            delivery_id = row["delivery_id"]
+            thread_id   = row["thread_id"]
+            event_type  = row["event_type"]
+            db.requeue_webhook_delivery(delivery_id)
+            log_event(
+                "webhook_dead_letter_requeued",
+                delivery_id=delivery_id,
+                thread_id=thread_id,
+                event_type=event_type,
+                prior_attempts=row["attempts"],
+            )
+
+    _dispatch_in_thread(_requeue_and_dispatch, {"rows": list(candidates)})
+    return len(candidates)
+

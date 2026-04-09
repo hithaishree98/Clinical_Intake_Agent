@@ -1,4 +1,6 @@
 from __future__ import annotations
+import hashlib
+import hmac
 import sqlite3
 import time
 import json
@@ -6,7 +8,7 @@ import uuid
 import threading
 from pathlib import Path
 
-from .settings import settings
+from .settings import get_settings as settings
 
 _db_lock = threading.Lock()
 _db_conn: sqlite3.Connection | None = None
@@ -14,14 +16,28 @@ _db_conn: sqlite3.Connection | None = None
 def conn() -> sqlite3.Connection:
     global _db_conn
     if _db_conn is None:
-        Path(settings.app_db_path).parent.mkdir(parents=True, exist_ok=True)
-        c = sqlite3.connect(settings.app_db_path, timeout=10.0, check_same_thread=False)
+        Path(settings().app_db_path).parent.mkdir(parents=True, exist_ok=True)
+        c = sqlite3.connect(settings().app_db_path, timeout=10.0, check_same_thread=False)
         c.row_factory = sqlite3.Row
         c.execute("PRAGMA journal_mode=WAL;")
         c.execute("PRAGMA synchronous=NORMAL;")
         c.execute("PRAGMA busy_timeout=10000;")
         _db_conn = c
     return _db_conn
+
+from contextlib import contextmanager
+
+@contextmanager
+def transaction():
+    global _db_conn
+    with _db_lock:
+        c = conn()
+        try:
+            yield c
+            c.commit()
+        except Exception:
+            c.rollback()
+            raise
 
 def _retry_db_operation(func, max_retries: int = 3):
     for attempt in range(max_retries):
@@ -45,19 +61,23 @@ def init_schema() -> None:
             c = conn()
             c.executescript(sql)
             # Migration: add fhir_bundle column to reports if it doesn't exist yet.
-            # This is safe to run on both new and existing databases.
-            existing = {
+            existing_reports = {
                 row[1]
                 for row in c.execute("PRAGMA table_info(reports)").fetchall()
             }
-            if "fhir_bundle" not in existing:
+            if "fhir_bundle" not in existing_reports:
                 c.execute("ALTER TABLE reports ADD COLUMN fhir_bundle TEXT")
-            # Migration: add pending_review column for "report pending review" mode.
-            # Default 0 (false) for all pre-existing rows.
-            if "pending_review" not in existing:
+            if "pending_review" not in existing_reports:
                 c.execute(
                     "ALTER TABLE reports ADD COLUMN pending_review INTEGER NOT NULL DEFAULT 0"
                 )
+            # Migration: add session_token column to sessions for patient auth.
+            existing_sessions = {
+                row[1]
+                for row in c.execute("PRAGMA table_info(sessions)").fetchall()
+            }
+            if "session_token" not in existing_sessions:
+                c.execute("ALTER TABLE sessions ADD COLUMN session_token TEXT")
             c.commit()
 
     _retry_db_operation(_init)
@@ -87,8 +107,34 @@ def fetch_all(q: str, p: tuple = ()):
     return _retry_db_operation(_fetch)
 
 
-def create_session(thread_id: str):
-    exec_one("INSERT INTO sessions (thread_id, status) VALUES (?, 'active')", (thread_id,))
+def create_session(thread_id: str, session_token: str | None = None):
+    # Store the hash, never the raw token. Verification uses the same hash path.
+    token_hash = _hash_token(session_token) if session_token else None
+    exec_one(
+        "INSERT INTO sessions (thread_id, status, session_token) VALUES (?, 'active', ?)",
+        (thread_id, token_hash),
+    )
+
+
+def _hash_token(token: str) -> str:
+    """SHA-256 the token before storage/comparison. The raw token is never persisted."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def verify_session_token(thread_id: str, token: str) -> bool:
+    """
+    Constant-time comparison of the token against its stored hash.
+    Tokens are stored as SHA-256(token) so a DB read never exposes the
+    raw bearer value.
+    """
+    row = fetch_one(
+        "SELECT session_token FROM sessions WHERE thread_id=?",
+        (thread_id,),
+    )
+    if not row:
+        return False
+    stored = row.get("session_token") or ""
+    return bool(stored) and hmac.compare_digest(stored, _hash_token(token))
 
 def set_session_status(thread_id: str, status: str):
     exec_one("UPDATE sessions SET status=?, updated_at=datetime('now') WHERE thread_id=?", (status, thread_id))
@@ -109,6 +155,45 @@ def save_idempotent_response(thread_id: str, key: str, request_hash: str, respon
         (thread_id, key, request_hash, json.dumps(response_obj)),
     )
 
+def persist_chat_turn(
+    *,
+    thread_id: str,
+    user_message: str,
+    assistant_reply: str,
+    state_snapshot: dict,
+    status: str,
+    client_msg_id: str,
+    request_hash: str,
+    response_obj: dict,
+    job_id: str | None = None,
+) -> None:
+    with transaction() as c:
+        c.execute(
+            "INSERT INTO session_state(thread_id, state_json, updated_at) VALUES (?,?,datetime('now')) "
+            "ON CONFLICT(thread_id) DO UPDATE SET state_json=excluded.state_json, updated_at=datetime('now')",
+            (thread_id, json.dumps(state_snapshot)),
+        )
+        c.execute(
+            "INSERT INTO messages (thread_id, role, text) VALUES (?,?,?)",
+            (thread_id, "user", user_message),
+        )
+        c.execute(
+            "INSERT INTO messages (thread_id, role, text) VALUES (?,?,?)",
+            (thread_id, "assistant", assistant_reply),
+        )
+        c.execute(
+            "UPDATE sessions SET status=?, updated_at=datetime('now') WHERE thread_id=?",
+            (status, thread_id),
+        )
+        c.execute(
+            "INSERT OR REPLACE INTO idempotency(thread_id, key, request_hash, response_json) VALUES (?,?,?,?)",
+            (thread_id, client_msg_id, request_hash, json.dumps(response_obj)),
+        )
+        if job_id:
+            c.execute(
+                "INSERT INTO jobs(job_id, thread_id, kind, status) VALUES (?,?,?,?)",
+                (job_id, thread_id, "report", "queued"),
+            )
 
 def get_stored_identity_by_name(name: str):
     q = "SELECT name, data_json FROM mock_ehr WHERE LOWER(TRIM(name))=LOWER(TRIM(?))"
@@ -340,6 +425,58 @@ def seed_emergency_phrases(phrases: list[str]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# LLM token usage tracking
+# ---------------------------------------------------------------------------
+
+# Gemini 2.0 Flash pricing (USD per 1 000 tokens, as of 2025-Q2).
+# Update GEMINI_INPUT_COST_PER_1K / OUTPUT when pricing changes.
+_GEMINI_INPUT_COST_PER_1K  = 0.000075   # $0.075 / 1M input tokens
+_GEMINI_OUTPUT_COST_PER_1K = 0.0003     # $0.30  / 1M output tokens
+
+
+def record_llm_usage(
+    thread_id: str,
+    node: str,
+    input_tokens: int,
+    output_tokens: int,
+) -> None:
+    """
+    Persist token counts and cost for one LLM call.
+
+    cost_usd is computed here so billing queries never need to re-derive it.
+    Failures are silently swallowed — usage tracking must never break the call path.
+    """
+    try:
+        cost = (
+            (input_tokens  / 1000) * _GEMINI_INPUT_COST_PER_1K
+            + (output_tokens / 1000) * _GEMINI_OUTPUT_COST_PER_1K
+        )
+        exec_one(
+            "INSERT INTO llm_usage (thread_id, node, input_tokens, output_tokens, cost_usd)"
+            " VALUES (?,?,?,?,?)",
+            (thread_id, node, input_tokens, output_tokens, round(cost, 8)),
+        )
+    except Exception:
+        pass  # never break the happy path over accounting
+
+
+def get_llm_usage_for_thread(thread_id: str) -> dict:
+    """Return aggregated token counts and cost for a single session."""
+    row = fetch_one(
+        "SELECT SUM(input_tokens) AS inp, SUM(output_tokens) AS out,"
+        "       SUM(cost_usd) AS cost, COUNT(*) AS calls"
+        " FROM llm_usage WHERE thread_id=?",
+        (thread_id,),
+    ) or {}
+    return {
+        "total_input_tokens":  row.get("inp") or 0,
+        "total_output_tokens": row.get("out") or 0,
+        "total_cost_usd":      round(row.get("cost") or 0.0, 6),
+        "llm_calls":           row.get("calls") or 0,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Webhook delivery tracking
 # ---------------------------------------------------------------------------
 
@@ -403,6 +540,107 @@ def get_webhook_deliveries(thread_id: str | None = None, limit: int = 50) -> lis
         "SELECT * FROM webhook_deliveries ORDER BY created_at DESC LIMIT ?",
         (limit,),
     )
+
+
+def get_exhausted_webhooks(older_than_hours: int = 24, max_lifetime_attempts: int = 6) -> list:
+    """
+    Return webhook delivery records that are exhausted AND have not exceeded
+    the lifetime attempt cap.
+
+    These are candidates for a dead-letter re-queue: they failed all original
+    retry attempts but may succeed now (e.g. the downstream EHR is back up).
+    The max_lifetime_attempts guard prevents infinite retry storms against a
+    permanently broken endpoint.
+    """
+    return fetch_all(
+        "SELECT * FROM webhook_deliveries"
+        " WHERE status='exhausted'"
+        "   AND attempts < ?"
+        "   AND updated_at <= datetime('now', ? || ' hours')"
+        " ORDER BY updated_at ASC"
+        " LIMIT 100",
+        (max_lifetime_attempts, f"-{older_than_hours}"),
+    )
+
+
+def requeue_webhook_delivery(delivery_id: str) -> None:
+    """
+    Reset an exhausted delivery to 'pending' so the dispatcher will retry it.
+
+    Keeps the existing attempt count intact so the lifetime cap in
+    get_exhausted_webhooks() continues to work correctly.
+    """
+    exec_one(
+        "UPDATE webhook_deliveries"
+        " SET status='pending', next_retry_at=datetime('now'),"
+        "     last_error='requeued_by_dead_letter_worker',"
+        "     updated_at=datetime('now')"
+        " WHERE delivery_id=?",
+        (delivery_id,),
+    )
+
+
+def expire_stale_sessions(ttl_hours: int = 4) -> int:
+    """
+    Mark sessions that have been 'active' (not done/escalated/expired) for longer
+    than ttl_hours as 'expired'.
+
+    A patient who abandons mid-intake stays active forever without this.
+    Expired sessions appear in the clinician dashboard so abandoned intakes
+    are visible rather than silently lingering.
+
+    Returns the number of sessions marked expired.
+    """
+    def _expire():
+        with _db_lock:
+            c = conn()
+            cur = c.execute(
+                "UPDATE sessions SET status='expired', updated_at=datetime('now')"
+                " WHERE status='active'"
+                "   AND updated_at <= datetime('now', ?)",
+                (f"-{ttl_hours} hours",),
+            )
+            c.commit()
+            return cur.rowcount
+    return _retry_db_operation(_expire)
+
+
+def prune_old_checkpoints(days: int = 30) -> int:
+    """
+    Delete LangGraph checkpoint rows for sessions completed more than `days` ago.
+    """
+    from .settings import get_settings
+    checkpoint_path = get_settings().checkpoint_db_path
+    try:
+        rows = fetch_all(
+            "SELECT thread_id FROM sessions "
+            "WHERE status IN ('done', 'expired') "
+            "AND updated_at <= datetime('now', ?)",
+            (f"-{days} days",),
+        )
+        thread_ids = [r["thread_id"] for r in rows]
+        if not thread_ids:
+            return 0
+
+        cp = sqlite3.connect(checkpoint_path, timeout=5.0)
+        placeholders = ",".join("?" for _ in thread_ids)
+
+        total_deleted = 0
+        for table in ("checkpoints", "checkpoint_writes"):
+            try:
+                cur = cp.execute(
+                    f"DELETE FROM {table} WHERE thread_id IN ({placeholders})",
+                    thread_ids,
+                )
+                total_deleted += cur.rowcount
+            except sqlite3.OperationalError:
+                pass
+
+        cp.commit()
+        cp.close()
+        return total_deleted
+    except Exception:
+        return 0
 
 
 def reset_demo_data() -> None:
@@ -476,6 +714,75 @@ def seed_demo_patients() -> None:
 
 
 
+# ---------------------------------------------------------------------------
+# Prompt A/B experiments
+# ---------------------------------------------------------------------------
+
+def create_experiment(name: str, prompt_key: str, variant_a: str, variant_b: str) -> str:
+    """Create a new A/B experiment. Returns the experiment_id."""
+    exp_id = str(uuid.uuid4())
+    exec_one(
+        "INSERT INTO prompt_experiments (experiment_id, name, prompt_key, variant_a, variant_b)"
+        " VALUES (?,?,?,?,?)",
+        (exp_id, name, prompt_key, variant_a, variant_b),
+    )
+    return exp_id
+
+
+def get_active_experiment(prompt_key: str) -> dict | None:
+    """Return the active experiment for a given prompt key, or None."""
+    return fetch_one(
+        "SELECT * FROM prompt_experiments WHERE status='active' AND prompt_key=? LIMIT 1",
+        (prompt_key,),
+    )
+
+
+def assign_experiment_variant(thread_id: str, experiment_id: str) -> str:
+    """
+    Deterministically assign variant 'a' or 'b' based on thread_id hash.
+    Same thread always gets the same variant. Increments the session counter.
+    Returns 'a' or 'b'.
+    """
+    import hashlib
+    variant = "a" if int(hashlib.md5(thread_id.encode()).hexdigest(), 16) % 2 == 0 else "b"
+    col = f"sessions_{variant}"
+    exec_one(
+        f"UPDATE prompt_experiments SET {col}={col}+1, updated_at=datetime('now')"
+        " WHERE experiment_id=?",
+        (experiment_id,),
+    )
+    return variant
+
+
+def resolve_prompt_variant(thread_id: str, prompt_key: str, default_version: str) -> tuple[str, str | None]:
+    """
+    Returns (version_string, experiment_id_or_None).
+
+    If an active experiment exists for prompt_key, the session is assigned to
+    variant_a or variant_b deterministically (md5(thread_id) % 2) and the
+    corresponding version string is returned.  The session counter is bumped.
+
+    If no active experiment, returns (default_version, None).
+    """
+    exp = get_active_experiment(prompt_key)
+    if not exp:
+        return default_version, None
+    variant = assign_experiment_variant(thread_id, exp["experiment_id"])
+    version = exp[f"variant_{variant}"]
+    return version, exp["experiment_id"]
+
+
+def list_experiments() -> list:
+    return fetch_all("SELECT * FROM prompt_experiments ORDER BY created_at DESC")
+
+
+def update_experiment_status(experiment_id: str, status: str) -> None:
+    exec_one(
+        "UPDATE prompt_experiments SET status=?, updated_at=datetime('now') WHERE experiment_id=?",
+        (status, experiment_id),
+    )
+
+
 def get_analytics() -> dict:
     """Return operational metrics over the last 7 days."""
     rows_today = fetch_one(
@@ -514,6 +821,20 @@ def get_analytics() -> dict:
 
     llm_stats = get_llm_failure_stats(days=7)
 
+    cost_row = fetch_one(
+        "SELECT COALESCE(SUM(CAST(input_tokens AS REAL)/1000000.0*0.075 "
+        "     + CAST(output_tokens AS REAL)/1000000.0*0.30), 0.0) AS cost "
+        "FROM llm_usage WHERE created_at >= date('now', '-7 days')"
+    ) or {}
+    llm_cost_7d = round(float(cost_row.get("cost") or 0.0), 6)
+
+    sessions_with_cost = fetch_one(
+        "SELECT COUNT(DISTINCT thread_id) AS n FROM llm_usage "
+        "WHERE created_at >= date('now', '-7 days')"
+    ) or {}
+    sessions_n = sessions_with_cost.get("n") or 0
+    avg_cost = round(llm_cost_7d / sessions_n, 6) if sessions_n else 0.0
+
     return {
         "sessions_today": rows_today.get("n", 0),
         "sessions_last_7_days": total_week,
@@ -525,4 +846,6 @@ def get_analytics() -> dict:
         "reports_generated_last_7_days": reports_week.get("n", 0),
         "failed_report_jobs_last_7_days": failed_jobs.get("n", 0),
         "llm_failures_last_7_days": llm_stats,
+        "llm_cost_last_7_days_usd": llm_cost_7d,
+        "avg_cost_per_session_usd": avg_cost,
     }

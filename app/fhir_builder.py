@@ -223,3 +223,68 @@ def build_bundle(state: dict) -> dict:
         "timestamp": _now(),
         "entry": entries,
     }
+
+
+# ---------------------------------------------------------------------------
+# Post-build structural validation (R4 spec — lightweight, no external lib)
+# ---------------------------------------------------------------------------
+
+_REQUIRED_RESOURCE_TYPES = {"Patient", "Condition"}
+
+_RESOURCE_REQUIRED_FIELDS: dict[str, list[str]] = {
+    "Patient":             ["id", "resourceType", "name"],
+    "Condition":           ["id", "resourceType", "subject", "clinicalStatus", "code"],
+    "AllergyIntolerance":  ["id", "resourceType", "patient", "clinicalStatus", "code"],
+    "MedicationStatement": ["id", "resourceType", "subject", "status", "medicationCodeableConcept"],
+    "Observation":         ["id", "resourceType", "subject", "status", "code"],
+}
+
+
+def validate_fhir_bundle(bundle: dict) -> List[str]:
+    """
+    Structural validation of a built FHIR R4 Bundle.
+
+    Checks:
+    1. Bundle has resourceType=Bundle, type, timestamp, and a non-empty entry list.
+    2. Every entry has fullUrl and resource.
+    3. Required resource types (Patient, Condition) are present.
+    4. Each resource contains its required R4 fields.
+
+    Returns a list of error strings (empty = valid).
+    Called in report_node after build_bundle() — failures are logged before
+    the bundle reaches the EHR boundary so malformed bundles are never silently
+    forwarded.
+    """
+    errors: List[str] = []
+
+    if (bundle.get("resourceType") or "") != "Bundle":
+        errors.append("bundle_missing_resourceType_Bundle")
+    if not bundle.get("type"):
+        errors.append("bundle_missing_type")
+    if not bundle.get("timestamp"):
+        errors.append("bundle_missing_timestamp")
+
+    entries = bundle.get("entry") or []
+    if not entries:
+        errors.append("bundle_empty_entry_list")
+        return errors  # nothing more to check
+
+    seen_types: set[str] = set()
+    for i, entry in enumerate(entries):
+        if not entry.get("fullUrl"):
+            errors.append(f"entry[{i}]_missing_fullUrl")
+        resource = entry.get("resource") or {}
+        rtype = resource.get("resourceType") or ""
+        if not rtype:
+            errors.append(f"entry[{i}]_missing_resourceType")
+            continue
+        seen_types.add(rtype)
+        for field in _RESOURCE_REQUIRED_FIELDS.get(rtype, []):
+            if field not in resource:
+                errors.append(f"{rtype}_missing_{field}")
+
+    for required in _REQUIRED_RESOURCE_TYPES:
+        if required not in seen_types:
+            errors.append(f"bundle_missing_required_resource_{required}")
+
+    return errors
