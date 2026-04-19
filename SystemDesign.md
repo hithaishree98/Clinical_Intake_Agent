@@ -32,8 +32,8 @@
            │                      │
            ▼                      ▼
 ┌──────────────────┐   ┌─────────────────────────────────────┐
-│   Gemini 2.0     │   │          SQLite (WAL mode)           │
-│   Flash (LLM)    │   │                                      │
+│  Gemini 2.5      │   │          SQLite (WAL mode)           │
+│  Flash Lite      │   │                                      │
 │                  │   │  app.db            checkpoints.db    │
 │  extract.py      │   │  ├─ sessions       └─ LangGraph      │
 │  (regex only,    │   │  ├─ messages           snapshots     │
@@ -42,9 +42,11 @@
 │  fhir_builder.py │   │  ├─ jobs                            │
 │  (pure Python,   │   │  ├─ mock_ehr                        │
 │   no LLM)        │   │  ├─ idempotency                     │
-└──────────────────┘   │  ├─ session_state                   │
-                       │  └─ emergency_phrases               │
-                       └─────────────────────────────────────┘
+│                  │   │  ├─ session_state                   │
+│  memory.py       │   │  ├─ patient_summary                 │
+│  (cross-visit    │   │  ├─ llm_usage                       │
+│   merge, no LLM) │   │  └─ emergency_phrases               │
+└──────────────────┘   └─────────────────────────────────────┘
            │
            ▼
 ┌──────────────────────────────┐
@@ -159,17 +161,21 @@ Every patient message passes through multiple safety layers before and after the
 Patient message arrives
     │
     ▼
-1. Prompt injection check (extract.py)
+1. Prompt injection check (extract.py, runs in /chat before graph)
    Regex scan for "ignore previous instructions", "you are now a..."
    Blocked messages get a neutral response, never reach the LLM
     │
     ▼
-2. Crisis / self-harm detection (extract.py)
-   Phrase matching for "want to die", "kill myself", etc.
-   Returns 988 Lifeline info, creates escalation, does NOT terminate session
+2. guard_node (LangGraph, runs before EVERY business node)
+   Two-tier crisis detection on every message, every phase:
+     Tier 1 — keyword/regex: "want to die", "kill myself" → instant 988 response
+     Tier 2 — LLM classifier: soft distress ("I can't take it anymore") →
+              CrisisScore schema → if is_crisis_risk=True, confidence high/medium → escalate
+   Creates escalation, fires Slack alert, routes to END.
+   Identity is never required — "Unknown patient" alert if pre-identity.
     │
     ▼
-3. Emergency red flag detection (extract.py)
+3. Emergency red flag detection (in subjective_node, before LLM)
    Phrase matching with negation awareness ("no chest pain" ≠ "chest pain")
    Triggers immediate handoff to 911 + clinician notification
     │
@@ -178,7 +184,7 @@ Patient message arrives
    Gemini extracts structured data from natural language
     │
     ▼
-5. Diagnosis language filter (llm.py)
+5. Diagnosis language filter (extract.py)
    Regex scan on LLM output for "you have", "consistent with", etc.
    If triggered, replaces LLM reply with a safe generic response
    intake assistants cannot diagnose
@@ -189,13 +195,27 @@ Safe response delivered to patient
 
 Layer 1 runs before any clinical logic because injected prompts shouldn't interact with the system at all.
 
-Layer 2 runs before emergency detection because the response is different. A crisis gets the 988 Lifeline and a compassionate message. An emergency gets "call 911." Ordering them wrong would send a suicidal patient a 911 message instead of crisis resources.
+Layer 2 (`guard_node`) runs before every business node. This is architecturally guaranteed — it is wired at `START` in the LangGraph graph, so it is impossible to add a new business node and accidentally skip crisis detection. Previously crisis detection was called inside individual nodes; if a new node was added without adding the check, it was silently unsafe. Moving it to `guard_node` eliminates that class of bug structurally.
 
-Layer 3 runs before the LLM because the emergency check is deterministic and faster. If someone says "I'm having a seizure", there's no reason to wait for Gemini to extract OPQRST fields before escalating.
+Crisis runs before emergency because the response is different. A crisis gets the 988 Lifeline and a compassionate message. An emergency gets "call 911." Ordering them wrong would send a suicidal patient a 911 message instead of crisis resources.
+
+Layer 3 (emergency) runs before the LLM because the emergency check is deterministic and faster. If someone says "I'm having a seizure", there's no reason to wait for Gemini to extract OPQRST fields before escalating.
 
 Layer 5 runs after the LLM because it's guarding against the LLM's own output. The prompt tells Gemini not to diagnose, but LLMs don't always follow instructions. The regex filter is the safety net.
 
 The emergency phrases (layer 3) are stored in the database, not hardcoded. Clinicians can add or remove phrases through the admin API without a redeploy. If a new drug interaction creates a new emergency pattern, it can be added immediately.
+
+**Layer-2 Patient Memory**
+
+Each completed intake writes a cross-visit summary to the `patient_summary` table. On the next visit, that summary is loaded and injected into LLM prompts so returning patients get context-aware questions rather than a clean slate.
+
+The merge rules are field-specific:
+- Allergies union across visits — a known allergen can never be silently dropped.
+- Medications replace each visit — patients stop and start medications; unioning them forever would pollute the list with drugs they no longer take.
+- Chronic conditions union — hypertension diagnosed two visits ago is still relevant.
+- Recent chief complaints are capped at 5 — a rolling window that keeps the prompt injection small without losing recent visit context.
+
+This sits in `memory.py` rather than `sqlite_db.py` because merge logic is domain logic. It doesn't know how the data is stored; `sqlite_db.py` doesn't know how data should be combined. Separating them lets each be tested and modified independently.
 
 ## What I'd change for production
 
@@ -206,6 +226,10 @@ This project is built as a single-process app with SQLite. That's appropriate fo
 SQLite is single-writer. With WAL mode and busy_timeout it handles moderate concurrency, but under real load writes would bottleneck. PostgreSQL handles concurrent writes natively, supports row-level locking.
 
 The LangGraph checkpointer would switch from SqliteSaver to PostgresSaver. The application DB queries are standard SQL and would migrate with minimal changes.
+
+**Database migrations: Alembic** ✅ already implemented
+
+Every schema change is a versioned migration file with an `upgrade()` and `downgrade()`. The CI pipeline runs `alembic upgrade head` before starting the app. A baseline migration (`001_baseline_schema.py`) captures all tables so the `alembic_version` table tracks history from the first deployment. The previous approach — `CREATE TABLE IF NOT EXISTS` at startup with hand-written `ALTER TABLE` checks — had no version tracking, making it impossible to know whether a given deployment was at the same schema as production.
 
 **Task queue: BackgroundTasks → Celery + Redis**
 

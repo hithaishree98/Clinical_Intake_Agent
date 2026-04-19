@@ -2,23 +2,32 @@
 
 ## How to run
 
-All dependencies are installed inside the Docker image, so tests run there without installing anything locally.
+The test suite runs entirely locally without Docker — the LLM is mocked and the database uses a temporary in-memory SQLite. No real API key needed.
 
 ```
-docker compose up --build -d
+python -m pytest tests/ -v
+```
+
+103 tests, passing in about 3–4 seconds.
+
+To run a single file:
+```
+python -m pytest tests/test_guardrails.py -v
+```
+
+To run a single test:
+```
+python -m pytest tests/test_integration.py::TestConversationFlow::test_crisis_message_gets_resource_reply -v
+```
+
+**Docker alternative:** All dependencies are inside the image, so tests also run there:
+```
 docker compose exec app python -m pytest tests/ -v
-```
-
-If the container isn't running, a one-off run works too:
-
-```
-docker build -t clinical-intake .
-docker run --rm clinical-intake python -m pytest tests/ -v
 ```
 
 ## What the test suite covers
 
-The test suite is split into four files. Each targets a specific layer of the system and can run independently — no real Gemini API key or running server needed.
+The test suite is split into six files. Each targets a specific layer of the system and can run independently — no real Gemini API key or running server needed.
 
 ### test_guardrails.py — Safety logic (28 tests)
 
@@ -93,6 +102,21 @@ Tests the three-level degradation in run_json_step using a mocked Gemini client.
 
 These tests mock the LLM so they run without an API key and test the degradation logic specifically, not Gemini's output quality.
 
+### test_integration.py — End-to-end flow tests
+
+Tests full conversation flows through the LangGraph state machine with a mocked LLM. Each test drives multiple turns through the graph and verifies that state transitions, escalations, and responses are correct.
+
+**What is mocked:**
+`run_json_step` is patched to return pre-authored responses keyed by schema type. `IdentityOut`, `SubjectiveOut`, `MedsOut`, and `IntentOut` all have mock responses. This avoids real Gemini calls while exercising the actual graph, node logic, and routing.
+
+**`_reset_circuit_breaker` autouse fixture:**
+The circuit breaker is a module-level singleton. If one test triggers 5 LLM failures and opens the breaker, subsequent tests fail because the breaker is still open. The autouse fixture resets the breaker before every test in the class.
+
+**Scenarios covered:**
+- Full identity collection across multiple messages
+- Subjective phase with mock LLM extraction
+- Crisis message in identity phase (before identity collected) — verifies guard_node fires, Slack alert sent with "Unknown patient", session ends with CRISIS_RESOURCE
+
 ### test_auth.py — Clinician authentication (7 tests)
 
 Tests the JWT authentication flow end-to-end using FastAPI's TestClient.
@@ -103,9 +127,27 @@ Correct password returns a 200 with an access_token. Wrong password returns 401.
 **Protected routes** (4 tests)
 No token returns 401. Invalid token returns 401. Valid token grants access to /clinician/pending. Expired token (encoded with exp in the past) returns 401.
 
+### test_memory.py — Layer-2 patient memory (6 tests)
+
+Tests the `merge_summary` and `format_for_prompt` functions in `app/memory.py` in complete isolation. No LLM, no database, no network calls.
+
+**`merge_summary` logic** (4 tests)
+- First visit produces a new summary with correct `visit_count`, allergies, conditions, and chief complaint entry.
+- Second visit unions allergies (new allergy is added, prior allergy is kept) and unions chronic conditions, but replaces medications — the current medication list is the source of truth, not an accumulation. This reflects clinical reality: patients stop and start medications between visits.
+- Crisis flag from `crisis_detected=True` in state is appended to the `flags` list in the summary, so a prior crisis is visible to the LLM on future visits.
+- `recent_complaints` is capped at 5 entries — the oldest drops off when a sixth is added, keeping the prompt injection small.
+
+**`format_for_prompt` rendering** (2 tests)
+- A summary with `visit_count=0` returns an empty string — no context injected for first-time patients.
+- A returning-patient summary renders all fields as a compact `RETURNING_PATIENT` block with `KNOWN_ALLERGIES`, `CURRENT_MEDICATIONS`, `CHRONIC_CONDITIONS`, and `RECENT_COMPLAINTS` labels. This string format is designed to fit within a few hundred tokens so it doesn't materially inflate LLM cost.
+
+Why this matters: Layer-2 memory is what prevents a returning patient with a known penicillin allergy from being asked "do you have any known allergies?" again. The merge logic is the safety boundary — it must union allergies correctly (never drop a known allergen) and replace medications correctly (never union old stopped medications with current ones). Both invariants are tested explicitly.
+
 ### conftest.py — Test infrastructure
 
-The `tmp_db` fixture creates a fresh SQLite database in a temp directory for each test. This means tests never share state — each test starts with a clean database, runs its operations, and the database is deleted after. Environment variables are set to test values (fake API key, test JWT secret, test password, debug mode on) so no real credentials are needed.
+The `tmp_db` fixture creates a fresh SQLite database in a temp directory for each test. Tests never share state — each test starts with a clean database, runs its operations, and the database is deleted after. Environment variables are set to test values (fake API key, test JWT secret, test password, debug mode on) so no real credentials are needed.
+
+`debug_mode=True` in test settings skips the Gemini API validation that runs at startup — the test process doesn't need a real API key to import and run the application code.
 
 ## Manual testing scenarios
 
@@ -203,3 +245,115 @@ Steps:
 6. Click "View Escalations" again
 
 Expected: after auth, the green "Clinician authenticated" badge appears. The escalation list shows the pending escalation with its kind and timestamp. After resolving, the escalation disappears from the pending list. The clinician note for a completed session shows the full report text when "Pull Clinician Note" is clicked.
+
+**Crisis before identity is collected**
+
+Steps:
+1. Click New Session
+2. Type "yes" to consent
+3. At the first identity question (before giving your name), type "I want to hurt myself"
+
+Expected: The system immediately shows the 988 Lifeline message regardless of the current phase. The chat input is disabled. If Slack is configured, the alert shows "Unknown — crisis occurred before identity was collected" with the first 120 characters of what the patient typed. The session ends — no report is generated for a crisis session.
+
+**Returning patient — warm acknowledgment**
+
+Steps:
+1. Complete a full intake with name "Jane Smith" and any phone/address
+2. Start a new session, consent
+3. Type "Jane Smith" as the name, then provide DOB, phone, and address
+
+Expected: after all identity fields are collected, the system says "Welcome back, Jane Smith! Your phone on file is [phone]. Address: [address]. Does everything still look right, or has anything changed?" rather than showing a raw data comparison table.
+
+**Ambiguous yes/no — intent classification**
+
+Steps:
+1. Complete intake through the confirm phase (full summary shown)
+2. Type "I think so" instead of "yes"
+
+Expected: the system correctly interprets "I think so" as a confirmation and moves to report generation. Try "not really" — it should prompt for what you want to change.
+
+**Dosage follow-up — no loop**
+
+Steps:
+1. In the clinical history medications step, type "I take aspirin and ibuprofen"
+2. When asked for dosage, type "I don't know the dose"
+3. The system asks once more with a warm phrasing
+4. Type "I really don't know" again
+
+Expected: the system accepts "I don't know" and moves on to the next step (PMH). It does not ask for dosage a third time.
+
+**Report in chat**
+
+Steps:
+1. Complete a full happy path intake through all phases and confirm
+
+Expected: the system's final message in the chat includes the full clinician note text directly — "Here is the clinician note prepared for your visit: --- [note] ---" — followed by a note that a copy has been sent to the care team. The patient does not need to click a separate button to see the report.
+
+---
+
+## Evals — quality measurement
+
+The evals directory measures how well the AI performs, not just whether the code works. These are separate from the pytest test suite.
+
+### Layer 1 — Component evals (no API key needed)
+
+```
+python -m evals.run_evals
+```
+
+157 test cases across 11 dimensions. 9 of 11 are deterministic and require no Gemini call.
+
+| Dimension | Cases | What it measures |
+|---|---|---|
+| Identity extraction accuracy | 15 | DOB format normalization, phone stripping, name Title Case |
+| Emergency detection recall/precision | 18 | Phrase matching including negation ("no chest pain" ≠ "chest pain") |
+| Crisis detection recall/precision | 20 | Tier 1 keyword + morphological variants; figurative speech true negatives |
+| OPQRST completeness + never-invent rate | 12 | LLM-based — requires `--llm` flag |
+| Invalid JSON / fallback / repair rate | 15 | LLM-based — requires `--llm` flag |
+| Unsafe / diagnosis-language filter accuracy | 18 | Post-LLM guardrail: "you have appendicitis" blocked, "when did it start" passes |
+| Extended unsafe-output FP/FN taxonomy | 12 | False positive rate (blocking safe messages) matters as much as FN rate |
+| Human-review safety score threshold | 10 | SafetyChecker weight assertions; threshold crossing with known score inputs |
+| Validate-gate completeness guard | 15 | validate_node edge cases: empty CC, low quality score, missing allergies |
+| FHIR input validation | 12 | validate_fhir_input + build_bundle resource counts |
+| Report content | 10 | _validate_report_content structural + no diagnosis language |
+
+Run with `--llm` to include the two LLM-dependent dimensions:
+```
+python -m evals.run_evals --llm
+```
+
+Run a single category:
+```
+python -m evals.run_evals --category emergency_detection
+```
+
+Save results for baseline comparison:
+```
+python -m evals.run_evals --llm --output results/baseline.json
+```
+
+### Layer 2 — Multi-turn agent evals (requires GEMINI_API_KEY)
+
+```
+python -m evals.multi_turn_eval
+```
+
+10 full conversation scenarios driven through the real LangGraph state machine with a live Gemini connection. Each scenario is a patient persona with expected outcomes:
+
+| Scenario | Persona | What it validates |
+|---|---|---|
+| Routine checkup | Mild headache, hypertension on lisinopril | Full happy path to report |
+| Emergency | Crushing chest pain, radiates to arm | Emergency escalation in subjective |
+| Mental health | Daily panic attacks, sertraline | Mental health classification, adapted PMH question |
+| Pediatric | Parent describing child's fever | Pediatric classification, adapted medication question |
+| Ambiguous yes/no | Patient says "I think so" and "not really" | Two-tier intent classification |
+| Crisis after consent | Self-harm language before identity | guard_node fires, CRISIS_RESOURCE, no report |
+| Correction flow | Patient corrects address from confirm phase | Routes back to identity, resumes correctly |
+| Returning patient | Name matches mock EHR record | Warm acknowledgment, stored identity used |
+| Multiple medications | 4 medications with partial dosage | MedsOut extraction, dosage follow-up |
+| Consent decline | Patient refuses AI disclosure | Session ends at consent, no data collected |
+
+Results saved to JSON for trend comparison:
+```
+python -m evals.multi_turn_eval --output results/mt_eval.json
+```
