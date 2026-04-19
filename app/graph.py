@@ -14,13 +14,26 @@ def route(state: IntakeState):
         "identity":         "identity_node",
         "identity_review":  "identity_review_node",
         "subjective":       "subjective_node",
-        "validate":         "validate_node",      
+        "validate":         "validate_node",
         "clinical_history": "clinical_history_node",
         "report":           "report_node",
         "handoff":          "handoff_node",
         "confirm":          "confirm_node",
         "done":             END,
     }.get(phase, "identity_node")
+
+
+def route_after_guard(state: IntakeState):
+    """
+    After guard_node runs:
+    - Crisis detected → END directly. guard_node already set the patient-facing
+      message (CRISIS_RESOURCE) and fired all side effects (DB escalation, webhook).
+      Routing through handoff_node would add a redundant message.
+    - No crisis → route normally by phase (guard_node returned {} unchanged).
+    """
+    if state.get("crisis_detected") and state.get("current_phase") == "handoff":
+        return END
+    return route(state)
 
 
 def build_graph():
@@ -32,24 +45,30 @@ def build_graph():
     checkpointer = SqliteSaver(cp)
 
     g = StateGraph(IntakeState)
+
+    # guard_node is the single entry point for every user message.
+    # It runs crisis detection once, centrally, before any business node.
+    g.add_node("guard_node",            nodes.guard_node)
     g.add_node("consent_node",          nodes.consent_node)
     g.add_node("identity_node",         nodes.identity_node)
     g.add_node("identity_review_node",  nodes.identity_review_node)
     g.add_node("subjective_node",       nodes.subjective_node)
-    g.add_node("validate_node",         nodes.validate_node)   # agentic: non-interactive
+    g.add_node("validate_node",         nodes.validate_node)
     g.add_node("clinical_history_node", nodes.clinical_history_node)
     g.add_node("report_node",           nodes.report_node)
     g.add_node("handoff_node",          nodes.handoff_node)
     g.add_node("confirm_node",          nodes.confirm_node)
 
-    g.add_conditional_edges(START, route)
+    # Every message enters through guard_node first.
+    g.add_conditional_edges(START, lambda _: "guard_node")
+    g.add_conditional_edges("guard_node", route_after_guard)
 
     for n in [
         "consent_node",
         "identity_node",
         "identity_review_node",
         "subjective_node",
-        "validate_node",        
+        "validate_node",
         "clinical_history_node",
         "confirm_node",
     ]:
@@ -61,6 +80,10 @@ def build_graph():
     return g.compile(
         checkpointer=checkpointer,
         interrupt_after=[
+            # guard_node intentionally NOT here — it must be transparent:
+            # run safety check then immediately continue to the business node
+            # in the same graph.invoke() call. Adding it here would consume
+            # the user message in the guard pause and starve the business node.
             "consent_node",
             "identity_node",
             "identity_review_node",
