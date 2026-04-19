@@ -735,21 +735,11 @@ This allows ANY website on the internet to make requests to your API from a brow
 
 ---
 
-### MEDIUM: No Database Migrations
+### MEDIUM: No Database Migrations ✅ RESOLVED
 
-**What it is:** The code does schema upgrades via manual `ALTER TABLE` checks in Python:
-```python
-if "fhir_bundle" not in existing:
-    c.execute("ALTER TABLE reports ADD COLUMN fhir_bundle TEXT")
-```
+**What it was:** The code did schema upgrades via manual `ALTER TABLE` checks in Python — no version tracking, no rollback, no way to know which migrations had run on a given deployment.
 
-**Why it breaks:** This works for adding columns but:
-- Cannot rename columns safely
-- Cannot change column types
-- No version tracking (how do you know which migrations have run?)
-- If the startup migration fails, the server fails to start
-
-**The fix:** Use Alembic (the standard Python migration tool). Every schema change is a numbered migration file. Alembic tracks which ones have been applied.
+**Resolution:** Alembic is now installed and wired up. `alembic/versions/001_baseline_schema.py` is the baseline migration covering all 14 tables. The CI pipeline runs `alembic upgrade head` before deploy. The inline `ALTER TABLE` guards in `init_schema()` are no longer needed for new deployments — `schema.sql` includes all columns in the initial `CREATE TABLE` definitions. The `alembic_version` table tracks exactly which migrations have been applied.
 
 ---
 

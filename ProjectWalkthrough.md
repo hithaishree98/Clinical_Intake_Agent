@@ -861,14 +861,13 @@ WAL mode (`PRAGMA journal_mode=WAL`) allows concurrent reads while a write is in
 
 ### 11.5 Schema migrations
 
-`init_schema()` runs `schema.sql` via `executescript()` (all `CREATE TABLE IF NOT EXISTS` — idempotent). Then inline `ALTER TABLE` migrations check `PRAGMA table_info()` for columns added after initial deployment:
+Schema evolution is managed by Alembic. `alembic/versions/001_baseline_schema.py` is the baseline migration that captures all 14 tables as they existed before version tracking was introduced. Every subsequent schema change is a numbered migration file with `upgrade()` and `downgrade()`.
 
-```python
-if "session_token" not in existing_sessions:
-    c.execute("ALTER TABLE sessions ADD COLUMN session_token TEXT")
-```
+`init_schema()` still runs `schema.sql` at startup for the application tables (idempotent `CREATE TABLE IF NOT EXISTS`). The inline `ALTER TABLE` guards that previously handled column additions have been consolidated into `schema.sql` directly — `patient_id` is part of the `CREATE TABLE sessions` definition, not added after. Alembic is the authoritative version record; `init_schema()` is the zero-migration bootstrap path.
 
-No migration tool, no version tracking file. The migration logic is in `init_schema()` and is safe to run on both fresh and existing databases. For a production system with multiple concurrent workers this would need a migration lock; for a single-process deployment it is sufficient.
+The CI pipeline runs `alembic upgrade head` before starting the app, so schema drift between environments is caught before deployment, not at runtime.
+
+**Why Alembic over the previous inline-ALTER approach:** The old guards (`if "column" not in PRAGMA table_info: ALTER TABLE ...`) had no version tracking — there was no way to know which migrations had been applied on a given deployment. Alembic's `alembic_version` table makes this auditable and reversible.
 
 ### 11.6 Token usage and cost tracking
 
@@ -880,7 +879,7 @@ CREATE TABLE llm_usage (
 );
 ```
 
-`cost_usd` is computed at write time from Gemini Flash pricing (`$0.075/1M input`, `$0.30/1M output`). The constants are named in `sqlite_db.py`. The `llm_usage` table enables:
+`cost_usd` is computed at write time using pricing from `settings().intake.gemini_input_cost_per_million` and `gemini_output_cost_per_million`. Both `record_llm_usage()` and `get_analytics()` read from the same `IntakeConfig` fields — there is no hardcoded pricing in SQL strings. The `llm_usage` table enables:
 - Per-session cost reports: `SELECT SUM(cost_usd) FROM llm_usage WHERE thread_id=?`
 - Node-level cost breakdown: `SELECT node, SUM(cost_usd) FROM llm_usage GROUP BY node`
 - Trend monitoring: `SELECT DATE(created_at), SUM(cost_usd) FROM llm_usage GROUP BY DATE(created_at)`
