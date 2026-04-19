@@ -8,4 +8,7 @@ langgraph-checkpoint-sqlite>=0.2
 python-multipart>=0.0.5
 slowapi>=0.1.9
 PyJWT>=2.8
+alembic>=1.13
 pytest>=8.0
+bandit>=1.7
+pip-audit>=2.7

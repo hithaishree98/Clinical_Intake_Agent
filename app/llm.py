@@ -1,11 +1,11 @@
-
 from __future__ import annotations
 
-import time
-import random
-import json
-import threading
 import concurrent.futures
+import json
+import random
+import re
+import threading
+import time
 from dataclasses import dataclass
 from typing import Callable, Optional, Type, Tuple
 
@@ -251,6 +251,11 @@ def get_gemini() -> GeminiClient:
     return _gemini
 
 
+def is_llm_available() -> bool:
+    """Return False when the circuit breaker is open (API temporarily unreachable)."""
+    return _breaker.allow_request()
+
+
 # ---------------------------------------------------------------------------
 # JSON extraction and repair
 # ---------------------------------------------------------------------------
@@ -364,9 +369,11 @@ def run_json_step(
     total_output = res.output_tokens + (res2.output_tokens if res2 else 0)
 
     latency_ms = int((time.time() - t0) * 1000)
-    # cost estimate using Gemini Flash pricing (input $0.075/1M, output $0.30/1M)
+    _cfg = settings().intake
     cost_usd = round(
-        (total_input / 1_000_000) * 0.075 + (total_output / 1_000_000) * 0.30, 8
+        (total_input  / 1_000_000) * _cfg.gemini_input_cost_per_million
+        + (total_output / 1_000_000) * _cfg.gemini_output_cost_per_million,
+        8,
     )
     meta = {
         "llm_ok": res.ok, "llm_error": res.error,
@@ -387,8 +394,6 @@ def run_json_step(
 # Diagnosis language filter — catches LLM output that drifts into diagnosing
 # ---------------------------------------------------------------------------
 
-import re as _re
-
 _DIAGNOSIS_PATTERNS = [
     r"\byou\s+(have|likely\s+have|probably\s+have|may\s+have|might\s+have)\b",
     r"\bdiagnos(is|ed|ing|e)\b",
@@ -397,7 +402,7 @@ _DIAGNOSIS_PATTERNS = [
     r"\bsounds?\s+like\s+(you\s+have|a\s+case\s+of)\b",
     r"\bthis\s+is\s+(likely|probably|possibly)\s+(a|an)\s+\w+\s+(condition|disease|disorder|infection)\b",
 ]
-_DIAGNOSIS_RE = _re.compile("|".join(_DIAGNOSIS_PATTERNS), _re.IGNORECASE)
+_DIAGNOSIS_RE = re.compile("|".join(_DIAGNOSIS_PATTERNS), re.IGNORECASE)
 
 _SAFE_REPLACEMENT = (
     "I've noted your symptoms. The clinician will review everything "

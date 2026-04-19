@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+import threading
 import time
 import uuid
 
@@ -19,6 +20,7 @@ from fastapi.responses import JSONResponse
 from .. import sqlite_db as db
 from ..extract import check_prompt_injection
 from ..graph import build_graph
+from ..llm import is_llm_available
 from ..logging_utils import log_event, log_audit, set_trace_id, set_request_id, set_job_id
 from ..settings import get_settings
 from .deps import limiter, require_session_token, require_clinician
@@ -34,39 +36,36 @@ def _issue_session_token() -> str:
     return secrets.token_hex(32)
 
 
+# Keys excluded from the persisted state snapshot.
+# "messages" is stored separately in the messages table; omitting it keeps
+# the snapshot compact and prevents double-storage of conversation history.
+# New IntakeState fields are persisted automatically — no manual sync needed.
+_SNAPSHOT_EXCLUDE: frozenset[str] = frozenset({"messages"})
+
+
 def _compact_snapshot(output: dict) -> dict:
-    """Strip the full message list and other noise before persisting state."""
-    return {
-        "current_phase":          output.get("current_phase"),
-        "identity":               output.get("identity"),
-        "stored_identity":        output.get("stored_identity"),
-        "identity_status":        output.get("identity_status"),
-        "needs_identity_review":  output.get("needs_identity_review"),
-        "consent_given":          output.get("consent_given"),
-        "chief_complaint":        output.get("chief_complaint"),
-        "opqrst":                 output.get("opqrst"),
-        "allergies":              output.get("allergies"),
-        "medications":            output.get("medications"),
-        "pmh":                    output.get("pmh"),
-        "recent_results":         output.get("recent_results"),
-        "triage":                 output.get("triage"),
-        "needs_emergency_review": output.get("needs_emergency_review"),
-        "clinical_step":          output.get("clinical_step"),
-        "mode":                   output.get("mode"),
-        "triage_attempts":        output.get("triage_attempts"),
-        "intake_classification":       output.get("intake_classification"),
-        "classification_confidence":   output.get("classification_confidence"),
-        "extraction_quality_score":    output.get("extraction_quality_score"),
-        "extraction_retry_count":      output.get("extraction_retry_count"),
-        "validation_errors":           output.get("validation_errors"),
-        "validation_target_phase":     output.get("validation_target_phase"),
-        "crisis_detected":        output.get("crisis_detected"),
-        "human_review_required":  output.get("human_review_required"),
-        "safety_score":           output.get("safety_score"),
-        "extraction_confidence":  output.get("extraction_confidence"),
-        "last_failed_phase":      output.get("last_failed_phase"),
-        "last_failure_reason":    output.get("last_failure_reason"),
+    """Persist all state fields except those in _SNAPSHOT_EXCLUDE."""
+    return {k: v for k, v in output.items() if k not in _SNAPSHOT_EXCLUDE}
+
+
+def _build_resume_context(phase: str, state_data: dict) -> str:
+    """Build a one-sentence context summary shown when a patient resumes a session."""
+    _phase_context = {
+        "consent":          "You were just getting started — we hadn't yet collected your information.",
+        "identity":         "You were sharing your personal details.",
+        "identity_review":  "You were reviewing your personal details.",
+        "subjective":       "You were describing what brought you in.",
+        "clinical_history": "You were sharing your health background.",
+        "confirm":          "You were reviewing your intake summary.",
+        "report":           "Your intake was being finalised.",
+        "handoff":          "Your intake is with the care team.",
+        "done":             "Your intake is complete.",
     }
+    ctx = _phase_context.get(phase, "You were in the middle of your intake.")
+    cc = (state_data.get("chief_complaint") or "").strip()
+    if cc and phase not in ("consent", "identity", "identity_review"):
+        ctx += f" Your main concern was noted as '{cc}'."
+    return f"Welcome back! {ctx} Let's continue where we left off."
 
 
 def _run_report_job(graph, thread_id: str, job_id: str) -> None:
@@ -121,10 +120,10 @@ def start_session(request: Request, mode: str = Form("clinic")):
         "opqrst": {"onset": "", "provocation": "", "quality": "", "radiation": "", "severity": "", "timing": ""},
         "subjective_complete": False,
         "clinical_step": "allergies",
-        "allergies": [],
-        "medications": [],
-        "pmh": [],
-        "recent_results": [],
+        "allergies": None,
+        "medications": None,
+        "pmh": None,
+        "recent_results": None,
         "clinical_complete": False,
         "triage": {"emergency_flag": False, "risk_level": "low", "visit_type": "routine",
                    "red_flags": [], "confidence": "low", "rationale": ""},
@@ -168,7 +167,8 @@ def start_session(request: Request, mode: str = Form("clinic")):
 
 
 @router.get("/resume/{thread_id}")
-def resume_session(thread_id: str, authorization: str = Header(default="")):
+@limiter.limit("30/minute")
+def resume_session(request: Request, thread_id: str, authorization: str = Header(default="")):
     require_session_token(thread_id, authorization)
     sess = db.fetch_one(
         "SELECT thread_id, status FROM sessions WHERE thread_id=?", (thread_id,)
@@ -178,17 +178,15 @@ def resume_session(thread_id: str, authorization: str = Header(default="")):
     if sess["status"] in ("done", "escalated", "expired"):
         raise HTTPException(status_code=410, detail=f"Session already {sess['status']}.")
 
-    last_msg = db.fetch_one(
-        "SELECT text FROM messages WHERE thread_id=? AND role='assistant' ORDER BY id DESC LIMIT 1",
-        (thread_id,),
-    )
-    state = db.get_session_state(thread_id)
-    phase = ((state or {}).get("state") or {}).get("current_phase", "identity")
+    state_row  = db.get_session_state(thread_id)
+    state_data = ((state_row or {}).get("state") or {})
+    phase      = state_data.get("current_phase", "identity")
+    resume_msg = _build_resume_context(phase, state_data)
     return {
         "thread_id": thread_id,
-        "status": sess["status"],
-        "phase": phase,
-        "reply": last_msg["text"] if last_msg else "Welcome back. Let's continue your intake.",
+        "status":    sess["status"],
+        "phase":     phase,
+        "reply":     resume_msg,
     }
 
 
@@ -249,6 +247,72 @@ def chat(
         _prev = db.get_session_state(thread_id)
         prev_phase = (_prev or {}).get("state", {}).get("current_phase") if _prev else None
 
+        # ── Guard 1: Circuit breaker — LLM API temporarily unavailable ──────
+        if not is_llm_available():
+            log_event("chat_blocked_circuit_open", level="warning", thread_id=thread_id)
+            return {
+                "reply": "We're experiencing a brief technical issue. "
+                         "Your progress is saved — please try again in a couple of minutes.",
+                "status": "active",
+                "phase":  prev_phase or "unknown",
+            }
+
+        # ── Guard 2: Max session turns — prevents loops and cost runaway ─────
+        turn_row = db.fetch_one(
+            "SELECT COUNT(*) AS n FROM messages WHERE thread_id=? AND role='user'",
+            (thread_id,),
+        ) or {}
+        if (turn_row.get("n") or 0) >= get_settings().intake.max_session_turns:
+            log_event("chat_max_turns_reached", level="warning", thread_id=thread_id)
+            db.set_session_status(thread_id, "done")
+            return {
+                "reply": "Your session has reached its maximum length. "
+                         "Please speak with the front desk to complete your intake — "
+                         "your progress has been saved.",
+                "status": "done",
+                "phase":  "done",
+            }
+
+        # ── Guard 2b: Session cost cap — prevents runaway LLM spend ─────────
+        # Queries llm_usage (written by _track_llm_failure after every LLM call)
+        # so the cap is enforced even across retries and repair calls.
+        _pricing = get_settings().intake
+        cost_row = db.fetch_one(
+            "SELECT COALESCE("
+            "  SUM(CAST(input_tokens AS REAL)/1000000.0*?"
+            "    + CAST(output_tokens AS REAL)/1000000.0*?), 0.0"
+            ") AS cost FROM llm_usage WHERE thread_id=?",
+            (_pricing.gemini_input_cost_per_million,
+             _pricing.gemini_output_cost_per_million,
+             thread_id),
+        ) or {}
+        session_cost = float(cost_row.get("cost") or 0.0)
+        if session_cost > get_settings().intake.max_cost_usd_per_session:
+            log_event("session_cost_cap_enforced", level="warning",
+                      thread_id=thread_id, session_cost_usd=session_cost,
+                      cap_usd=get_settings().intake.max_cost_usd_per_session)
+            db.set_session_status(thread_id, "done")
+            return {
+                "reply": "Your session has reached its limit. "
+                         "Please speak with the front desk to complete your intake — "
+                         "your progress has been saved.",
+                "status": "done",
+                "phase":  "done",
+            }
+
+        # ── Guard 3: In-flight report job — prevents concurrent graph invocations ──
+        active_jobs = [
+            j for j in db.get_jobs_for_thread(thread_id)
+            if j["status"] in ("queued", "running")
+        ]
+        if active_jobs:
+            return {
+                "reply":  "Your intake summary is currently being prepared — you'll receive it shortly!",
+                "status": "active",
+                "phase":  "report_generating",
+                "job_id": active_jobs[0]["job_id"],
+            }
+
         graph = request.app.state.graph
         output = graph.invoke({"messages": [{"role": "user", "text": message}]}, config)
         db.save_session_state(thread_id, _compact_snapshot(output))
@@ -262,7 +326,6 @@ def chat(
         phase = output.get("current_phase")
 
         if phase == "report":
-            import threading
             job_id = db.create_job(thread_id, "report")
             t = threading.Thread(target=_run_report_job, args=(graph, thread_id, job_id), daemon=True)
             t.start()

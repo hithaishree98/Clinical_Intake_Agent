@@ -78,6 +78,8 @@ def mask_phi(fields: dict[str, Any]) -> dict[str, Any]:
             out[k] = "[REDACTED]"
         elif isinstance(v, dict):
             out[k] = mask_phi(v)
+        elif isinstance(v, list):
+            out[k] = [mask_phi(item) if isinstance(item, dict) else item for item in v]
         elif isinstance(v, str) and any(p.search(v) for p in _PHI_PATTERNS):
             out[k] = "[REDACTED]"
         else:

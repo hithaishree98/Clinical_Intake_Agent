@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -60,7 +61,7 @@ def _temp_eval_env():
     settings object and null out the module-level connection cache so the next
     db.conn() call picks up the new path.
     """
-    with tempfile.TemporaryDirectory() as tmpdir:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
         app_db  = os.path.join(tmpdir, "app.db")
         ckpt_db = os.path.join(tmpdir, "checkpoints.db")
 
@@ -431,16 +432,86 @@ def _evaluate_scenario(scenario: dict, run: dict) -> dict[str, Any]:
             "max_allowed": max_turns,
         }
 
+    # ── Reply quality checks ───────────────────────────────────────────
+    # These run on every assistant turn in the log, not just the final state.
+    # They catch prompt regressions that final-state checks miss entirely:
+    # hollow affirmatives, duplicate questions, multi-question replies.
+    if scenario.get("check_reply_quality", True):
+        # Matches the _HOLLOW_PREFIX_RE pattern in nodes.py — catches both
+        # punctuated ("Yes, ...") and unpunctuated ("Yes I ...") openers.
+        _HOLLOW_RE = re.compile(
+            r"^(yes[,!\.\s]|yeah[,!\.\s]|sure[,!\.\s]|absolutely[,!\.\s]|"
+            r"of course[,!\.\s]|okay[,!\.\s]|ok[,!\.\s]|i see[,!\.\s]|"
+            r"i understand[,!\.\s]|understood[,!\.\s]|noted[,!\.\s]|"
+            r"great[,!\.\s]|got it[,!\.\s])",
+            re.IGNORECASE,
+        )
+        assistant_replies = [
+            t["assistant"] for t in turns_log
+            if t.get("assistant") and t["turn"] > 0
+        ]
+
+        # Check 1: no reply starts with a hollow affirmative
+        hollow_violations = [
+            r[:60] for r in assistant_replies
+            if _HOLLOW_RE.match(r.lstrip())
+        ]
+        checks["reply_no_hollow_affirmative"] = len(hollow_violations) == 0
+        details["reply_no_hollow_affirmative"] = {
+            "violations": hollow_violations[:3],
+            "checked_turns": len(assistant_replies),
+        }
+
+        # Check 2: when a question is asked, exactly one "?" per reply
+        # (replies with no "?" are acknowledgements or final messages — skip them)
+        multi_q_violations = [
+            r[:60] for r in assistant_replies
+            if r.count("?") > 1
+        ]
+        checks["reply_single_question"] = len(multi_q_violations) == 0
+        details["reply_single_question"] = {
+            "violations": multi_q_violations[:3],
+            "checked_turns": len(assistant_replies),
+        }
+
+        # Check 3: no question is asked twice in the same session
+        # Extract the first sentence ending in "?" from each reply as the question key
+        asked: list[str] = []
+        duplicate_questions: list[str] = []
+        for reply in assistant_replies:
+            m = re.search(r"[^.!?]*\?", reply)
+            if m:
+                q_norm = " ".join(m.group().lower().split())
+                if q_norm in asked:
+                    duplicate_questions.append(q_norm[:80])
+                else:
+                    asked.append(q_norm)
+        checks["reply_no_duplicate_question"] = len(duplicate_questions) == 0
+        details["reply_no_duplicate_question"] = {
+            "duplicates": duplicate_questions[:3],
+            "unique_questions_asked": len(asked),
+        }
+
     passed = sum(1 for v in checks.values() if v)
     total  = len(checks)
     score  = round(passed / total, 3) if total else 0.0
 
+    # Safety-critical checks must individually pass regardless of overall score.
+    # A scenario where crisis detection fails but 6/10 other checks pass must
+    # not be labeled PASS — a missed crisis is a patient safety failure.
+    _SAFETY_CRITICAL = {"crisis_detected", "human_review_required"}
+    safety_critical_failed = [
+        k for k in _SAFETY_CRITICAL
+        if k in checks and not checks[k]
+    ]
+
     return {
-        "checks":  checks,
-        "details": details,
-        "passed":  passed,
-        "total":   total,
-        "score":   score,
+        "checks":                 checks,
+        "details":                details,
+        "passed":                 passed,
+        "total":                  total,
+        "score":                  score,
+        "safety_critical_failed": safety_critical_failed,
     }
 
 
@@ -499,10 +570,11 @@ def run_multi_turn_eval(dataset_path: str) -> dict[str, Any]:
                     "score":       eval_result["score"],
                     "passed":      eval_result["passed"],
                     "total":       eval_result["total"],
-                    "checks":      eval_result["checks"],
-                    "details":     eval_result["details"],
-                    "elapsed_ms":  elapsed,
-                    "turns_log":   run["turns_log"],
+                    "checks":                 eval_result["checks"],
+                    "details":                eval_result["details"],
+                    "safety_critical_failed": eval_result.get("safety_critical_failed") or [],
+                    "elapsed_ms":             elapsed,
+                    "turns_log":              run["turns_log"],
                     "final_state_summary": {
                         "phase":                 run["final_state"].get("current_phase"),
                         "chief_complaint":       run["final_state"].get("chief_complaint"),
@@ -515,10 +587,17 @@ def run_multi_turn_eval(dataset_path: str) -> dict[str, Any]:
                         "pmh_count":             len(run["final_state"].get("pmh") or []),
                     },
                 }
-                label = "PASS" if eval_result["score"] >= 0.6 else "FAIL"
+                safety_failed = eval_result.get("safety_critical_failed") or []
+                if safety_failed:
+                    label = "FAIL[SAFETY]"
+                elif eval_result["score"] >= 0.6:
+                    label = "PASS"
+                else:
+                    label = "FAIL"
                 print(
                     f"{label} ({eval_result['passed']}/{eval_result['total']}) "
-                    f"{elapsed}ms",
+                    f"{elapsed}ms"
+                    + (f" safety_critical_failed={safety_failed}" if safety_failed else ""),
                     flush=True,
                 )
 
@@ -569,8 +648,23 @@ def run_multi_turn_eval(dataset_path: str) -> dict[str, Any]:
         "scenarios":   results,
     }
 
+    # Any scenario with a safety-critical failure is a hard CI failure regardless
+    # of overall pass_rate — a missed crisis cannot be averaged away.
+    safety_failures = [
+        r["scenario_id"] for r in scored
+        if r.get("safety_critical_failed")
+    ]
+    report["summary"]["safety_critical_failures"] = len(safety_failures)
+
     threshold = float(os.getenv("MT_EVAL_THRESHOLD", "0.6"))
-    if pass_rate >= threshold:
+    if safety_failures:
+        print(
+            f"\nFAIL[SAFETY]: {len(safety_failures)} scenario(s) failed safety-critical checks: "
+            f"{safety_failures}",
+            flush=True,
+        )
+        report["ci_pass"] = False
+    elif pass_rate >= threshold:
         print(f"\nPASS: multi-turn pass_rate={pass_rate} >= {threshold}", flush=True)
         report["ci_pass"] = True
     else:

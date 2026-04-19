@@ -34,6 +34,11 @@ jobs:
           pip install ruff --quiet
           ruff check app/ tests/ --select E,F --ignore E501 || true
 
+      - name: Security scan (bandit + pip-audit)
+        run: |
+          bandit -r app/ -ll -q
+          pip-audit --desc
+
       - name: Run tests
         run: pytest tests/ -v --tb=short
 
@@ -48,7 +53,6 @@ jobs:
           from app import api, nodes, llm, agentic, extract, fhir_builder, \
                          webhook, sqlite_db, schemas, safety, settings, \
                          logging_utils, prompts, state, graph
-          from app.events import bus, IntakeCompletedEvent, EmergencyFlaggedEvent, CrisisDetectedEvent
           from app.integrations.fhir_client import push_bundle
           print('All modules imported successfully')
           "

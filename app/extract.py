@@ -54,6 +54,11 @@ def is_ack(text: str) -> bool:
 
 
 def extract_identity_deterministic(text: str) -> Dict[str, str]:
+    """
+    Regex-based identity extraction. Used by evals to benchmark deterministic
+    accuracy against the LLM-based IdentityOut path. Not called in production —
+    identity_node uses run_json_step(schema=IdentityOut) instead.
+    """
     t = (text or "").strip()
     out = {"name": "", "phone": "", "address": "", "dob": ""}
 

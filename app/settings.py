@@ -41,8 +41,38 @@ class IntakeConfig(BaseModel):
     session_ttl_hours: int = 4
     checkpoint_retention_days: int = 30
 
+    # ── Session turns guard ───────────────────────────────────────────────
+    # Hard cap on user messages per session. Prevents infinite loops and
+    # runaway LLM costs. Patient is directed to the front desk when hit.
+    max_session_turns: int = 30
+    # Hard cap on identity collection attempts before giving up and directing
+    # the patient to the front desk.
+    max_identity_attempts: int = 6
+
     # ── Report generation ─────────────────────────────────────────────────
     max_report_attempts: int = 3
+    # Use the deterministic template for clinician notes by default.
+    # The LLM adds natural-language flow to the HPI narrative but the output
+    # format is fully prescribed — the template produces an equivalent note at
+    # zero LLM cost (~32% of per-session spend).  Set to True only when prose
+    # quality is a hard requirement for the deployment context.
+    use_llm_report_narrative: bool = False
+
+    # ── Cost controls ─────────────────────────────────────────────────────
+    # Gemini Flash pricing (per million tokens).  Update here when Anthropic
+    # revises the pricing tier — both llm.py and patient.py read from these
+    # so there is exactly one place to change.
+    gemini_input_cost_per_million: float = 0.075
+    gemini_output_cost_per_million: float = 0.30
+    # Alert threshold for the repair rate over the last hour.
+    # repair_used fires when the primary LLM call returns invalid JSON and a
+    # second call is made — doubling cost for that call.  A rate above this
+    # threshold is logged as a warning in /analytics.
+    repair_rate_alert_threshold: float = 0.05
+    # Hard cost cap per session. Once accumulated LLM spend exceeds this,
+    # the session routes to done with a front-desk message rather than making
+    # further LLM calls.  Default is ~8× a normal session (~$0.0012 typical).
+    max_cost_usd_per_session: float = 0.01
 
     # ── Webhook dead-letter ───────────────────────────────────────────────
     # Exhausted deliveries are eligible for re-queue after this many hours.

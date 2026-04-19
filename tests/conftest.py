@@ -7,6 +7,26 @@ os.environ.setdefault("CLINICIAN_PASSWORD", "test-password")
 os.environ.setdefault("DEBUG_MODE", "true")
 
 
+@pytest.fixture(autouse=True)
+def reset_circuit_breaker():
+    """
+    Reset the LLM circuit breaker before every test, module-wide.
+
+    Any test that triggers a real (failing) LLM call — because run_json_step
+    is not mocked — increments the breaker's failure counter.  Without this
+    reset, accumulated failures from earlier tests trip the breaker and cause
+    subsequent tests to fail with 503 at the /chat guard, even when the test
+    itself correctly mocks the LLM.
+    """
+    import app.llm as llm_mod
+    breaker = llm_mod._breaker
+    with breaker._lock:
+        breaker._state     = llm_mod.CircuitBreaker.CLOSED
+        breaker._failures  = 0
+        breaker._opened_at = 0.0
+    yield
+
+
 @pytest.fixture
 def tmp_db(tmp_path, monkeypatch):
     """Spin up a fresh SQLite database for each test so tests never share state."""

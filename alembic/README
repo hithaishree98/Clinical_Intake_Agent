@@ -1,0 +1,24 @@
+Database migrations for the clinical intake application.
+
+## Running migrations
+
+    # Apply all pending migrations (safe to run on every deploy)
+    alembic upgrade head
+
+    # Check current revision
+    alembic current
+
+    # Stamp an existing database (skip running 001 if schema already exists)
+    alembic stamp 001
+
+    # Generate a new migration after changing schema.sql
+    alembic revision --autogenerate -m "describe_the_change"
+
+## First deploy on a new machine
+
+    alembic upgrade head
+
+## Existing databases (before Alembic was introduced)
+
+    alembic stamp 001   # mark as already at baseline
+    alembic upgrade head  # apply any newer migrations

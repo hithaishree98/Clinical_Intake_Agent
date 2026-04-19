@@ -1,13 +1,16 @@
 from __future__ import annotations
 import hashlib
 import hmac
-import sqlite3
-import time
 import json
-import uuid
+import sqlite3
 import threading
+import time
+import uuid
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Literal
 
+from .logging_utils import log_event
 from .settings import get_settings as settings
 
 _db_lock = threading.Lock()
@@ -25,7 +28,6 @@ def conn() -> sqlite3.Connection:
         _db_conn = c
     return _db_conn
 
-from contextlib import contextmanager
 
 @contextmanager
 def transaction():
@@ -120,6 +122,28 @@ def _hash_token(token: str) -> str:
     """SHA-256 the token before storage/comparison. The raw token is never persisted."""
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
+def derive_patient_id(name: str, dob: str) -> str | None:
+    """
+    Deterministic patient_id from normalized (name, dob).
+    Returns None until both fields are known — callers should defer
+    persistence until identity is captured.
+
+    Rationale: using a hash rather than a raw join key means the ID
+    itself carries no PHI and can appear in logs safely.
+    """
+    n = (name or "").strip().lower()
+    d = (dob or "").strip()
+    if not n or not d:
+        return None
+    raw = f"{n}|{d}".encode("utf-8")
+    return "pat_" + hashlib.sha256(raw).hexdigest()[:16]
+
+
+def set_session_patient_id(thread_id: str, patient_id: str) -> None:
+    exec_one(
+        "UPDATE sessions SET patient_id=?, updated_at=datetime('now') WHERE thread_id=?",
+        (patient_id, thread_id),
+    )
 
 def verify_session_token(thread_id: str, token: str) -> bool:
     """
@@ -136,7 +160,7 @@ def verify_session_token(thread_id: str, token: str) -> bool:
     stored = row.get("session_token") or ""
     return bool(stored) and hmac.compare_digest(stored, _hash_token(token))
 
-def set_session_status(thread_id: str, status: str):
+def set_session_status(thread_id: str, status: Literal["active", "done", "expired", "escalated"]):
     exec_one("UPDATE sessions SET status=?, updated_at=datetime('now') WHERE thread_id=?", (status, thread_id))
 
 def save_message(thread_id: str, role: str, text: str):
@@ -260,6 +284,73 @@ def save_report(
         " VALUES (?,?,?,?,?,?,?)",
         (str(uuid.uuid4()), thread_id, risk_level, visit_type, report_text,
          fhir_bundle, int(pending_review)),
+    )
+
+def get_patient_summary(patient_id: str) -> dict | None:
+    """
+    Return the Layer-2 summary for this patient, or None if first visit.
+    Shape:
+      { identity, allergies, medications, conditions,
+        recent_complaints, flags, visit_count, first_seen_at, updated_at }
+    """
+    row = fetch_one(
+        "SELECT * FROM patient_summary WHERE patient_id=?", (patient_id,)
+    )
+    if not row:
+        return None
+    out = {
+        "patient_id":        row["patient_id"],
+        "visit_count":       row["visit_count"],
+        "first_seen_at":     row["first_seen_at"],
+        "updated_at":        row["updated_at"],
+    }
+    for key, col in [
+        ("identity",          "identity_json"),
+        ("allergies",         "allergies_json"),
+        ("medications",       "medications_json"),
+        ("conditions",        "conditions_json"),
+        ("recent_complaints", "recent_complaints_json"),
+        ("flags",             "flags_json"),
+    ]:
+        try:
+            out[key] = json.loads(row[col])
+        except Exception:
+            out[key] = {} if key == "identity" else []
+    return out
+
+
+def upsert_patient_summary(patient_id: str, merged: dict) -> None:
+    """
+    Write the merged summary back. Caller is responsible for merge logic —
+    this function is dumb persistence only.
+    """
+    exec_one(
+        """
+        INSERT INTO patient_summary(
+          patient_id, identity_json, allergies_json, medications_json,
+          conditions_json, recent_complaints_json, flags_json,
+          visit_count, first_seen_at, updated_at
+        ) VALUES (?,?,?,?,?,?,?,?,datetime('now'),datetime('now'))
+        ON CONFLICT(patient_id) DO UPDATE SET
+          identity_json          = excluded.identity_json,
+          allergies_json         = excluded.allergies_json,
+          medications_json       = excluded.medications_json,
+          conditions_json        = excluded.conditions_json,
+          recent_complaints_json = excluded.recent_complaints_json,
+          flags_json             = excluded.flags_json,
+          visit_count            = excluded.visit_count,
+          updated_at             = datetime('now')
+        """,
+        (
+            patient_id,
+            json.dumps(merged.get("identity") or {}),
+            json.dumps(merged.get("allergies") or []),
+            json.dumps(merged.get("medications") or []),
+            json.dumps(merged.get("conditions") or []),
+            json.dumps(merged.get("recent_complaints") or []),
+            json.dumps(merged.get("flags") or []),
+            int(merged.get("visit_count") or 1),
+        ),
     )
 
 
@@ -835,6 +926,41 @@ def get_analytics() -> dict:
     sessions_n = sessions_with_cost.get("n") or 0
     avg_cost = round(llm_cost_7d / sessions_n, 6) if sessions_n else 0.0
 
+    cost_today_row = fetch_one(
+        "SELECT COALESCE(SUM(CAST(input_tokens AS REAL)/1000000.0*0.075 "
+        "     + CAST(output_tokens AS REAL)/1000000.0*0.30), 0.0) AS cost "
+        "FROM llm_usage WHERE created_at >= date('now')"
+    ) or {}
+    llm_cost_today = round(float(cost_today_row.get("cost") or 0.0), 6)
+
+    # Repair rate over the last hour — a sudden spike signals a prompt regression
+    # that silently doubles LLM cost for affected calls.
+    calls_1h = fetch_one(
+        "SELECT COUNT(*) AS n FROM llm_usage "
+        "WHERE created_at >= datetime('now', '-1 hour')"
+    ) or {}
+    repairs_1h = fetch_one(
+        "SELECT COUNT(*) AS n FROM llm_failure_log "
+        "WHERE failure_type = 'repair_used' "
+        "AND created_at >= datetime('now', '-1 hour')"
+    ) or {}
+    calls_1h_n   = calls_1h.get("n") or 0
+    repairs_1h_n = repairs_1h.get("n") or 0
+    repair_rate_1h = round(repairs_1h_n / calls_1h_n, 3) if calls_1h_n else 0.0
+
+    _repair_threshold = settings().intake.repair_rate_alert_threshold
+    repair_rate_alert = repair_rate_1h > _repair_threshold
+
+    if repair_rate_alert:
+        log_event(
+            "repair_rate_alert",
+            level="warning",
+            repair_rate_1h=repair_rate_1h,
+            threshold=_repair_threshold,
+            calls=calls_1h_n,
+            repairs=repairs_1h_n,
+        )
+
     return {
         "sessions_today": rows_today.get("n", 0),
         "sessions_last_7_days": total_week,
@@ -847,5 +973,8 @@ def get_analytics() -> dict:
         "failed_report_jobs_last_7_days": failed_jobs.get("n", 0),
         "llm_failures_last_7_days": llm_stats,
         "llm_cost_last_7_days_usd": llm_cost_7d,
+        "llm_cost_today_usd": llm_cost_today,
         "avg_cost_per_session_usd": avg_cost,
+        "repair_rate_last_1h": repair_rate_1h,
+        "repair_rate_alert": repair_rate_alert,
     }

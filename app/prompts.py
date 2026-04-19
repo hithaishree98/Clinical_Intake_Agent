@@ -31,13 +31,94 @@ dashboards can detect prompt regressions across deploys without code changes.
 # ---------------------------------------------------------------------------
 
 PROMPT_VERSIONS: dict[str, str] = {
+    "identity":        "v1.0",   # LLM extraction: name, dob (ISO 8601), phone, address
     "subjective":      "v1.5",   # descriptive severity, format hints, new examples
     "medications":     "v1.2",   # CURRENT_MEDICATIONS merge + no hollow affirmatives
     "classification":  "v1.1",
-    "followup":        "v1.0",
     "report":          "v1.1",
     "crisis_score":    "v1.0",   # LLM borderline-crisis classifier (Tier 2 safety layer)
 }
+
+
+def intent_classify_system() -> str:
+    return """
+ROLE: Intent classifier for a clinical intake chatbot.
+
+TASK:
+Classify the patient's SHORT message (1-8 words) into exactly one intent.
+Return ONLY a JSON object matching the OUTPUT SCHEMA.
+
+OUTPUT SCHEMA:
+{
+  "intent":             "confirm|decline|provide_info|correction|unclear",
+  "correcting_section": "identity|symptoms|history|none"
+}
+
+INTENT DEFINITIONS:
+  confirm      — patient agrees or says yes in any form
+  decline      — patient disagrees or says no in any form
+  provide_info — patient is giving information (a name, date, symptom, etc.)
+  correction   — patient wants to go back and fix something they said earlier
+  unclear      — cannot determine intent from the message alone
+
+correcting_section: fill only when intent is "correction".
+  identity  — they mention name, date of birth, phone, or address
+  symptoms  — they mention pain, symptoms, or their complaint
+  history   — they mention medications, allergies, or past conditions
+  none      — correction intent but no section specified
+
+EXAMPLES:
+"yeah that looks right"      → {"intent": "confirm",       "correcting_section": "none"}
+"I think so"                 → {"intent": "confirm",       "correcting_section": "none"}
+"sounds about right"         → {"intent": "confirm",       "correcting_section": "none"}
+"nah that's not correct"     → {"intent": "decline",       "correcting_section": "none"}
+"not really"                 → {"intent": "decline",       "correcting_section": "none"}
+"hmm I'm not sure"           → {"intent": "unclear",       "correcting_section": "none"}
+"wait my name is wrong"      → {"intent": "correction",    "correcting_section": "identity"}
+"actually my phone changed"  → {"intent": "correction",    "correcting_section": "identity"}
+"let me fix my symptoms"     → {"intent": "correction",    "correcting_section": "symptoms"}
+"mhm"                        → {"intent": "confirm",       "correcting_section": "none"}
+"""
+
+
+def identity_extract_system() -> str:
+    return """
+ROLE:
+You are a clinical intake assistant extracting patient identity from a conversational message.
+
+TASK:
+Extract name, date of birth, phone, and home address. Return ONLY a JSON object.
+
+OUTPUT SCHEMA:
+{
+  "name":    "Full name in Title Case — e.g. Jane Smith",
+  "dob":     "Date of birth as YYYY-MM-DD — e.g. 1990-06-01",
+  "phone":   "10-digit US phone, digits only — e.g. 4125550199",
+  "address": "Home address verbatim — e.g. 123 Main St Philadelphia PA"
+}
+
+RULES:
+- Return "" for any field not present. Never invent.
+- name: Title Case. Strip honorifics (Mr/Mrs/Dr) unless part of the name.
+- dob: Convert ANY format to YYYY-MM-DD. Examples:
+    "1st June 1990"   → "1990-06-01"
+    "13/08/1998"      → "1998-08-13"
+    "August 13, 1998" → "1998-08-13"
+    "3/15/85"         → "1985-03-15"
+    "march 15 1985"   → "1985-03-15"
+- phone: Strip non-digits, remove leading +1 or 1, keep 10 digits only.
+- Return ONLY JSON. No markdown. No explanation.
+
+EXAMPLES:
+Input: "My name is john smith, born on the 3rd of march 1975. Call me at 412 555 0199"
+Output: {"name": "John Smith", "dob": "1975-03-03", "phone": "4125550199", "address": ""}
+
+Input: "Jane Doe, DOB 1st June 1990, I live at 123 Main Street Philadelphia"
+Output: {"name": "Jane Doe", "dob": "1990-06-01", "phone": "", "address": "123 Main Street Philadelphia"}
+
+Input: "Just calling about an appointment"
+Output: {"name": "", "dob": "", "phone": "", "address": ""}
+"""
 
 
 def subjective_extract_system(style: str) -> str:
@@ -76,7 +157,11 @@ HARD CONSTRAINTS:
 - extraction_confidence = "high" when patient stated all extracted fields clearly.
 - extraction_confidence = "medium" when fields are likely correct but required some interpretation.
 - extraction_confidence = "low"  when patient was vague, contradictory, or key fields are missing.
-
+- If RETURNING_PATIENT context is provided above, acknowledge known allergies,
+  medications, and conditions already on file — do NOT re-ask about them.
+  You MAY briefly confirm ("I see you're still taking lisinopril — is that
+  still daily?") but do not collect them from scratch again.
+  
 FEW-SHOT EXAMPLES:
 
 Example 1 — Partial state, new message adds severity:
@@ -248,50 +333,6 @@ OUTPUT SCHEMA:
 """.strip()
 
 
-def followup_strategy_system(intake_classification: str, mode: str) -> str:
-    return f"""
-ROLE:
-You are a clinical intake assistant selecting the most clinically relevant follow-up question.
-
-CONTEXT:
-- Intake classification: {intake_classification}
-- Mode: {mode}
-
-TASK:
-Given the current OPQRST state and chief complaint, identify the most important missing field
-and return the single best follow-up question to ask the patient.
-
-HARD CONSTRAINTS:
-- Return ONLY a JSON object matching the OUTPUT schema. No markdown, no prose.
-- Ask about exactly ONE field in next_question.
-- Prioritize: severity → onset → quality → timing → provocation → radiation
-- For mental_health: prioritize duration/timing over radiation.
-- For emergency_visit: severity is always highest priority if missing.
-- For pediatric: rephrase questions to address the guardian (e.g. "How severe is your child's...").
-- Never diagnose. Never invent data. Never ask something already answered.
-- If all fields are filled, return next_question as "".
-
-FEW-SHOT EXAMPLES:
-
-Example 1 — emergency_visit, severity missing:
-  OPQRST: onset="2 hours ago", severity="", quality="pressure"
-  Output: {{"priority_fields":["severity"],"next_question":"How severe is the chest pressure on a scale of 0 to 10?","rationale":"Severity is missing and critical for ED triage."}}
-
-Example 2 — mental_health, onset missing:
-  OPQRST: onset="", severity="moderate", quality="sad and anxious"
-  Output: {{"priority_fields":["onset","timing"],"next_question":"How long have you been feeling this way?","rationale":"Duration is the most clinically relevant missing field for mental health."}}
-
-Example 3 — pediatric, quality missing:
-  OPQRST: onset="yesterday", severity="7/10", quality=""
-  Output: {{"priority_fields":["quality"],"next_question":"How would you describe your child's pain — is it sharp, dull, or does it come in waves?","rationale":"Quality is missing; phrased for guardian."}}
-
-OUTPUT SCHEMA:
-{{
-  "priority_fields": [],   // ordered list of OPQRST keys to ask about
-  "next_question": "",     // the single best question to ask next, or "" if all fields filled
-  "rationale": ""          // brief clinical reasoning
-}}
-""".strip()
 
 
 def crisis_score_system() -> str:

@@ -16,9 +16,12 @@ Design rules:
 """
 from __future__ import annotations
 
+import re as _re
 from typing import Annotated, Any, Dict, List, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+from .extract import normalize_drug_name
 
 
 # ---------------------------------------------------------------------------
@@ -68,7 +71,6 @@ class MedicationItem(BaseModel):
         raw = (str(v) if v else "").strip()
         if not raw:
             return raw
-        from .extract import normalize_drug_name
         return normalize_drug_name(raw)
 
 
@@ -125,17 +127,97 @@ class ClassificationOut(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Follow-up strategy
+# Intent classification — replaces hardcoded yes/no keyword lists
 # ---------------------------------------------------------------------------
 
-_OPQRSTKey = Literal["onset", "provocation", "quality", "radiation", "severity", "timing"]
+class IntentOut(BaseModel):
+    """
+    Result of the LLM short-message intent classifier.
+
+    Used when a message is too ambiguous for fast-path keyword matching:
+    "I think so", "not really", "hmm yeah", "I suppose".
+
+    intent semantics:
+      confirm      — patient is agreeing / saying yes in any form
+      decline      — patient is disagreeing / saying no in any form
+      provide_info — patient is giving information (name, date, symptom, etc.)
+      correction   — patient wants to go back and fix something
+      unclear      — cannot determine; caller should prompt for clarification
+
+    correcting_section is only populated when intent == "correction":
+      identity, symptoms, history, or none.
+    """
+    intent:             Literal["confirm", "decline", "provide_info", "correction", "unclear"] = "unclear"
+    correcting_section: Literal["identity", "symptoms", "history", "none"]                    = "none"
 
 
-class FollowUpStrategyOut(BaseModel):
-    """Feature 2: dynamic follow-up strategy selection result."""
-    priority_fields: List[_OPQRSTKey]                                         = Field(default_factory=list)
-    next_question:   Annotated[str, Field(default="", max_length=400)]        = ""
-    rationale:       Annotated[str, Field(default="", max_length=200)]        = ""
+# ---------------------------------------------------------------------------
+# LLM-extracted identity with normalization at the schema boundary
+# ---------------------------------------------------------------------------
+
+_DATE_FORMATS = [
+    "%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y", "%d/%m/%Y", "%d-%m-%Y",
+    "%m/%d/%y", "%m-%d-%y", "%B %d %Y", "%b %d %Y",
+    "%d %B %Y", "%d %b %Y", "%B %d, %Y", "%b %d, %Y",
+    "%d %B, %Y", "%d %b, %Y", "%m %d %Y", "%Y/%m/%d",
+]
+
+
+class IdentityOut(BaseModel):
+    """
+    Output schema for LLM identity extraction.
+
+    Validators normalise at the schema boundary so callers always receive:
+      name  — Title Case
+      dob   — ISO 8601 (YYYY-MM-DD) or ""
+      phone — 10 digits or ""
+      address — stripped or ""
+
+    Any value that fails normalisation is silently set to "" so identity_node
+    asks the patient again rather than storing bad data.
+    """
+    name:    str = ""
+    dob:     str = ""
+    phone:   str = ""
+    address: str = ""
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def _norm_name(cls, v: object) -> str:
+        raw = (str(v) if v else "").strip()
+        if not raw or raw.lower() in ("unknown", "n/a", "none", "not provided", "not given"):
+            return ""
+        return " ".join(w.capitalize() for w in raw.split())
+
+    @field_validator("dob", mode="before")
+    @classmethod
+    def _norm_dob(cls, v: object) -> str:
+        from datetime import datetime
+        raw = (str(v) if v else "").strip()
+        if not raw or raw.lower() in ("unknown", "n/a", "none", "not provided", "not given"):
+            return ""
+        # Strip ordinal suffixes: "1st" → "1", "13th" → "13", "3rd" → "3"
+        cleaned = _re.sub(r"\b(\d{1,2})(st|nd|rd|th)\b", r"\1", raw, flags=_re.IGNORECASE)
+        for fmt in _DATE_FORMATS:
+            try:
+                return datetime.strptime(cleaned, fmt).strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+        return ""  # unparseable — identity_node will re-ask
+
+    @field_validator("phone", mode="before")
+    @classmethod
+    def _norm_phone(cls, v: object) -> str:
+        digits = _re.sub(r"\D", "", str(v) if v else "")
+        if len(digits) == 11 and digits.startswith("1"):
+            digits = digits[1:]
+        return digits if len(digits) == 10 else ""
+
+    @field_validator("address", mode="before")
+    @classmethod
+    def _strip_address(cls, v: object) -> str:
+        raw = (str(v) if v else "").strip()
+        return "" if raw.lower() in ("unknown", "n/a", "none", "not provided", "not given") else raw
 
 
 # ---------------------------------------------------------------------------
