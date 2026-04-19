@@ -519,12 +519,6 @@ def seed_emergency_phrases(phrases: list[str]) -> None:
 # LLM token usage tracking
 # ---------------------------------------------------------------------------
 
-# Gemini 2.0 Flash pricing (USD per 1 000 tokens, as of 2025-Q2).
-# Update GEMINI_INPUT_COST_PER_1K / OUTPUT when pricing changes.
-_GEMINI_INPUT_COST_PER_1K  = 0.000075   # $0.075 / 1M input tokens
-_GEMINI_OUTPUT_COST_PER_1K = 0.0003     # $0.30  / 1M output tokens
-
-
 def record_llm_usage(
     thread_id: str,
     node: str,
@@ -538,16 +532,19 @@ def record_llm_usage(
     Failures are silently swallowed — usage tracking must never break the call path.
     """
     try:
+        _cfg = settings().intake
         cost = (
-            (input_tokens  / 1000) * _GEMINI_INPUT_COST_PER_1K
-            + (output_tokens / 1000) * _GEMINI_OUTPUT_COST_PER_1K
+            (input_tokens  / 1_000_000) * _cfg.gemini_input_cost_per_million
+            + (output_tokens / 1_000_000) * _cfg.gemini_output_cost_per_million
         )
         exec_one(
             "INSERT INTO llm_usage (thread_id, node, input_tokens, output_tokens, cost_usd)"
             " VALUES (?,?,?,?,?)",
             (thread_id, node, input_tokens, output_tokens, round(cost, 8)),
         )
-    except Exception:
+    except Exception as _e:
+        log_event("llm_usage_record_failed", level="warning",
+                  thread_id=thread_id, node=node, error=str(_e)[:100])
         pass  # never break the happy path over accounting
 
 
@@ -700,8 +697,7 @@ def prune_old_checkpoints(days: int = 30) -> int:
     """
     Delete LangGraph checkpoint rows for sessions completed more than `days` ago.
     """
-    from .settings import get_settings
-    checkpoint_path = get_settings().checkpoint_db_path
+    checkpoint_path = settings().checkpoint_db_path
     try:
         rows = fetch_all(
             "SELECT thread_id FROM sessions "
@@ -730,7 +726,8 @@ def prune_old_checkpoints(days: int = 30) -> int:
         cp.commit()
         cp.close()
         return total_deleted
-    except Exception:
+    except Exception as _e:
+        log_event("checkpoint_prune_failed", level="warning", error=str(_e)[:100])
         return 0
 
 
@@ -834,7 +831,6 @@ def assign_experiment_variant(thread_id: str, experiment_id: str) -> str:
     Same thread always gets the same variant. Increments the session counter.
     Returns 'a' or 'b'.
     """
-    import hashlib
     variant = "a" if int(hashlib.md5(thread_id.encode()).hexdigest(), 16) % 2 == 0 else "b"
     col = f"sessions_{variant}"
     exec_one(
@@ -912,10 +908,12 @@ def get_analytics() -> dict:
 
     llm_stats = get_llm_failure_stats(days=7)
 
+    _pricing = settings().intake
     cost_row = fetch_one(
-        "SELECT COALESCE(SUM(CAST(input_tokens AS REAL)/1000000.0*0.075 "
-        "     + CAST(output_tokens AS REAL)/1000000.0*0.30), 0.0) AS cost "
-        "FROM llm_usage WHERE created_at >= date('now', '-7 days')"
+        "SELECT COALESCE(SUM(CAST(input_tokens AS REAL)/1000000.0*? "
+        "     + CAST(output_tokens AS REAL)/1000000.0*?), 0.0) AS cost "
+        "FROM llm_usage WHERE created_at >= date('now', '-7 days')",
+        (_pricing.gemini_input_cost_per_million, _pricing.gemini_output_cost_per_million),
     ) or {}
     llm_cost_7d = round(float(cost_row.get("cost") or 0.0), 6)
 
@@ -927,9 +925,10 @@ def get_analytics() -> dict:
     avg_cost = round(llm_cost_7d / sessions_n, 6) if sessions_n else 0.0
 
     cost_today_row = fetch_one(
-        "SELECT COALESCE(SUM(CAST(input_tokens AS REAL)/1000000.0*0.075 "
-        "     + CAST(output_tokens AS REAL)/1000000.0*0.30), 0.0) AS cost "
-        "FROM llm_usage WHERE created_at >= date('now')"
+        "SELECT COALESCE(SUM(CAST(input_tokens AS REAL)/1000000.0*? "
+        "     + CAST(output_tokens AS REAL)/1000000.0*?), 0.0) AS cost "
+        "FROM llm_usage WHERE created_at >= date('now')",
+        (_pricing.gemini_input_cost_per_million, _pricing.gemini_output_cost_per_million),
     ) or {}
     llm_cost_today = round(float(cost_today_row.get("cost") or 0.0), 6)
 

@@ -4,6 +4,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   thread_id    TEXT PRIMARY KEY,
   status       TEXT NOT NULL DEFAULT 'active',
   session_token TEXT,
+  patient_id   TEXT,
   created_at   TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -171,11 +172,6 @@ CREATE TABLE IF NOT EXISTS prompt_experiments (
 
 CREATE INDEX IF NOT EXISTS idx_experiments_status
 ON prompt_experiments(status, prompt_key);
-
--- Stable identifier for a person across visits. Derived deterministically
--- from normalized name + DOB (see sqlite_db.derive_patient_id). A single
--- patient can have many thread_ids (one per visit).
-ALTER TABLE sessions ADD COLUMN patient_id TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_sessions_patient ON sessions(patient_id);
 CREATE INDEX IF NOT EXISTS idx_reports_patient  ON reports(thread_id);

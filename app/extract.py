@@ -104,8 +104,9 @@ def _load_phrases() -> List[str]:
             phrases = db.get_emergency_phrases()
             _phrases_cache = phrases if phrases else DEFAULT_EMERGENCY_PHRASES
             _phrases_cache_at = time.time()
-        except Exception:
-            pass  # Keep stale cache on DB error; DEFAULT_EMERGENCY_PHRASES below as fallback
+        except Exception as _e:
+            from .logging_utils import log_event
+            log_event("emergency_phrases_load_failed", level="warning", error=str(_e)[:100])
     return _phrases_cache or DEFAULT_EMERGENCY_PHRASES
 
 

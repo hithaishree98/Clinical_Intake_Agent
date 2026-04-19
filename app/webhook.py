@@ -92,6 +92,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .logging_utils import log_event
+from .settings import get_settings as settings
 
 
 def _dispatch_in_thread(target, kwargs: dict) -> None:
@@ -337,7 +338,7 @@ def slack_alert(
     """Send a message to a Slack channel via Incoming Webhook."""
     if not webhook_url:
         return False
-    from .settings import get_settings as settings
+
     cap = max_attempts if max_attempts is not None else settings().webhook_max_attempts
     payload = json.dumps({"text": text}).encode("utf-8")
     result = _post_with_retry(
@@ -385,7 +386,7 @@ def signed_fhir_webhook(
     """
     if not url or not fhir_json:
         return False
-    from .settings import get_settings as settings
+
     cap = max_attempts if max_attempts is not None else settings().webhook_max_attempts
 
     payload = fhir_json.encode("utf-8")
@@ -411,7 +412,7 @@ def signed_fhir_webhook(
 # ---------------------------------------------------------------------------
 
 def _do_emergency_alert(*, thread_id: str, patient_name: str, red_flags: list[str], session_short: str) -> None:
-    from .settings import get_settings as settings
+
     text = (
         f":rotating_light: *EMERGENCY ESCALATION*\n"
         f"Patient: {patient_name or 'Unknown'}\n"
@@ -443,7 +444,7 @@ def dispatch_emergency_alert(
 
 
 def _do_intake_complete(*, thread_id: str, patient_name: str, risk_level: str, fhir_json: str | None) -> None:
-    from .settings import get_settings as settings
+
     session_short = thread_id[:8]
     text = (
         f":white_check_mark: *Intake Complete — Risk: {risk_level.upper()}*\n"
@@ -486,7 +487,7 @@ def _fmt_partial_identity(identity: dict) -> str:
 
 def _do_crisis_alert(*, thread_id: str, patient_name: str, matched_phrases: list[str],
                      partial_identity: dict | None = None, message_preview: str = "") -> None:
-    from .settings import get_settings as settings
+
     identity_line = (
         patient_name
         if patient_name and patient_name != "unknown patient"
@@ -551,9 +552,8 @@ def retry_exhausted_webhooks() -> int:
     Returns the number of deliveries re-queued.
     """
     from . import sqlite_db as db
-    from .settings import get_settings
 
-    cfg = get_settings().intake
+    cfg = settings().intake
     candidates = db.get_exhausted_webhooks(
         older_than_hours=cfg.dead_letter_retry_after_hours,
         max_lifetime_attempts=cfg.dead_letter_max_lifetime_attempts,
