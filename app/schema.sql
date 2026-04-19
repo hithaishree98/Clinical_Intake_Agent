@@ -171,3 +171,27 @@ CREATE TABLE IF NOT EXISTS prompt_experiments (
 
 CREATE INDEX IF NOT EXISTS idx_experiments_status
 ON prompt_experiments(status, prompt_key);
+
+-- Stable identifier for a person across visits. Derived deterministically
+-- from normalized name + DOB (see sqlite_db.derive_patient_id). A single
+-- patient can have many thread_ids (one per visit).
+ALTER TABLE sessions ADD COLUMN patient_id TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_sessions_patient ON sessions(patient_id);
+CREATE INDEX IF NOT EXISTS idx_reports_patient  ON reports(thread_id);
+
+-- Layer 2 memory: compact structured patient summary.
+-- One row per patient, overwritten on each intake via merge logic.
+-- Raw transcripts and full reports stay in messages/reports tables (Layer 3).
+CREATE TABLE IF NOT EXISTS patient_summary (
+  patient_id            TEXT PRIMARY KEY,
+  identity_json         TEXT NOT NULL DEFAULT '{}',   -- latest known identity
+  allergies_json        TEXT NOT NULL DEFAULT '[]',   -- deduplicated list
+  medications_json      TEXT NOT NULL DEFAULT '[]',   -- currently active meds
+  conditions_json       TEXT NOT NULL DEFAULT '[]',   -- chronic/ongoing PMH
+  recent_complaints_json TEXT NOT NULL DEFAULT '[]',  -- last 5 complaints w/ dates
+  flags_json            TEXT NOT NULL DEFAULT '[]',   -- safety/clinical flags
+  visit_count           INTEGER NOT NULL DEFAULT 0,
+  first_seen_at         TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at            TEXT NOT NULL DEFAULT (datetime('now'))
+);

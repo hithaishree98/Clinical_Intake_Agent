@@ -97,4 +97,7 @@ def analytics_summary(_: None = Depends(require_clinician)):
         ),
         "llm_circuit_state":       _breaker.state,
         "failed_report_jobs":      data["failed_report_jobs_last_7_days"],
+        "llm_cost_today_usd":      data.get("llm_cost_today_usd", 0.0),
+        "repair_rate_last_1h":     data.get("repair_rate_last_1h", 0.0),
+        "repair_rate_alert":       data.get("repair_rate_alert", False),
     }

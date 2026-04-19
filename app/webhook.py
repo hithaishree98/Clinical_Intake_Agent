@@ -472,15 +472,36 @@ def dispatch_intake_complete(
     })
 
 
-def _do_crisis_alert(*, thread_id: str, patient_name: str, matched_phrases: list[str]) -> None:
+def _fmt_partial_identity(identity: dict) -> str:
+    """Best available identity description for staff when name is unknown."""
+    parts = []
+    if (identity.get("name") or "").strip():
+        parts.append(identity["name"])
+    if (identity.get("phone") or "").strip():
+        parts.append(f"phone {identity['phone']}")
+    if (identity.get("dob") or "").strip():
+        parts.append(f"DOB {identity['dob']}")
+    return ", ".join(parts) if parts else "Unknown — crisis occurred before identity was collected"
+
+
+def _do_crisis_alert(*, thread_id: str, patient_name: str, matched_phrases: list[str],
+                     partial_identity: dict | None = None, message_preview: str = "") -> None:
     from .settings import get_settings as settings
-    text = (
-        f":warning: *CRISIS LANGUAGE DETECTED*\n"
-        f"Patient: {patient_name or 'Unknown'}\n"
-        f"Matched: {', '.join(matched_phrases)}\n"
-        f"Session: {thread_id[:8]}"
+    identity_line = (
+        patient_name
+        if patient_name and patient_name != "unknown patient"
+        else _fmt_partial_identity(partial_identity or {})
     )
-    slack_alert(webhook_url=settings().slack_webhook_url, text=text,
+    lines = [
+        ":rotating_light: *CRISIS LANGUAGE DETECTED — IMMEDIATE ATTENTION REQUIRED*",
+        f"Patient: {identity_line}",
+        f"Session: `{thread_id}`",
+    ]
+    if message_preview:
+        lines.append(f'Patient wrote: "{message_preview[:120]}"')
+    lines.append(f"Detected: {', '.join(matched_phrases)}")
+    lines.append("_Open the clinician dashboard to view the full session._")
+    slack_alert(webhook_url=settings().slack_webhook_url, text="\n".join(lines),
                 thread_id=thread_id, event_type="slack_crisis")
 
 
@@ -489,16 +510,22 @@ def dispatch_crisis_alert(
     thread_id: str,
     patient_name: str,
     matched_phrases: list[str],
+    partial_identity: dict | None = None,
+    message_preview: str = "",
 ) -> None:
     """
     Fire crisis Slack alert in a background thread.
 
-    Patient safety: the 988 Lifeline message must reach the patient immediately
+    partial_identity and message_preview are included when identity has not
+    yet been collected — gives staff enough context to act without a name.
+    Patient safety: the 988 Lifeline message reaches the patient immediately
     regardless of Slack latency.
     """
     _dispatch_in_thread(_do_crisis_alert, {
         "thread_id": thread_id, "patient_name": patient_name,
         "matched_phrases": matched_phrases,
+        "partial_identity": partial_identity or {},
+        "message_preview": message_preview,
     })
 
 
