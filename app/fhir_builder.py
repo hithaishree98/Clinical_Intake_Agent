@@ -196,8 +196,13 @@ def validate_fhir_input(state: dict) -> List[str]:
 
 def build_bundle(state: dict) -> dict:
     """Build a FHIR R4 Bundle from a completed intake state dict."""
-    thread_id = state.get("thread_id") or _uid()
-    patient_id = f"patient-{thread_id[:8]}"
+    # Prefer the deterministic patient_id (sha16 of name+dob) so the same
+    # patient gets the same FHIR Patient.id across visits — without this,
+    # the EHR receives a new Patient resource for every intake.
+    patient_id = (state.get("patient_id") or "").strip()
+    if not patient_id:
+        thread_id = state.get("thread_id") or _uid()
+        patient_id = f"patient-{thread_id[:8]}"
 
     entries = [_entry(_patient(patient_id, state.get("identity") or {}))]
 

@@ -1,7 +1,7 @@
 let threadId       = null;
-let sessionToken   = null;   // bearer token issued by /start, required on /chat /report /jobs
+let sessionToken   = null;   // bearer token issued by /start, required on /chat
 let clientMsgId    = 0;
-let clinicianToken = null;
+let currentPhase   = null;   // last known phase from /chat or /start; used by VoiceController
 
 function $(id) { return document.getElementById(id); }
 
@@ -20,6 +20,16 @@ function setTyping(on) {
   $("typing").classList.toggle("hidden", !on);
   $("sendBtn").disabled = on;
   $("msg").disabled     = on;
+  // Mic shares the lock so a fast double-click during /chat or /transcribe
+  // can't queue a second recording — only matters once voice is enabled,
+  // and the optional-chain keeps this safe pre-DOM-ready or in tests.
+  const mic = $("micBtn");
+  if (mic && !mic.classList.contains("hidden")) mic.disabled = on;
+  // Quick-reply buttons share the disabled state of the composer so a fast
+  // double-click can't fire two /chat requests on the same turn.  We toggle
+  // the entire .quick-replies container's children rather than tracking
+  // individual buttons because new ones may be rendered between calls.
+  document.querySelectorAll(".btn-quick-reply").forEach(b => { b.disabled = on; });
 }
 
 function setStatus(state, text) {
@@ -39,13 +49,6 @@ function escHtml(s) {
 const PHASE_ORDER = ["consent","identity","identity_review","subjective","clinical_history","confirm","done"];
 
 function updatePhase(status, phase) {
-  // sidebar
-  const badge = $("sessStatus");
-  badge.textContent = status || "—";
-  badge.className   = "badge " + (status || "");
-
-  $("sidePhase").textContent = (phase || "—").replace(/_/g, " ");
-
   // top phase track
   const steps    = document.querySelectorAll(".phase-step");
   const current  = PHASE_ORDER.indexOf(phase || "");
@@ -71,36 +74,262 @@ function addMsg(role, text, type = "") {
   chat.scrollTop = chat.scrollHeight;
 }
 
-/* ── Report polling ────────────────────────────────────── */
-async function waitForReport(jobId) {
-  while (true) {
-    await new Promise(r => setTimeout(r, 1500));
-    const res = await fetch(`/jobs/${jobId}`, {
-      headers: { "Authorization": `Bearer ${sessionToken}` },
+/* ── Quick-reply buttons ─────────────────────────────────
+   Rendered when the server returns `quick_replies` on consent,
+   identity_review, or confirm turns.  Each button sends a short canonical
+   payload that the server's intent fast-path recognises with zero LLM
+   cost.  Free-text input remains available alongside.
+
+   Buttons are removed once one is clicked or the patient types something
+   so old prompts don't accumulate. */
+function clearQuickReplies() {
+  const existing = $("chat").querySelectorAll(".quick-replies");
+  existing.forEach(el => el.remove());
+}
+
+function renderQuickReplies(replies) {
+  if (!Array.isArray(replies) || replies.length === 0) return;
+  clearQuickReplies();
+  const wrap = document.createElement("div");
+  wrap.className = "quick-replies";
+  replies.forEach(qr => {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "btn-quick-reply";
+    btn.textContent = qr.label;
+    btn.dataset.payload = qr.payload;
+    btn.addEventListener("click", () => {
+      // Behave exactly as if the patient typed and pressed Enter.
+      $("msg").value = qr.payload;
+      sendMsg();
     });
-    const job = await res.json();
-    if (job.status === "done")   { await loadReport(); return; }
-    if (job.status === "failed") {
-      showToast("Report generation failed: " + (job.error || "unknown"), "error");
-      return;
-    }
+    wrap.appendChild(btn);
+  });
+  $("chat").appendChild(wrap);
+  $("chat").scrollTop = $("chat").scrollHeight;
+}
+
+/* ── Voice (Groq Whisper STT + browser TTS) ───────────────
+   Voice is intentionally a thin shell on top of the existing /chat
+   contract.  Audio is captured locally via MediaRecorder, POSTed to
+   /transcribe, the returned text is routed through the same sendMsg()
+   path the keyboard uses.  No new state machine, no new safety layer —
+   every existing /chat guardrail (idempotency, prompt-injection check,
+   PHI masking, cost cap) applies automatically.
+
+   Two safety features specific to voice:
+     1. CONFIRM_PHASES — on identity / clinical_history turns the
+        transcript is shown for review before sending.  Mishearings on
+        names, drug names, and allergies are clinically dangerous; the
+        existing identity_review / validate gates downstream catch the
+        rest, but stopping the bad text upstream is cheaper.
+     2. Hallucination filter on the server returns "" for canned
+        Whisper phrases ("Thanks for watching!", etc.); we treat that
+        as a soft "didn't catch that" and prompt the patient to retry.
+
+   TTS uses the browser's free speechSynthesis — no Groq cost, audio
+   never leaves the device.  Toggle persists in localStorage. */
+
+const VOICE_CONFIRM_PHASES = new Set(["identity", "clinical_history"]);
+let voiceCfg          = { enabled: false, max_seconds: 30 };
+let mediaRecorder     = null;
+let recordedChunks    = [];
+let recordingTimer    = null;
+let recordingStream   = null;
+let ttsEnabled        = localStorage.getItem("tts") === "1";
+
+function voiceSupported() {
+  return !!(navigator.mediaDevices &&
+            navigator.mediaDevices.getUserMedia &&
+            window.MediaRecorder);
+}
+
+function ttsSupported() {
+  return typeof window.speechSynthesis !== "undefined";
+}
+
+async function loadVoiceConfig() {
+  try {
+    const res = await fetch("/voice/config");
+    if (!res.ok) return;
+    voiceCfg = await res.json();
+  } catch { /* leave disabled */ }
+
+  if (voiceCfg.enabled && voiceSupported()) {
+    $("micBtn").classList.remove("hidden");
+  }
+  if (ttsSupported()) {
+    const btn = $("ttsToggleBtn");
+    btn.classList.remove("hidden");
+    btn.setAttribute("aria-pressed", String(ttsEnabled));
   }
 }
 
+function speakReply(text) {
+  if (!ttsEnabled || !ttsSupported() || !text) return;
+  // Cancel any in-flight utterance — overlapping voices on a new turn
+  // is the #1 voice-bot bug.
+  speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(text);
+  u.rate = 1.0;
+  u.pitch = 1.0;
+  speechSynthesis.speak(u);
+}
+
+function toggleTts() {
+  ttsEnabled = !ttsEnabled;
+  localStorage.setItem("tts", ttsEnabled ? "1" : "0");
+  $("ttsToggleBtn").setAttribute("aria-pressed", String(ttsEnabled));
+  if (!ttsEnabled) speechSynthesis.cancel();
+  showToast(ttsEnabled ? "Voice replies on" : "Voice replies off", "info", 1500);
+}
+
+async function startRecording() {
+  if (!threadId)             return showToast("Start a session first.", "info");
+  if (!voiceCfg.enabled)     return;
+  if (mediaRecorder)         return; // already recording
+
+  try {
+    recordingStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch {
+    showToast("Microphone access denied — please type instead.", "error");
+    $("micBtn").disabled = true;
+    return;
+  }
+
+  // Browsers pick a supported codec automatically when mimeType is omitted.
+  // Chrome → webm/opus, Safari → mp4/aac, Firefox → ogg/opus.  All three
+  // are accepted by /transcribe.
+  recordedChunks = [];
+  try {
+    mediaRecorder = new MediaRecorder(recordingStream);
+  } catch {
+    cleanupRecording();
+    showToast("Voice recording not supported in this browser.", "error");
+    return;
+  }
+  mediaRecorder.ondataavailable = e => {
+    if (e.data && e.data.size > 0) recordedChunks.push(e.data);
+  };
+  mediaRecorder.onstop = handleRecordingStopped;
+  mediaRecorder.start();
+
+  $("micBtn").classList.add("recording");
+  // Hard ceiling: stop automatically after max_seconds even if the user
+  // forgets to release the button.  Server enforces the same cap; this
+  // just avoids a wasted round-trip.
+  recordingTimer = setTimeout(() => stopRecording(), voiceCfg.max_seconds * 1000);
+}
+
+function stopRecording() {
+  if (!mediaRecorder) return;
+  try { mediaRecorder.stop(); } catch { /* already stopped */ }
+}
+
+function cleanupRecording() {
+  $("micBtn").classList.remove("recording");
+  if (recordingTimer) { clearTimeout(recordingTimer); recordingTimer = null; }
+  if (recordingStream) {
+    recordingStream.getTracks().forEach(t => t.stop());
+    recordingStream = null;
+  }
+  mediaRecorder = null;
+}
+
+async function handleRecordingStopped() {
+  const chunks = recordedChunks;
+  recordedChunks = [];
+  cleanupRecording();
+
+  if (chunks.length === 0) return;
+  const mime = chunks[0].type || "audio/webm";
+  const blob = new Blob(chunks, { type: mime });
+
+  // Tiny blobs are almost certainly accidental clicks — skip the network
+  // round-trip and tell the patient.  Threshold is generous: a 200ms
+  // clip at 32kbps is ~800 bytes, real speech is several KB minimum.
+  if (blob.size < 1500) {
+    showToast("Recording too short — hold the mic and speak.", "info");
+    return;
+  }
+
+  setTyping(true);
+  try {
+    const fd = new FormData();
+    fd.append("thread_id", threadId);
+    fd.append("audio",     blob, "audio." + (mime.split("/")[1] || "webm").split(";")[0]);
+    const res = await fetch("/transcribe", {
+      method: "POST", body: fd,
+      headers: { "Authorization": `Bearer ${sessionToken}` },
+    });
+    if (!res.ok) {
+      if (res.status === 413)      showToast("Recording too long — try again.", "error");
+      else if (res.status === 415) showToast("Audio format not supported.", "error");
+      else if (res.status === 503) showToast("Voice unavailable — please type.", "error");
+      else                          showToast("Couldn't transcribe — try again.", "error");
+      return;
+    }
+    const j = await res.json();
+    const text = (j.text || "").trim();
+    if (!text) {
+      showToast("Didn't catch that — try again.", "info");
+      return;
+    }
+    routeTranscript(text);
+  } catch {
+    showToast("Voice request failed — please type.", "error");
+  } finally {
+    setTyping(false);
+  }
+}
+
+function routeTranscript(text) {
+  // On clinical-risk phases the patient must review what Whisper heard
+  // before it commits.  Everywhere else the transcript auto-sends — the
+  // existing quick-reply flow + extraction quality retries already
+  // absorb the typical voice errors on those turns.
+  if (VOICE_CONFIRM_PHASES.has(currentPhase || "")) {
+    showVoiceConfirm(text);
+  } else {
+    $("msg").value = text;
+    sendMsg();
+  }
+}
+
+function showVoiceConfirm(text) {
+  $("voiceConfirmText").textContent = text;
+  $("voiceConfirm").classList.remove("hidden");
+}
+
+function hideVoiceConfirm() {
+  $("voiceConfirm").classList.add("hidden");
+  $("voiceConfirmText").textContent = "";
+}
+
+function confirmVoiceSend() {
+  const text = $("voiceConfirmText").textContent.trim();
+  hideVoiceConfirm();
+  if (!text) return;
+  $("msg").value = text;
+  sendMsg();
+}
+
+function editVoiceTranscript() {
+  const text = $("voiceConfirmText").textContent.trim();
+  hideVoiceConfirm();
+  $("msg").value = text;
+  $("msg").focus();
+}
+
 async function loadReport() {
-  if (!threadId) return;
-  const res = await fetch(`/report/${threadId}`, {
-    headers: { "Authorization": `Bearer ${sessionToken}` },
-  });
-  if (!res.ok) { $("report").textContent = "Report not ready yet."; return; }
-  const j    = await res.json();
-  const box  = $("report");
-  box.textContent = j.latest?.report_text || "(empty)";
-  box.classList.add("has-content");
+  // Report is available to clinicians via /clinician/case/{thread_id}.
+  // The patient sees the note inline in the final chat message from report_node.
 }
 
 /* ── Start session ─────────────────────────────────────── */
 async function start() {
+  localStorage.removeItem("threadId");
+  localStorage.removeItem("sessionToken");
   setStatus("", "Starting…");
   $("startBtn").disabled = true;
 
@@ -110,21 +339,26 @@ async function start() {
 
     threadId     = j.thread_id;
     sessionToken = j.session_token;
+    localStorage.setItem("threadId",     threadId);
+    localStorage.setItem("sessionToken", sessionToken);
     clientMsgId  = 0;
 
     $("tid").textContent = threadId.slice(0, 12) + "…";
     $("sessionLabel").classList.remove("hidden");
     $("chat").innerHTML  = "";
-    const box = $("report");
-    box.textContent = "Complete the intake to generate the clinician note.";
-    box.classList.remove("has-content");
 
     $("msg").disabled     = false;
     $("sendBtn").disabled = false;
 
+    currentPhase = j.phase || "identity";
     setStatus("active", "Session active");
-    updatePhase("active", j.phase || "identity");
+    updatePhase("active", currentPhase);
     addMsg("assistant", j.reply);
+    speakReply(j.reply);
+    renderQuickReplies(j.quick_replies);
+    if ($("micBtn") && voiceCfg.enabled && voiceSupported()) {
+      $("micBtn").disabled = false;
+    }
     $("msg").focus();
   } catch {
     setStatus("error", "Failed to start");
@@ -142,6 +376,11 @@ async function sendMsg() {
   if (!msg) return;
 
   input.value = "";
+  // Drop any stale quick-reply buttons or voice-confirm strip from the
+  // previous turn so the patient doesn't see stale options after they've
+  // moved on.
+  clearQuickReplies();
+  hideVoiceConfirm();
   addMsg("user", msg);
   setTyping(true);
   clientMsgId++;
@@ -160,21 +399,31 @@ async function sendMsg() {
     const isEmergency = j.status === "escalated";
 
     addMsg("assistant", j.reply, isEmergency ? "emergency" : "");
+    speakReply(j.reply);
+    renderQuickReplies(j.quick_replies);
+    currentPhase = j.phase;
+    if (j.status === "done" || j.status === "escalated") {
+      localStorage.removeItem("threadId");
+      localStorage.removeItem("sessionToken");
+    }
     updatePhase(j.status, j.phase);
+    if (j.hint) showToast(j.hint, "info", 4000);
 
     if (isEmergency) {
       setStatus("escalated", "Emergency escalation");
       $("msg").disabled     = true;
       $("sendBtn").disabled = true;
+      if ($("micBtn")) $("micBtn").disabled = true;
     } else if (j.status === "error") {
       setStatus("error", "Error");
     } else if (j.phase === "done") {
       setStatus("done", "Intake complete");
+      if ($("micBtn")) $("micBtn").disabled = true;
     } else {
       setStatus("active", "Session active");
     }
 
-    if (j.job_id) waitForReport(j.job_id);
+    if (j.phase === "done") await loadReport();
 
   } catch {
     showToast("Message failed. Please try again.", "error");
@@ -185,101 +434,6 @@ async function sendMsg() {
   }
 }
 
-/* ── Clinician auth ────────────────────────────────────── */
-async function clinicianLogin() {
-  const pwd = $("clinicianPwd").value.trim();
-  if (!pwd) return showToast("Enter the clinician password.", "info");
-
-  const fd = new FormData();
-  fd.append("password", pwd);
-
-  try {
-    const res = await fetch("/clinician/token", { method: "POST", body: fd });
-    if (!res.ok) return showToast("Incorrect password.", "error");
-    const j = await res.json();
-    clinicianToken = j.access_token;
-    $("clinician-login").classList.add("hidden");
-    $("clinician-tools").classList.remove("hidden");
-    showToast("Authenticated as clinician.", "success");
-  } catch {
-    showToast("Login failed.", "error");
-  }
-}
-
-/* ── Pending escalations ───────────────────────────────── */
-async function loadPending() {
-  if (!clinicianToken) return showToast("Log in first.", "info");
-
-  try {
-    const res = await fetch("/clinician/pending", {
-      headers: { "Authorization": `Bearer ${clinicianToken}` }
-    });
-    if (!res.ok) return showToast("Auth failed. Token may have expired.", "error");
-
-    const items = await res.json();
-    const list  = $("escalations-list");
-    list.innerHTML = "";
-
-    if (!Array.isArray(items) || items.length === 0) {
-      list.innerHTML = '<p style="font-family:var(--mono);font-size:11px;color:var(--text-dim);padding:8px 0">No pending escalations.</p>';
-      list.classList.remove("hidden");
-      return;
-    }
-
-    items.forEach(item => {
-      const div = document.createElement("div");
-      div.className = `esc-item ${item.kind || ""}`;
-      div.innerHTML = `
-        <div class="esc-kind">${escHtml(item.kind || "unknown")}</div>
-        <div class="esc-meta">${escHtml((item.thread_id || "").slice(0, 12))}… &middot; ${escHtml(item.created_at || "")}</div>
-      `;
-      div.addEventListener("click", () => {
-        $("escThreadId").value = item.thread_id || "";
-        $("escId").value       = item.esc_id    || "";
-        $("resolve-form").classList.remove("hidden");
-        $("escNote").focus();
-      });
-      list.appendChild(div);
-    });
-
-    list.classList.remove("hidden");
-    showToast(`${items.length} escalation${items.length !== 1 ? "s" : ""} pending.`, "info");
-  } catch {
-    showToast("Failed to load escalations.", "error");
-  }
-}
-
-/* ── Resolve escalation ────────────────────────────────── */
-async function resolveEsc() {
-  if (!clinicianToken) return showToast("Log in first.", "info");
-  const t    = $("escThreadId").value.trim();
-  const e    = $("escId").value.trim();
-  const note = $("escNote").value.trim() || "Resolved";
-  if (!t || !e) return showToast("Select an escalation from the list.", "info");
-
-  const fd = new FormData();
-  fd.append("thread_id",  t);
-  fd.append("esc_id",     e);
-  fd.append("nurse_note", note);
-
-  try {
-    const res = await fetch("/clinician/resolve", {
-      method: "POST", body: fd,
-      headers: { "Authorization": `Bearer ${clinicianToken}` }
-    });
-    const j = await res.json();
-    if (j.ok) {
-      showToast("Escalation resolved.", "success");
-      $("resolve-form").classList.add("hidden");
-      [$("escThreadId"), $("escId"), $("escNote")].forEach(el => el.value = "");
-      await loadPending();
-    } else {
-      showToast("Failed to resolve.", "error");
-    }
-  } catch {
-    showToast("Request failed.", "error");
-  }
-}
 
 /* ── Copy session ID ───────────────────────────────────── */
 async function copyTid() {
@@ -289,66 +443,74 @@ async function copyTid() {
 }
 
 /* ── Demo scenarios ────────────────────────────────────── */
-let _demoScenarios = [];
-
-async function loadDemoScenarios() {
-  try {
-    const res = await fetch("/admin/demo/scenarios");
-    const j   = await res.json();
-    _demoScenarios = j.scenarios || [];
-    renderDemoScenarios();
-  } catch {
-    /* scenarios are optional — silently skip */
-  }
-}
-
-function renderDemoScenarios() {
-  const container = $("demo-scenarios");
-  if (!container || _demoScenarios.length === 0) return;
-
-  container.innerHTML = _demoScenarios.map(s => `
-    <button class="btn-demo-scenario" data-id="${escHtml(s.id)}" title="${escHtml(s.description)}">
-      ${escHtml(s.label)}
-    </button>
-  `).join("");
-
-  container.querySelectorAll(".btn-demo-scenario").forEach(btn => {
-    btn.addEventListener("click", () => runDemoScenario(btn.dataset.id));
-  });
-}
-
-async function runDemoScenario(scenarioId) {
-  const scenario = _demoScenarios.find(s => s.id === scenarioId);
-  if (!scenario) return;
-
-  showToast(`Running demo: ${scenario.label}`, "info", 2000);
-
-  // Start a fresh session first
-  await start();
-  if (!threadId) return;
-
-  // Send each message with a short delay so the UI animates naturally
-  for (const msg of scenario.messages) {
-    await new Promise(r => setTimeout(r, 900));
-    $("msg").value = msg;
-    await sendMsg();
-    // Wait for the typing indicator to clear before next message
-    await new Promise(r => setTimeout(r, 300));
-  }
-}
 
 /* ── Event bindings ────────────────────────────────────── */
 window.addEventListener("DOMContentLoaded", () => {
   $("startBtn").addEventListener("click", start);
   $("sendBtn").addEventListener("click", sendMsg);
   $("msg").addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMsg(); } });
-  $("viewReportBtn").addEventListener("click", loadReport);
-  $("pendingBtn").addEventListener("click", loadPending);
-  $("resolveBtn").addEventListener("click", resolveEsc);
-  $("loginBtn").addEventListener("click", clinicianLogin);
   $("copyTidBtn").addEventListener("click", copyTid);
-  $("clinicianPwd").addEventListener("keydown", e => { if (e.key === "Enter") clinicianLogin(); });
 
-  // Load demo scenarios in the background (no auth required)
-  loadDemoScenarios();
+  // ── Voice wiring ────────────────────────────────────────
+  // Push-to-talk: pointerdown starts, pointerup OR pointerleave stops.
+  // Pointer events cover mouse + touch + pen with one handler set, and
+  // pointerleave catches the case where the user drags off the button
+  // before releasing — without it the recording would run until the
+  // 30s ceiling.
+  const mic = $("micBtn");
+  if (mic) {
+    const begin = e => { e.preventDefault(); startRecording(); };
+    const end   = e => { e.preventDefault(); stopRecording(); };
+    mic.addEventListener("pointerdown",  begin);
+    mic.addEventListener("pointerup",    end);
+    mic.addEventListener("pointerleave", end);
+    mic.addEventListener("pointercancel", end);
+    // Spacebar shortcut for desktop accessibility — only when the
+    // composer input is not focused so we don't intercept normal typing.
+    document.addEventListener("keydown", e => {
+      if (e.code === "Space" && !mic.disabled && document.activeElement !== $("msg")
+          && !mediaRecorder && voiceCfg.enabled) {
+        e.preventDefault(); startRecording();
+      }
+    });
+    document.addEventListener("keyup", e => {
+      if (e.code === "Space" && mediaRecorder) { e.preventDefault(); stopRecording(); }
+    });
+  }
+
+  $("ttsToggleBtn").addEventListener("click", toggleTts);
+  $("vcSendBtn").addEventListener("click",   confirmVoiceSend);
+  $("vcEditBtn").addEventListener("click",   editVoiceTranscript);
+  $("vcCancelBtn").addEventListener("click", hideVoiceConfirm);
+
+  const savedTid   = localStorage.getItem("threadId");
+  const savedToken = localStorage.getItem("sessionToken");
+  if (savedTid && savedToken) {
+    sessionToken = savedToken;
+    threadId     = savedTid;
+    fetch(`/resume/${savedTid}`, {
+      headers: { "Authorization": `Bearer ${savedToken}` },
+    })
+      .then(r => r.ok ? r.json() : Promise.reject(r.status))
+      .then(j => {
+        $("tid").textContent = savedTid.slice(0, 12) + "…";
+        $("sessionLabel").classList.remove("hidden");
+        $("chat").innerHTML = "";
+        $("msg").disabled     = false;
+        $("sendBtn").disabled = false;
+        currentPhase = j.phase || "identity";
+        setStatus("active", "Session resumed");
+        updatePhase("active", currentPhase);
+        addMsg("assistant", j.reply);
+        renderQuickReplies(j.quick_replies);
+      })
+      .catch(() => {
+        localStorage.removeItem("threadId");
+        localStorage.removeItem("sessionToken");
+        sessionToken = null;
+        threadId     = null;
+      });
+  }
+
+  loadVoiceConfig();
 });

@@ -1,29 +1,29 @@
 /* ─── Tokens ─────────────────────────────────────────── */
 :root {
-  --bg:           #0d1117;
-  --bg2:          #161b22;
-  --surface:      #1c2333;
-  --surface2:     #21293b;
-  --border:       #2d3748;
-  --border-light: #3a4a63;
+  --bg:           #f8fafc;
+  --bg2:          #f1f5f9;
+  --surface:      #ffffff;
+  --surface2:     #f8fafc;
+  --border:       #e2e8f0;
+  --border-light: #cbd5e1;
 
-  --text:         #e2e8f0;
-  --text-muted:   #7a8899;
-  --text-dim:     #4a5568;
+  --text:         #0f172a;
+  --text-muted:   #64748b;
+  --text-dim:     #94a3b8;
 
-  --teal:         #00c9b1;
-  --teal-dim:     rgba(0,201,177,0.12);
-  --teal-glow:    rgba(0,201,177,0.25);
+  --teal:         #00a896;
+  --teal-dim:     rgba(0,168,150,0.10);
+  --teal-glow:    rgba(0,168,150,0.22);
 
-  --red:          #ff5c6a;
-  --red-dim:      rgba(255,92,106,0.12);
-  --orange:       #f6ad55;
-  --orange-dim:   rgba(246,173,85,0.12);
-  --blue:         #63b3ed;
-  --blue-dim:     rgba(99,179,237,0.1);
+  --red:          #dc2626;
+  --red-dim:      rgba(220,38,38,0.10);
+  --orange:       #d97706;
+  --orange-dim:   rgba(217,119,6,0.10);
+  --blue:         #2563eb;
+  --blue-dim:     rgba(37,99,235,0.10);
 
-  --user-bubble:  #1a4a7a;
-  --user-border:  #2563a8;
+  --user-bubble:  #dbeafe;
+  --user-border:  #93c5fd;
 
   --font:    'DM Sans', ui-sans-serif, system-ui, sans-serif;
   --mono:    'IBM Plex Mono', ui-monospace, monospace;
@@ -49,8 +49,6 @@ body {
   line-height: 1.55;
   height: 100%;
   min-height: 100vh;
-  /* subtle noise texture */
-  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.75' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.025'/%3E%3C/svg%3E");
 }
 
 /* ─── Layout ──────────────────────────────────────────── */
@@ -66,7 +64,7 @@ body {
 
 .body {
   display: grid;
-  grid-template-columns: 1fr 320px;
+  grid-template-columns: 1fr;
   gap: 14px;
   flex: 1;
   min-height: 0;
@@ -385,13 +383,14 @@ body {
   border: 1px solid var(--border);
   color: var(--text);
   border-top-left-radius: 3px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.06);
 }
 
 /* User bubble */
 .msg.user .bubble {
   background: var(--user-bubble);
   border: 1px solid var(--user-border);
-  color: #dbeafe;
+  color: #1e3a5f;
   border-top-right-radius: 3px;
 }
 
@@ -495,6 +494,80 @@ body {
 }
 .btn-send:hover:not(:disabled) { opacity: 0.85; }
 .btn-send:disabled { opacity: 0.3; cursor: not-allowed; }
+
+/* ─── Mic button ──────────────────────────────────────────
+   Push-to-talk recorder.  Hidden by default — JS reveals it after
+   /voice/config returns enabled=true AND MediaRecorder is supported.
+   When recording, .recording adds a red pulse ring so the patient
+   can tell at a glance that the mic is hot. */
+.btn-mic {
+  width: 40px;
+  height: 40px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: color 0.15s, border-color 0.15s, background 0.15s, box-shadow 0.15s;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.btn-mic:hover:not(:disabled) {
+  border-color: var(--teal);
+  color: var(--teal);
+}
+.btn-mic:disabled { opacity: 0.35; cursor: not-allowed; }
+.btn-mic.recording {
+  border-color: var(--red);
+  color: var(--red);
+  background: var(--red-dim);
+  animation: mic-pulse 1.4s infinite;
+}
+
+@keyframes mic-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(255,92,106,0.5); }
+  50%       { box-shadow: 0 0 0 6px rgba(255,92,106,0); }
+}
+
+/* ─── Voice confirm strip ─────────────────────────────────
+   Surfaces the Whisper transcript on clinical-risk phases (identity,
+   clinical_history) so the patient can fix mishearings before the text
+   is committed to /chat.  Lives between the chat scroll area and the
+   composer so it doesn't shift any existing layout when hidden. */
+.voice-confirm {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  background: var(--bg2);
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+.vc-label {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+.vc-text {
+  flex: 1;
+  min-width: 160px;
+  font-size: 13px;
+  color: var(--text);
+  font-style: italic;
+  word-break: break-word;
+}
+
+/* TTS toggle reveals once a session is active and Web Speech is supported. */
+.icon-btn[aria-pressed="true"] { color: var(--teal); }
 
 /* ─── Sidebar ─────────────────────────────────────────── */
 .sidebar {
@@ -711,6 +784,21 @@ body {
   margin-bottom: 2px;
 }
 
+.case-output {
+  margin-top: 8px;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px;
+  font-family: var(--mono);
+  font-size: 10px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 260px;
+  overflow-y: auto;
+  color: var(--text-dim);
+}
+
 /* ─── Toast ───────────────────────────────────────────── */
 .toast {
   position: fixed;
@@ -752,33 +840,83 @@ body {
 
 .hidden { display: none !important; }
 
-/* ─── Demo scenarios ──────────────────────────────────── */
-.demo-scenarios {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  padding: 10px 18px 0;
-  min-height: 0;
-}
-.demo-scenarios:empty { padding: 0; }
 
-.btn-demo-scenario {
-  font-family: var(--mono);
-  font-size: 10px;
-  font-weight: 500;
-  letter-spacing: 0.04em;
-  padding: 4px 10px;
-  border-radius: 4px;
-  border: 1px solid var(--border-light);
-  background: var(--surface2);
-  color: var(--text-muted);
-  cursor: pointer;
-  white-space: nowrap;
-  transition: border-color 0.15s, color 0.15s;
+/* ─── Quick reply buttons ─────────────────────────────
+   Rendered inline after a binary-gate assistant message (consent,
+   identity_review, confirm).  Sit on the left under the bubble like a
+   mini composer, sized down to make typing still feel like the primary
+   path.  Clicks send the canonical payload — never the label — so the
+   server's intent fast-path matches without an LLM call. */
+.quick-replies {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 18px 12px;
 }
-.btn-demo-scenario:hover {
-  border-color: var(--teal);
+.btn-quick-reply {
+  font-family: var(--font);
+  font-size: 14px;
+  font-weight: 600;
+  padding: 12px 20px;
+  border-radius: var(--radius-sm);
+  border: 2px solid var(--teal);
+  background: var(--teal-dim);
   color: var(--teal);
+  cursor: pointer;
+  width: 100%;
+  text-align: center;
+  transition: background 0.15s, color 0.15s;
+}
+.btn-quick-reply:hover {
+  background: var(--teal);
+  color: #fff;
+}
+.btn-quick-reply:active {
+  transform: translateY(1px);
+}
+.btn-quick-reply:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.btn-quick-reply:disabled:hover {
+  background: var(--teal-dim);
+  color: var(--teal);
+}
+
+/* ─── Responsive — collapse the sidebar below the chat on narrow viewports.
+     The desktop layout is a 1fr/320px grid; on phones / portrait tablets we
+     stack chat (full width) above sidebar (full width) so neither column
+     gets squeezed below readability.  720px is the breakpoint where the
+     320px sidebar starts compressing the chat to ~400px. */
+@media (max-width: 760px) {
+  .layout {
+    height: auto;
+    min-height: 100vh;
+    padding: 12px 12px 16px;
+  }
+  .body {
+    grid-template-columns: 1fr;
+  }
+  .header {
+    flex-wrap: wrap;
+    height: auto;
+    padding: 12px 14px;
+    gap: 10px;
+  }
+  /* Hide the phase track on very narrow screens — it dominates a header
+     that's already stacked from flex-wrap.  Sidebar shows the phase. */
+  .phase-track { display: none; }
+  .header-actions { gap: 8px; flex-wrap: wrap; }
+  .chat { min-height: 50vh; }
+  .composer { gap: 6px; }
+  .msg .bubble { max-width: 88%; }
+  .quick-replies { padding: 6px 12px 4px; }
+}
+
+/* Hide brand mark + "DRAFT" tag on very narrow screens to save horizontal space. */
+@media (max-width: 380px) {
+  .brand-mark { display: none; }
+  .card-tag { display: none; }
 }
 
 /* ─── Dashboard nav link ─────────────────────────────── */

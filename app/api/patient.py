@@ -1,36 +1,25 @@
 """
 patient.py — Patient-facing API endpoints.
-
-Endpoints here require only a session token (issued at /start).
-No clinician JWT is needed, which means the attack surface is limited:
-a patient can only read their own session data.
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import secrets
-import threading
 import time
 import uuid
 
 from fastapi import APIRouter, Depends, Form, Header, HTTPException, Request
-from fastapi.responses import JSONResponse
 
 from .. import sqlite_db as db
 from ..extract import check_prompt_injection
-from ..graph import build_graph
 from ..llm import is_llm_available
-from ..logging_utils import log_event, log_audit, set_trace_id, set_request_id, set_job_id
+from ..logging_utils import log_event, set_trace_id
 from ..settings import get_settings
 from .deps import limiter, require_session_token, require_clinician
 
 router = APIRouter()
 
-
-# ---------------------------------------------------------------------------
-# Helpers shared across patient routes
-# ---------------------------------------------------------------------------
 
 def _issue_session_token() -> str:
     return secrets.token_hex(32)
@@ -38,14 +27,71 @@ def _issue_session_token() -> str:
 
 # Keys excluded from the persisted state snapshot.
 # "messages" is stored separately in the messages table; omitting it keeps
-# the snapshot compact and prevents double-storage of conversation history.
-# New IntakeState fields are persisted automatically — no manual sync needed.
+# the snapshot compact and prevents double-storage of conversation history.r
 _SNAPSHOT_EXCLUDE: frozenset[str] = frozenset({"messages"})
 
 
 def _compact_snapshot(output: dict) -> dict:
     """Persist all state fields except those in _SNAPSHOT_EXCLUDE."""
     return {k: v for k, v in output.items() if k not in _SNAPSHOT_EXCLUDE}
+
+
+def _quick_replies_for_state(output: dict) -> list[dict]:
+    """
+    Return the quick-reply button list appropriate for the current state.
+
+    Why surface buttons:
+      The binary-gate phases (consent, identity_review, confirm) are the
+      single biggest source of avoidable LLM intent-classification calls.
+      A patient who clicks a button doesn't need an LLM to disambiguate
+      "I think so" — they just chose YES or NO.  Free-text typing still
+      works because we always include the input box.
+
+    Where buttons are shown:
+      - consent             — the AI-disclosure agreement gate
+      - identity_review     — confirming or correcting captured identity
+      - confirm             — pre-report summary acknowledgement
+      - validate→confirm    — the confirm summary appears here too because
+                              clinical_history_node returns with phase=validate
+                              while emitting the summary; the next user reply
+                              re-enters the graph at validate_node which
+                              forwards to confirm_node.
+
+    Where buttons are NOT shown:
+      - identity / subjective / clinical_history extraction turns — these
+        are fundamentally free-text (name, dob, symptoms, drug names) and
+        the LLM is doing real value-add extraction.
+    """
+    phase = output.get("current_phase")
+    target = output.get("validation_target_phase")
+
+    if phase == "consent":
+        return [
+            {"label": "Yes, I consent", "payload": "yes"},
+            {"label": "No, decline",    "payload": "no"},
+        ]
+
+    if phase == "identity_review":
+        # When we have a stored EHR record the choice is "keep what's on
+        # file" vs. "use what I just provided" — both routed through the
+        # same yes/no codepath inside identity_review_node.
+        if output.get("stored_identity"):
+            return [
+                {"label": "Keep on file", "payload": "yes"},
+                {"label": "Update",       "payload": "no"},
+            ]
+        return [
+            {"label": "Yes, that's right", "payload": "yes"},
+            {"label": "Fix it",            "payload": "no"},
+        ]
+
+    if phase == "confirm" or (phase == "validate" and target == "confirm"):
+        return [
+            {"label": "Confirm",        "payload": "confirm"},
+            {"label": "Make a change",  "payload": "go back"},
+        ]
+
+    return []
 
 
 def _build_resume_context(phase: str, state_data: dict) -> str:
@@ -68,29 +114,23 @@ def _build_resume_context(phase: str, state_data: dict) -> str:
     return f"Welcome back! {ctx} Let's continue where we left off."
 
 
-def _run_report_job(graph, thread_id: str, job_id: str) -> None:
-    try:
-        set_trace_id(thread_id)
-        set_job_id(job_id)
-        db.update_job(job_id, "running")
-        config = {"configurable": {"thread_id": thread_id}}
-        output = graph.invoke({"messages": []}, config)
-
-        phase = output.get("current_phase")
-        if phase == "handoff" and output.get("human_review_required"):
-            err = "report_blocked_preflight: required fields missing — clinician review required"
-            db.update_job(job_id, "failed", error=err)
-            log_event("report_job_blocked", level="warning",
-                      thread_id=thread_id, job_id=job_id,
-                      safety_score=output.get("safety_score"))
-        else:
-            db.update_job(job_id, "done")
-            log_event("report_job_done", thread_id=thread_id, job_id=job_id)
-
-    except Exception as e:
-        db.update_job(job_id, "failed", error=f"{type(e).__name__}: {str(e)[:300]}")
-        log_event("report_job_failed", level="error",
-                  thread_id=thread_id, job_id=job_id, error=str(e)[:400])
+def _run_report_inline(graph, thread_id: str, config: dict) -> tuple[dict, str | None]:
+    """
+    Finalise the LangGraph state machine synchronously, returning
+    (output, final_reply).  Called directly in the /chat handler when
+    the graph reaches the 'report' phase — no thread pool, no job table.
+    """
+    output = graph.invoke({"messages": []}, config)
+    messages = output.get("messages") or []
+    final_reply: str | None = None
+    if messages and messages[-1].get("role") == "assistant":
+        final_reply = (messages[-1].get("text") or "").strip() or None
+    db.persist_report_turn(
+        thread_id=thread_id,
+        state_snapshot=_compact_snapshot(output),
+        assistant_reply=final_reply,
+    )
+    return output, final_reply
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +139,7 @@ def _run_report_job(graph, thread_id: str, job_id: str) -> None:
 
 @router.post("/start")
 @limiter.limit("10/hour")
-def start_session(request: Request, mode: str = Form("clinic")):
+def start_session(request: Request, mode: str = Form("clinic"), clinic_id: str = Form("default")):
     settings = get_settings()
     thread_id = str(uuid.uuid4())
     set_trace_id(thread_id)
@@ -145,8 +185,8 @@ def start_session(request: Request, mode: str = Form("clinic")):
     }
 
     session_token = _issue_session_token()
-    db.create_session(thread_id, session_token=session_token)
-    log_event("session_started", thread_id=thread_id, mode=initial_state["mode"])
+    db.create_session(thread_id, session_token=session_token, clinic_id=clinic_id)
+    log_event("session_started", thread_id=thread_id, mode=initial_state["mode"], clinic_id=clinic_id)
 
     graph = request.app.state.graph
     t0 = time.time()
@@ -157,22 +197,24 @@ def start_session(request: Request, mode: str = Form("clinic")):
     messages = output.get("messages") or []
     reply = messages[-1]["text"] if messages else "Welcome. Let's begin your intake."
     db.save_message(thread_id, "assistant", reply)
-    return {
-        "thread_id": thread_id,
+    response = {
+        "thread_id":     thread_id,
         "session_token": session_token,
-        "reply": reply,
-        "phase": output.get("current_phase") or "identity",
-        "status": "active",
+        "reply":         reply,
+        "phase": output.get("current_phase") or initial_state["current_phase"],
+        "status":        "active",
     }
+    quick_replies = _quick_replies_for_state(output)
+    if quick_replies:
+        response["quick_replies"] = quick_replies
+    return response
 
 
 @router.get("/resume/{thread_id}")
 @limiter.limit("30/minute")
 def resume_session(request: Request, thread_id: str, authorization: str = Header(default="")):
     require_session_token(thread_id, authorization)
-    sess = db.fetch_one(
-        "SELECT thread_id, status FROM sessions WHERE thread_id=?", (thread_id,)
-    )
+    sess = db.get_session_row(thread_id)
     if not sess:
         raise HTTPException(status_code=404, detail="Session not found.")
     if sess["status"] in ("done", "escalated", "expired"):
@@ -182,12 +224,21 @@ def resume_session(request: Request, thread_id: str, authorization: str = Header
     state_data = ((state_row or {}).get("state") or {})
     phase      = state_data.get("current_phase", "identity")
     resume_msg = _build_resume_context(phase, state_data)
-    return {
+    response = {
         "thread_id": thread_id,
         "status":    sess["status"],
         "phase":     phase,
         "reply":     resume_msg,
     }
+    # returning patient lands on a binary-gate phase (consent / identity_review / confirm) sees the same
+    # one-click choices they would on a fresh /chat turn.  state_data is the
+    # snapshot persisted at the end of the previous turn; it carries the
+    # `validation_target_phase` and `stored_identity` fields _quick_replies_for_state
+    # uses, so no re-derivation is needed.
+    quick_replies = _quick_replies_for_state(state_data)
+    if quick_replies:
+        response["quick_replies"] = quick_replies
+    return response
 
 
 @router.post("/chat")
@@ -227,20 +278,28 @@ def chat(
             )
         return json.loads(prev["response_json"])
 
-    db.expire_stale_sessions(ttl_hours=get_settings().intake.session_ttl_hours)
-
-    sess = db.fetch_one("SELECT thread_id, status FROM sessions WHERE thread_id=?", (thread_id,))
+    # TTL expiry runs in the hourly background loop (see app.main).  The old
+    # 5%-per-chat-turn sweep contended with the chat-write transaction and
+    # was a flaky-test source — non-deterministic UPDATEs between assertion
+    # rounds.  Hourly is plenty for a 4-hour TTL.
+    sess = db.get_session_row(thread_id)
     if not sess:
         raise HTTPException(status_code=404, detail="Session not found. Start a new session first.")
     if sess["status"] == "expired":
         raise HTTPException(status_code=410, detail="Session expired. Please start a new intake.")
+    # A "done" session has already produced a clinician note — further chat
+    # turns would route to END and return a stale default reply.  Surface the
+    # terminal state to the caller instead so the UI can prompt for a new
+    # intake.  Mirrors the /resume behaviour for already-completed sessions.
+    if sess["status"] == "done":
+        raise HTTPException(status_code=410, detail="Session already complete. Please start a new intake.")
 
     set_trace_id(thread_id)
     config = {"configurable": {"thread_id": thread_id}}
-    request_id = str(uuid.uuid4())
-    set_request_id(request_id)
 
-    log_event("chat_received", request_id=request_id, thread_id=thread_id, message_len=len(message))
+    # request_id is set by CorrelationMiddleware and propagates via ContextVar —
+    # log_event picks it up automatically, so we don't generate or pass one here.
+    log_event("chat_received", thread_id=thread_id, message_len=len(message))
 
     try:
         t0 = time.time()
@@ -281,7 +340,8 @@ def chat(
             "SELECT COALESCE("
             "  SUM(CAST(input_tokens AS REAL)/1000000.0*?"
             "    + CAST(output_tokens AS REAL)/1000000.0*?), 0.0"
-            ") AS cost FROM llm_usage WHERE thread_id=?",
+            ") AS cost FROM llm_usage "
+            "WHERE thread_id=? AND provider='gemini'",
             (_pricing.gemini_input_cost_per_million,
              _pricing.gemini_output_cost_per_million,
              thread_id),
@@ -300,19 +360,6 @@ def chat(
                 "phase":  "done",
             }
 
-        # ── Guard 3: In-flight report job — prevents concurrent graph invocations ──
-        active_jobs = [
-            j for j in db.get_jobs_for_thread(thread_id)
-            if j["status"] in ("queued", "running")
-        ]
-        if active_jobs:
-            return {
-                "reply":  "Your intake summary is currently being prepared — you'll receive it shortly!",
-                "status": "active",
-                "phase":  "report_generating",
-                "job_id": active_jobs[0]["job_id"],
-            }
-
         graph = request.app.state.graph
         output = graph.invoke({"messages": [{"role": "user", "text": message}]}, config)
         db.save_session_state(thread_id, _compact_snapshot(output))
@@ -322,13 +369,13 @@ def chat(
             log_event("phase_transition", thread_id=thread_id,
                       from_phase=prev_phase, to_phase=new_phase)
 
-        job_id = None
         phase = output.get("current_phase")
 
+        # When the graph reaches the report phase, run report_node synchronously
+        # in the same request — it completes in ~300ms and returns the final note.
         if phase == "report":
-            job_id = db.create_job(thread_id, "report")
-            t = threading.Thread(target=_run_report_job, args=(graph, thread_id, job_id), daemon=True)
-            t.start()
+            output, _ = _run_report_inline(graph, thread_id, config)
+            phase = output.get("current_phase")
 
         duration_ms = int((time.time() - t0) * 1000)
 
@@ -341,7 +388,7 @@ def chat(
         elif phase == "handoff" or output.get("needs_emergency_review") or triage.get("emergency_flag"):
             status = "escalated"
         else:
-            current = db.fetch_one("SELECT status FROM sessions WHERE thread_id=?", (thread_id,))
+            current = db.get_session_row(thread_id)
             current_status = (current or {}).get("status") or "active"
             status = current_status if current_status in ("done", "escalated", "expired") else "active"
 
@@ -351,9 +398,11 @@ def chat(
         db.set_session_status(thread_id, status)
 
         resp_obj = {"reply": reply, "status": status, "phase": phase}
-        if job_id:
-            resp_obj["job_id"] = job_id
-            resp_obj["phase"] = "report_generating"
+        if output.get("validation_errors"):
+            resp_obj["hint"] = "Gathering a bit more detail before moving on."
+        quick_replies = _quick_replies_for_state(output)
+        if quick_replies:
+            resp_obj["quick_replies"] = quick_replies
 
         db.persist_chat_turn(
             thread_id=thread_id,
@@ -364,112 +413,18 @@ def chat(
             client_msg_id=client_msg_id,
             request_hash=request_hash,
             response_obj=resp_obj,
-            job_id=job_id,
+            job_id=None,
         )
 
-        log_event("chat_done", request_id=request_id, thread_id=thread_id,
+        log_event("chat_done", thread_id=thread_id,
                   duration_ms=duration_ms, phase=phase, status=status)
         return resp_obj
 
     except Exception as e:
-        log_event("chat_error", level="error", request_id=request_id,
+        log_event("chat_error", level="error",
                   thread_id=thread_id, error=str(e)[:400])
         raise HTTPException(status_code=500, detail="Something went wrong. Please try again.")
 
 
-@router.get("/report/{thread_id}")
-@limiter.limit("30/minute")
-def get_report(request: Request, thread_id: str, authorization: str = Header(default="")):
-    require_session_token(thread_id, authorization)
-    sess = db.fetch_one("SELECT thread_id FROM sessions WHERE thread_id=?", (thread_id,))
-    if not sess:
-        raise HTTPException(status_code=404, detail="Session not found.")
-    rep = db.get_latest_report(thread_id)
-    if not rep:
-        raise HTTPException(status_code=404, detail="Report not generated yet.")
-    rep_dict = dict(rep)
-    rep_dict["pending_review"] = bool(rep_dict.get("pending_review", 0))
-    return {"latest": rep_dict}
-
-
-@router.post("/report/{thread_id}/retry")
-@limiter.limit("5/hour")
-def retry_report(
-    request: Request,
-    thread_id: str,
-    _: None = Depends(require_clinician),
-):
-    sess = db.fetch_one("SELECT status FROM sessions WHERE thread_id=?", (thread_id,))
-    if not sess:
-        raise HTTPException(status_code=404, detail="Session not found.")
-
-    jobs = db.get_jobs_for_thread(thread_id)
-    report_jobs = [j for j in jobs if j["kind"] == "report"]
-    in_flight = [j for j in report_jobs if j["status"] in ("queued", "running")]
-    if in_flight:
-        raise HTTPException(
-            status_code=409,
-            detail=f"A report job is already {in_flight[0]['status']}. "
-                   f"Poll /jobs/{in_flight[0]['job_id']} for status.",
-        )
-
-    MAX_ATTEMPTS = get_settings().intake.max_report_attempts
-    if len(report_jobs) >= MAX_ATTEMPTS:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Maximum retry attempts ({MAX_ATTEMPTS}) reached for this thread.",
-        )
-    if not report_jobs or report_jobs[0]["status"] != "failed":
-        raise HTTPException(
-            status_code=409,
-            detail="No failed report job to retry.",
-        )
-
-    import threading
-    attempt = len(report_jobs) + 1
-    job_id = db.create_job(thread_id, "report")
-    graph = request.app.state.graph
-    t = threading.Thread(target=_run_report_job, args=(graph, thread_id, job_id), daemon=True)
-    t.start()
-    log_event("report_retry_queued", thread_id=thread_id, job_id=job_id, attempt=attempt)
-    return {"job_id": job_id, "attempt": attempt, "status": "queued"}
-
-
-@router.get("/jobs/{job_id}")
-@limiter.limit("120/minute")
-def job_status(request: Request, job_id: str, authorization: str = Header(default="")):
-    """
-    Poll report generation progress.
-
-    Requires the session token of the thread that owns the job — prevents
-    a patient from enumerating other patients' job statuses by guessing UUIDs.
-    The job record carries a thread_id; we verify the caller owns that thread
-    before returning any data.
-    """
-    # Fetch job first so we have the thread_id for the ownership check.
-    stale_count = db.mark_stale_jobs_failed(stale_minutes=10)
-    if stale_count:
-        log_event("stale_jobs_expired", level="warning", count=stale_count)
-
-    job = db.get_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found.")
-
-    # Ownership check: the caller must hold the session token for this thread.
-    require_session_token(job["thread_id"], authorization)
-
-    report_available = False
-    if job["status"] == "done":
-        report_available = db.get_latest_report(job["thread_id"]) is not None
-
-    return {
-        "job_id":           job["job_id"],
-        "thread_id":        job["thread_id"],
-        "kind":             job["kind"],
-        "status":           job["status"],
-        "error":            job["error"],
-        "updated_at":       job["updated_at"],
-        "report_available": report_available,
-    }
 
 

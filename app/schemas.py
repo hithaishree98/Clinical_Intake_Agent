@@ -109,24 +109,6 @@ class CrisisScore(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Intake classification
-# ---------------------------------------------------------------------------
-
-_IntakeClass = Literal[
-    "emergency_visit", "routine_checkup", "specialist_referral",
-    "mental_health", "pediatric",
-]
-_Confidence = Literal["high", "medium", "low"]
-
-
-class ClassificationOut(BaseModel):
-    """Feature 1: intake classification result."""
-    intake_classification: _IntakeClass = "routine_checkup"
-    confidence:            _Confidence  = "medium"
-    rationale:             Annotated[str, Field(default="", max_length=200)] = ""
-
-
-# ---------------------------------------------------------------------------
 # Intent classification — replaces hardcoded yes/no keyword lists
 # ---------------------------------------------------------------------------
 
@@ -198,6 +180,20 @@ class IdentityOut(BaseModel):
             return ""
         # Strip ordinal suffixes: "1st" → "1", "13th" → "13", "3rd" → "3"
         cleaned = _re.sub(r"\b(\d{1,2})(st|nd|rd|th)\b", r"\1", raw, flags=_re.IGNORECASE)
+
+        # Refuse genuinely ambiguous numeric dates.  "01/02/1990" could be
+        # 02 Jan (US) or 01 Feb (everywhere else); silently picking m/d
+        # has put wrong DOBs in the EHR.  When both leading numbers are
+        # in [1,12] AND the format is purely numeric, return "" so
+        # identity_node re-asks ("any format works, like '15 March 1985'").
+        # 4-digit-leading (ISO) and any string containing a month name are
+        # unambiguous and pass through.
+        ambig = _re.match(r"^(\d{1,2})[\/\-](\d{1,2})[\/\-]\d{2,4}$", cleaned)
+        if ambig:
+            a, b = int(ambig.group(1)), int(ambig.group(2))
+            if 1 <= a <= 12 and 1 <= b <= 12 and a != b:
+                return ""
+
         for fmt in _DATE_FORMATS:
             try:
                 return datetime.strptime(cleaned, fmt).strftime("%Y-%m-%d")
@@ -217,7 +213,52 @@ class IdentityOut(BaseModel):
     @classmethod
     def _strip_address(cls, v: object) -> str:
         raw = (str(v) if v else "").strip()
-        return "" if raw.lower() in ("unknown", "n/a", "none", "not provided", "not given") else raw
+        if not raw or raw.lower() in ("unknown", "n/a", "none", "not provided", "not given"):
+            return ""
+        # Require a 5-digit zip code as a proxy for a complete address.
+        # Addresses missing a zip (street only, city+state only) are returned
+        # as "" so identity_node re-asks for the full address.
+        if not _re.search(r"\b\d{5}(-\d{4})?\b", raw):
+            return ""
+        return raw
+
+
+# ---------------------------------------------------------------------------
+# Generic clinical list extraction (allergies, PMH, recent results)
+# ---------------------------------------------------------------------------
+
+class ListExtractOut(BaseModel):
+    """
+    Structured extraction of a list of short clinical items from a patient
+    free-text turn.  Used for allergies, past medical history, and
+    recent_results — fields that previously used a naive regex split on
+    "," / ";" / "and" and corrupted multi-clause sentences like
+    "yes I'm allergic to peanuts and pollen".
+
+    The LLM prompt configures the *kind* of list (allergy / condition / lab
+    result), but the schema is shared so one call site handles all three.
+
+    items_complete = True   → caller advances to the next clinical step
+    items_complete = False  → caller stays on this step and asks the question
+                              in `reply` (already capped + safety-checked).
+    """
+    items: List[Annotated[str, Field(max_length=200)]]            = Field(default_factory=list)
+    items_complete: bool                                          = True
+    reply: Annotated[str, Field(default="", max_length=400)]      = ""
+
+    @model_validator(mode="after")
+    def _strip_blanks_and_cap(self) -> "ListExtractOut":
+        """Drop empty entries, dedup by case-insensitive match, cap to 30."""
+        seen: set[str] = set()
+        cleaned: List[str] = []
+        for it in self.items:
+            v = (it or "").strip()
+            k = v.lower()
+            if v and k not in seen:
+                seen.add(k)
+                cleaned.append(v)
+        self.items = cleaned[:30]
+        return self
 
 
 # ---------------------------------------------------------------------------

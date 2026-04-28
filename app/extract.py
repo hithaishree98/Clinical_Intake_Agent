@@ -3,9 +3,12 @@ import threading
 import time
 from typing import Dict, List
 
-ACKS = {"ok", "okay", "k", "sure", "alright", "fine", "done", "got it", "sounds good", "thanks", "thank you"}
-YES  = {"yes", "y", "yeah", "yep", "correct", "right", "sounds right", "that's right"}
-NO   = {"no", "n", "nope", "nah", "not really", "not sure"}
+# Note: is_yes / is_no / is_ack and the YES / NO / ACKS token sets used to
+# live here.  They were superseded by app.intent (parse_quick_reply,
+# is_bare_acknowledgment) which provides exact-token matching without the
+# prefix-based footgun that misclassified "yes I have chest pain" and
+# "ok I have penicillin allergy" as bare acknowledgments and discarded
+# the substantive content.  Use app.intent for any new intent checks.
 
 # Default phrases used when the DB table is empty or hasn't been seeded yet.
 DEFAULT_EMERGENCY_PHRASES = [
@@ -22,65 +25,36 @@ DEFAULT_EMERGENCY_PHRASES = [
 ]
 
 
+# Common contractions expanded before tokenisation so the negation token set
+# (no/not/denies/...) sees "not" inside "haven't", "doesn't", etc.  Without
+# this expansion "haven't had chest pain in years" slipped past the negation
+# guard and fired a false-positive emergency escalation.
+_CONTRACTIONS_RE = re.compile(
+    r"\b(haven|hadn|doesn|don|didn|isn|wasn|aren|weren|won|wouldn|couldn|shouldn|can)['’]?t\b",
+    re.IGNORECASE,
+)
+_CONTRACTION_EXPANSIONS = {
+    "haven": "have not", "hadn": "had not",   "doesn": "does not",
+    "don":   "do not",   "didn": "did not",   "isn":   "is not",
+    "wasn":  "was not",  "aren": "are not",   "weren": "were not",
+    "won":   "will not", "wouldn": "would not", "couldn": "could not",
+    "shouldn": "should not", "can": "can not",
+}
+
+
+def _expand_contractions(text: str) -> str:
+    return _CONTRACTIONS_RE.sub(
+        lambda m: _CONTRACTION_EXPANSIONS[m.group(1).lower()],
+        text,
+    )
+
+
 def _norm(text: str) -> str:
     t = (text or "").strip().lower()
+    t = _expand_contractions(t)
     t = re.sub(r"[\.!\?:\;,\(\)\[\]\{\}]+", " ", t)
     t = re.sub(r"\s+", " ", t).strip()
     return t
-
-
-def normalize_phone(s: str) -> str:
-    return re.sub(r"\D+", "", s or "")
-
-
-def is_yes(text: str) -> bool:
-    t = _norm(text)
-    return t in YES or t.startswith("yes ")
-
-
-def is_no(text: str) -> bool:
-    t = _norm(text)
-    return t in NO or t.startswith("no ")
-
-
-def is_ack(text: str) -> bool:
-    t = _norm(text)
-    if t in ACKS:
-        return True
-    for a in ACKS:
-        if t.startswith(a + " "):
-            return True
-    return False
-
-
-def extract_identity_deterministic(text: str) -> Dict[str, str]:
-    """
-    Regex-based identity extraction. Used by evals to benchmark deterministic
-    accuracy against the LLM-based IdentityOut path. Not called in production —
-    identity_node uses run_json_step(schema=IdentityOut) instead.
-    """
-    t = (text or "").strip()
-    out = {"name": "", "phone": "", "address": "", "dob": ""}
-
-    # DOB: MM/DD/YYYY or YYYY-MM-DD
-    dob_match = re.search(r"\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\b", t)
-    if not dob_match:
-        dob_match = re.search(r"\b(\d{4}[\/\-]\d{1,2}[\/\-]\d{1,2})\b", t)
-    if dob_match:
-        out["dob"] = dob_match.group(1)
-
-    phone_match = re.search(r"(\+?\d[\d\-\s\(\)]{6,}\d)", t)
-    if phone_match:
-        out["phone"] = phone_match.group(1)
-
-    if any(k in t.lower() for k in [" st", " street", " ave", " avenue", " rd", " road", " blvd", " lane", " ln", " dr", " drive"]):
-        out["address"] = t
-
-    if len(t.split()) in (2, 3) and not out["address"] and not out["phone"]:
-        if all(re.match(r"^[A-Za-z\-\']+$", w) for w in t.split()):
-            out["name"] = t
-
-    return out
 
 
 _phrases_cache: List[str] = []
@@ -116,6 +90,19 @@ def detect_emergency_red_flags(chief_complaint: str, opqrst: Dict[str, str], fre
 
     NEGATIONS = {"no", "not", "denies", "deny", "without", "never"}
     HISTORICAL = {"history of", "previously", "years ago", "year ago", "months ago", "month ago", "last year", "in the past"}
+    # Resolution markers: when one of these appears AFTER the matched phrase,
+    # the patient is describing a symptom that has already gone away.  Without
+    # this guard "chest pain has stopped", "chest pain resolved an hour ago",
+    # "chest pain is gone now" all triggered an emergency escalation because
+    # the existing negation check only inspects the LEFT window of the phrase.
+    RESOLVED = {"resolved", "stopped", "gone", "ended", "passed",
+                "subsided", "subsiding", "resolving"}
+    # Reactivation markers cancel a RESOLVED hit: "chest pain stopped but it's
+    # back now" should still fire the emergency.  False negatives here are far
+    # worse than false positives — a patient with active chest pain who got
+    # missed is a patient-safety incident.  When in doubt we let the flag fire
+    # and the clinician triages.
+    REACTIVATION = {"but", "again", "back", "returned", "recurred", "recurring"}
 
     toks = blob.split()
 
@@ -138,6 +125,14 @@ def detect_emergency_red_flags(chief_complaint: str, opqrst: Dict[str, str], fre
                 if any(h in neighborhood for h in HISTORICAL):
                     return False
 
+                # Symptom-resolution language in the right window: the patient
+                # is describing a past episode, not a current emergency — UNLESS
+                # the same window also contains reactivation language ("but it's
+                # back", "started again"), in which case the symptom is current
+                # and we let the flag fire.
+                if any(w in right for w in RESOLVED) and not any(w in right for w in REACTIVATION):
+                    return False
+
                 return True
         return False
 
@@ -150,132 +145,13 @@ def detect_emergency_red_flags(chief_complaint: str, opqrst: Dict[str, str], fre
     return flags
 
 
-# ---------------------------------------------------------------------------
-# Drug / allergy synonym normalization
-# Maps common brand names and lay terms to their generic equivalents.
-# "Tylenol" → "acetaminophen", "blood thinner" → "warfarin" etc.
-# Add entries here as they surface in production — no redeploy needed for
-# this dict since it ships with the code (not DB-backed intentionally: it
-# affects clinical note content and should be code-reviewed before changes).
-# ---------------------------------------------------------------------------
-
-_DRUG_SYNONYMS: dict[str, str] = {
-    # OTC brand → generic
-    "tylenol":           "acetaminophen",
-    "advil":             "ibuprofen",
-    "motrin":            "ibuprofen",
-    "aleve":             "naproxen",
-    "benadryl":          "diphenhydramine",
-    "pepcid":            "famotidine",
-    "prilosec":          "omeprazole",
-    "nexium":            "esomeprazole",
-    "claritin":          "loratadine",
-    "zyrtec":            "cetirizine",
-    "allegra":           "fexofenadine",
-    "sudafed":           "pseudoephedrine",
-    "mucinex":           "guaifenesin",
-    "robitussin":        "guaifenesin",
-    "zantac":            "ranitidine",
-    "tagamet":           "cimetidine",
-    "mylanta":           "aluminum hydroxide/magnesium hydroxide",
-    "tums":              "calcium carbonate",
-    # Rx brand → generic
-    "lipitor":           "atorvastatin",
-    "zocor":             "simvastatin",
-    "crestor":           "rosuvastatin",
-    "norvasc":           "amlodipine",
-    "zestril":           "lisinopril",
-    "prinivil":          "lisinopril",
-    "altace":            "ramipril",
-    "toprol":            "metoprolol",
-    "lopressor":         "metoprolol",
-    "coreg":             "carvedilol",
-    "lasix":             "furosemide",
-    "glucophage":        "metformin",
-    "januvia":           "sitagliptin",
-    "lantus":            "insulin glargine",
-    "humalog":           "insulin lispro",
-    "novolog":           "insulin aspart",
-    "synthroid":         "levothyroxine",
-    "coumadin":          "warfarin",
-    "eliquis":           "apixaban",
-    "xarelto":           "rivaroxaban",
-    "pradaxa":           "dabigatran",
-    "plavix":            "clopidogrel",
-    "zithromax":         "azithromycin",
-    "amoxil":            "amoxicillin",
-    "augmentin":         "amoxicillin-clavulanate",
-    "cipro":             "ciprofloxacin",
-    "levaquin":          "levofloxacin",
-    "diflucan":          "fluconazole",
-    "valtrex":           "valacyclovir",
-    "prozac":            "fluoxetine",
-    "zoloft":            "sertraline",
-    "lexapro":           "escitalopram",
-    "celexa":            "citalopram",
-    "wellbutrin":        "bupropion",
-    "cymbalta":          "duloxetine",
-    "effexor":           "venlafaxine",
-    "abilify":           "aripiprazole",
-    "seroquel":          "quetiapine",
-    "risperdal":         "risperidone",
-    "xanax":             "alprazolam",
-    "ativan":            "lorazepam",
-    "klonopin":          "clonazepam",
-    "ambien":            "zolpidem",
-    "neurontin":         "gabapentin",
-    "lyrica":            "pregabalin",
-    "topamax":           "topiramate",
-    "depakote":          "valproate",
-    "tegretol":          "carbamazepine",
-    "singulair":         "montelukast",
-    "spiriva":           "tiotropium",
-    "symbicort":         "budesonide/formoterol",
-    "advair":            "fluticasone/salmeterol",
-    "flovent":           "fluticasone",
-    "ventolin":          "albuterol",
-    "proventil":         "albuterol",
-    # Lay terms → generic
-    "blood thinner":     "warfarin",
-    "blood thinners":    "anticoagulant",
-    "water pill":        "furosemide",
-    "water pills":       "diuretic",
-    "sugar pill":        "placebo",
-    "heart pill":        "cardiac medication",
-    "cholesterol pill":  "statin",
-    "cholesterol pills": "statin",
-    "thyroid pill":      "levothyroxine",
-    "thyroid pills":     "levothyroxine",
-    "sleeping pill":     "sedative/hypnotic",
-    "sleeping pills":    "sedative/hypnotic",
-    "pain pill":         "analgesic",
-    "pain pills":        "analgesic",
-    "nerve pill":        "anxiolytic",
-    "nerve pills":       "anxiolytic",
-    "inhaler":           "bronchodilator inhaler",
-    "puffer":            "bronchodilator inhaler",
-    "epi pen":           "epinephrine auto-injector",
-    "epipen":            "epinephrine auto-injector",
-}
-
-
 def normalize_drug_name(name: str) -> str:
-    """
-    Map a brand name or lay term to its generic equivalent.
+    """Return the patient-supplied drug name unchanged.
 
-    Matching is case-insensitive and whole-word so "Tylenol PM" is caught by
-    the "tylenol" key.  The original term is kept in parentheses when a
-    substitution is made so the clinician can see what the patient actually said.
-    Returns the original string unchanged when no synonym matches.
+    RxNorm canonicalisation is planned for production (swap in RxCUI lookup
+    when a real customer requires EHR drug-interaction matching).
     """
-    key = (name or "").strip().lower()
-    if key in _DRUG_SYNONYMS:
-        return f"{_DRUG_SYNONYMS[key]} ({name.strip()})"
-    # Partial prefix match: "Tylenol PM" contains "tylenol"
-    for synonym, generic in _DRUG_SYNONYMS.items():
-        if key.startswith(synonym) or synonym in key:
-            return f"{generic} ({name.strip()})"
-    return name.strip()
+    return (name or "").strip()
 
 
 # Phrases that mean "nothing to report" — shared across allergies, PMH, meds, results.
@@ -492,8 +368,6 @@ def llm_crisis_score(text: str) -> "CrisisScore":
 
 # ---------------------------------------------------------------------------
 # Consent helpers
-# Why here: is_consent_accepted / is_consent_declined are the same kind of
-# thing as is_yes / is_no / is_ack already in this file.
 # ---------------------------------------------------------------------------
 
 CONSENT_MESSAGE = (
@@ -504,36 +378,11 @@ CONSENT_MESSAGE = (
 )
 
 
-def is_consent_accepted(text: str) -> bool:
-    t = (text or "").strip().lower()
-    return t in {"yes", "y", "yeah", "yep", "ok", "okay", "sure", "i agree", "agree", "consent"}
-
-
-def is_consent_declined(text: str) -> bool:
-    t = (text or "").strip().lower()
-    return t in {"no", "n", "nope", "nah", "decline", "i decline", "cancel", "stop"}
-
-
 # ---------------------------------------------------------------------------
-# Phone and DOB validation
-# Why here: normalize_phone already lives here. validate_dob extends
-# extract_identity_deterministic which is also here. Same family.
+# DOB validation
 # ---------------------------------------------------------------------------
 
 from datetime import datetime, date as _date
-
-
-def validate_phone(raw: str):
-    """
-    Returns (cleaned_10_digits, error_str). error_str="" means ok.
-    Strips formatting, handles +1 country code.
-    """
-    digits = re.sub(r"\D", "", raw or "")
-    if len(digits) == 11 and digits.startswith("1"):
-        digits = digits[1:]
-    if len(digits) != 10:
-        return "", "Phone number must be 10 digits (US format). Example: 412-555-0199"
-    return digits, ""
 
 
 def validate_dob(raw: str):

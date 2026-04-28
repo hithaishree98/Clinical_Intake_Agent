@@ -6,10 +6,10 @@ Run with:
 
 Architecture:
     Each concern lives in its own router module under app/api/:
-      patient.py   — patient-facing intake flow (/start, /chat, /report, /jobs)
-      clinician.py — clinician-gated workflow (/clinician/*, /experiments)
-      admin.py     — operational tooling (/admin/emergency-phrases, /demo/*)
-      health.py    — observability (/health, /ready, /analytics)
+      patient.py   — patient-facing intake flow (/start, /chat, /resume)
+      clinician.py — clinician-gated workflow (/clinician/token, /pending, /resolve, /case/*, /report/*/fhir)
+      admin.py     — operational tooling (/admin/emergency-phrases, /demo/*, /analytics, /webhooks, /experiments)
+      health.py    — observability (/health, /ready, /analytics/summary)
 
     Shared dependencies (rate limiter, auth guards) live in app/api/deps.py
     so every router imports from one place instead of re-declaring them.
@@ -35,8 +35,9 @@ from .api.patient import router as patient_router
 from .api.clinician import router as clinician_router
 from .api.admin import router as admin_router
 from .api.health import router as health_router
+from .api.voice import router as voice_router
 from .graph import build_graph
-from .llm import get_gemini
+from .llm import get_provider
 from .logging_utils import log_event, set_request_id
 from .settings import get_settings
 
@@ -103,7 +104,7 @@ async def lifespan(app: FastAPI):
         db.seed_emergency_phrases(DEFAULT_EMERGENCY_PHRASES)
 
     if not settings.debug_mode:
-        get_gemini().validate()
+        get_provider().validate()
 
     app.state.graph = build_graph()
 
@@ -122,9 +123,12 @@ async def lifespan(app: FastAPI):
     if requeued:
         log_event("dead_letter_requeued_on_startup", count=requeued)
 
-    # Hourly background task: keeps trying exhausted webhooks without waiting
-    # for a process restart.  Uses asyncio so no extra thread or process needed.
-    async def _dead_letter_loop():
+    # Hourly background loop: dead-letter recovery + stale-job sweep.
+    # Both used to be triggered inline (dead_letter on startup only,
+    # stale-jobs on every /jobs poll); the loop centralises the cadence so
+    # neither contends with request-path writes and ops can grep one log
+    # for periodic-housekeeping events.
+    async def _hourly_background_loop():
         while True:
             await asyncio.sleep(3600)  # 1 hour
             try:
@@ -133,8 +137,22 @@ async def lifespan(app: FastAPI):
                     log_event("dead_letter_requeued_hourly", count=n)
             except Exception as exc:
                 log_event("dead_letter_loop_error", level="warning", error=str(exc)[:200])
+            try:
+                stale = db.mark_stale_jobs_failed(stale_minutes=10)
+                if stale:
+                    log_event("stale_jobs_expired_hourly", level="warning", count=stale)
+            except Exception as exc:
+                log_event("stale_jobs_loop_error", level="warning", error=str(exc)[:200])
+            try:
+                expired_sessions = db.expire_stale_sessions(
+                    ttl_hours=settings.intake.session_ttl_hours,
+                )
+                if expired_sessions:
+                    log_event("sessions_expired_hourly", count=expired_sessions)
+            except Exception as exc:
+                log_event("session_expiry_loop_error", level="warning", error=str(exc)[:200])
 
-    task = asyncio.create_task(_dead_letter_loop())
+    task = asyncio.create_task(_hourly_background_loop())
 
     yield
 
@@ -176,10 +194,15 @@ def create_app() -> FastAPI:
     def dashboard():
         return (STATIC_DIR / "dashboard.html").read_text(encoding="utf-8")
 
+    @app.get("/admin", response_class=HTMLResponse)
+    def admin_page():
+        return (STATIC_DIR / "admin.html").read_text(encoding="utf-8")
+
     app.include_router(patient_router)
     app.include_router(clinician_router)
     app.include_router(admin_router)
     app.include_router(health_router)
+    app.include_router(voice_router)
     return app
 
 

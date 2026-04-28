@@ -14,7 +14,7 @@ on:
     paths:
       - "app/prompts.py"
       - "app/nodes.py"
-      - "app/llm.py"
+      - "app/llm/**"
       - "app/agentic.py"
       - "app/extract.py"
       - "app/safety.py"

@@ -71,23 +71,22 @@ def _temp_eval_env():
         settings     = get_settings()
         orig_app_db  = settings.app_db_path
         orig_ckpt_db = settings.checkpoint_db_path
-        orig_conn    = db._db_conn
 
         settings.app_db_path        = app_db
         settings.checkpoint_db_path = ckpt_db
-        db._db_conn = None  # force conn() to open the new file
 
+        # close_all_connections() drops every per-thread connection still
+        # pointing at the previous app_db_path, so the next db.conn() call
+        # opens against the new tempfile.  This replaces the old single-
+        # global-connection swap (`db._db_conn = None`) that worked before
+        # sqlite_db was refactored to per-thread connections.
+        db.close_all_connections()
         db.init_schema()
 
         try:
             yield settings
         finally:
-            if db._db_conn is not None:
-                try:
-                    db._db_conn.close()
-                except Exception:
-                    pass
-            db._db_conn             = orig_conn
+            db.close_all_connections()
             settings.app_db_path        = orig_app_db
             settings.checkpoint_db_path = orig_ckpt_db
 

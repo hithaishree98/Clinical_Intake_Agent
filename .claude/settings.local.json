@@ -8,7 +8,17 @@
       "WebSearch",
       "Bash(python -m pytest:*)",
       "Bash(pip install:*)",
-      "Bash(docker build:*)"
+      "Bash(docker build:*)",
+      "Bash(python -m evals.run_evals)",
+      "Bash(head -80 \"d:\\\\git\\\\hospital_assistant_v2 \\(1\\)\\\\hospital_assistant\\\\static\\\\index.html\")",
+      "Bash(python -c ' *)",
+      "Bash(python -c \"from app.settings import get_settings; s = get_settings\\(\\); print\\('groq_api_key set?:', bool\\(s.groq_api_key\\)\\); print\\('voice_enabled:', s.voice_enabled\\); print\\('model:', s.intake.groq_stt_model\\); print\\('max_bytes:', s.intake.transcribe_max_bytes\\); print\\('max_seconds:', s.intake.transcribe_max_seconds\\)\")",
+      "Bash(python -c \"from app.transcription import is_likely_hallucination as f; print\\(f\\('Thanks for watching!'\\), f\\('please subscribe to my channel'\\), f\\('I have a headache'\\), f\\(''\\), f\\('   '\\)\\)\")",
+      "Bash(python -c \"from app.main import create_app; app = create_app\\(\\); routes = [r.path for r in app.routes if hasattr\\(r, 'path'\\)]; print\\('/transcribe' in routes\\); print\\([r for r in routes if 'transcribe' in r]\\)\")",
+      "Bash(python -c \"from app.main import create_app; app = create_app\\(\\); routes = [r.path for r in app.routes if hasattr\\(r, 'path'\\)]; print\\('/transcribe registered:', '/transcribe' in routes\\)\")",
+      "Bash(node -e \"const fs=require\\('fs'\\); const src=fs.readFileSync\\('static/app.js','utf8'\\); try { new Function\\(src\\); console.log\\('OK: app.js parses, length=' + src.length\\); } catch\\(e\\) { console.error\\('PARSE ERROR:', e.message\\); process.exit\\(1\\); }\")",
+      "Bash(python -c \"from app.main import create_app; app = create_app\\(\\); routes = [r.path for r in app.routes if hasattr\\(r, 'path'\\)]; print\\('voice routes:', [r for r in routes if 'voice' in r or 'transcribe' in r]\\)\")",
+      "Bash(docker compose *)"
     ]
   }
 }

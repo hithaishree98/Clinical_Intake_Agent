@@ -18,29 +18,79 @@ from typing import Dict, List
 # Clinical history question tuning by intake classification
 # ---------------------------------------------------------------------------
 
+# Keys: (step, classification). Missing key → caller uses the static default.
+# Steps: allergies | meds | pmh | results
+# Classifications: emergency | routine_checkup | specialist | mental_health | pediatric
+_ADAPTED_QUESTIONS: dict[tuple[str, str], str] = {
+    # ── Emergency — brevity and urgency throughout ────────────────────────
+    ("allergies", "emergency"): (
+        "Any allergies to medications, foods, or anything else? A quick list is fine."
+    ),
+    ("meds", "emergency"): (
+        "What medications are you currently taking? Name and dose — a quick list is fine. "
+        "If none, just say 'none'."
+    ),
+    ("pmh", "emergency"): (
+        "Any major medical conditions, surgeries, or prior hospitalizations we should know about? "
+        "If none, just say 'none'."
+    ),
+    ("results", "emergency"): (
+        "Any recent labs, imaging, or procedures in the past few months? "
+        "If none, just say 'none'."
+    ),
+
+    # ── Specialist — precision over completeness ──────────────────────────
+    ("meds", "specialist"): (
+        "What medications are you currently taking, including any prescribed by other providers? "
+        "Please include the name, dose, and frequency. If none, just say 'none'."
+    ),
+    ("results", "specialist"): (
+        "Have you had any relevant labs, imaging, or specialist reports related to this visit? "
+        "Please include the date and type if you can. If none, just say 'none'."
+    ),
+
+    # ── Mental health — all four steps need clinical sensitivity ──────────
+    ("meds", "mental_health"): (
+        "What medications are you currently taking? Please include any psychiatric medications, "
+        "supplements, or substances — name, dose, and how often. If none, just say 'none'."
+    ),
+    ("pmh", "mental_health"): (
+        "Thank you for sharing. Do you have any past medical conditions, surgeries, "
+        "or prior mental health diagnoses or treatments I should know about? "
+        "If none, just say 'none'."
+    ),
+    ("results", "mental_health"): (
+        "Have you had any recent lab tests, imaging, or psychiatric evaluations "
+        "since your last visit? If none, just say 'none'."
+    ),
+
+    # ── Pediatric — all four steps are parent-addressed ───────────────────
+    ("allergies", "pediatric"): (
+        "Does the patient have any known allergies — medications, foods, latex, or environmental? "
+        "Include dye or contrast allergies if known. If none, just say 'none'."
+    ),
+    ("meds", "pediatric"): (
+        "What medications or vitamins is the patient currently taking? "
+        "Please include the name, dose, how often, and when last taken — "
+        "including any children's vitamins or OTC medications. If none, just say 'none'."
+    ),
+    ("pmh", "pediatric"): (
+        "Does the patient have any prior medical conditions, surgeries, or developmental concerns "
+        "I should know about? If none, just say 'none'."
+    ),
+    ("results", "pediatric"): (
+        "Have there been any recent lab tests, imaging, or specialist visits for the patient? "
+        "If none, just say 'none'."
+    ),
+}
+
+
 def adapt_clinical_question(step: str, classification: str) -> str:
     """
     Return a classification-adapted clinical history question for `step`,
     or "" to fall back to the static default question.
     """
-    if step == "meds" and classification == "pediatric":
-        return (
-            "What medications or vitamins is the patient currently taking? "
-            "Please include the name, dose, how often, and when last taken — "
-            "including any children's vitamins or OTC medications. If none, just say 'none'."
-        )
-    if step == "pmh" and classification == "mental_health":
-        return (
-            "Thank you for sharing. Do you have any past medical conditions, surgeries, "
-            "or prior mental health diagnoses or treatments I should know about? "
-            "If none, just say 'none'."
-        )
-    if step == "results" and classification == "mental_health":
-        return (
-            "Have you had any recent lab tests, imaging, or psychiatric evaluations "
-            "since your last visit? If none, just say 'none'."
-        )
-    return ""
+    return _ADAPTED_QUESTIONS.get((step, classification), "")
 
 
 # ---------------------------------------------------------------------------

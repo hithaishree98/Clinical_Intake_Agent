@@ -2,18 +2,17 @@
 """
 run_evals.py — Evaluation harness for the clinical intake system.
 
-Measures eleven dimensions:
-  1. Identity extraction accuracy
-  2. Emergency detection recall/precision
-  3. Crisis detection recall/precision (morphological variants included)
-  4. OPQRST field completeness + never-invent rate          [LLM]
-  5. Invalid JSON / fallback / repair rate                  [LLM]
-  6. Unsafe / diagnosis-language response filter accuracy
-  7. Extended unsafe-output: FP/FN taxonomy
-  8. Human-review safety score threshold (SafetyChecker unit tests)
-  9. Validate-gate completeness guard (validate_node edge cases)
- 10. FHIR input validation: validate_fhir_input + build_bundle resource counts
- 11. Report content: _validate_report_content structural + safety checks
+Measures ten dimensions:
+  1. Emergency detection recall/precision
+  2. Crisis detection recall/precision (morphological variants included)
+  3. OPQRST field completeness + never-invent rate          [LLM]
+  4. Invalid JSON / fallback / repair rate                  [LLM]
+  5. Unsafe / diagnosis-language response filter accuracy
+  6. Extended unsafe-output: FP/FN taxonomy
+  7. Human-review safety score threshold (SafetyChecker unit tests)
+  8. Validate-gate completeness guard (validate_node edge cases)
+  9. FHIR input validation: validate_fhir_input + build_bundle resource counts
+ 10. Report content: _validate_report_content structural + safety checks
 
 Usage:
   # From project root:
@@ -115,96 +114,6 @@ def _pct(n: float) -> str:
 # ---------------------------------------------------------------------------
 # Category runners
 # ---------------------------------------------------------------------------
-
-def run_identity_evals(cases: list, verbose: bool) -> Tuple[CategoryMetrics, List[CaseResult]]:
-    from app.extract import extract_identity_deterministic, validate_dob, validate_phone
-
-    metrics = CategoryMetrics(category="identity_extraction", total=len(cases))
-    results = []
-
-    for c in cases:
-        cid    = c["id"]
-        label  = c["label"]
-        inp    = c.get("input", "")
-        exp    = c.get("expected", {})
-        passed = True
-        details: Dict[str, Any] = {}
-
-        try:
-            det = extract_identity_deterministic(inp)
-
-            # Name check
-            if exp.get("name") is not None:
-                got = (det.get("name") or "").strip()
-                exp_name = exp["name"].strip()
-                ok = got == exp_name
-                details["name_match"] = ok
-                details["name_got"] = got
-                details["name_expected"] = exp_name
-                if not ok:
-                    passed = False
-
-            # DOB extraction check
-            if exp.get("dob") is not None:
-                got = (det.get("dob") or "").strip()
-                ok = bool(got)
-                details["dob_extracted"] = ok
-                details["dob_got"] = got
-                if not ok:
-                    passed = False
-
-            # DOB validation check
-            dob_valid_exp = exp.get("dob_valid")
-            if dob_valid_exp is not None:
-                raw_dob = (det.get("dob") or "").strip()
-                if not raw_dob:
-                    # No DOB extracted — treat as failed if we expected valid
-                    details["dob_validation"] = "not_extracted"
-                    if dob_valid_exp:
-                        passed = False
-                else:
-                    _, err = validate_dob(raw_dob)
-                    validated = err == ""
-                    details["dob_validation"] = "ok" if validated else f"error: {err}"
-                    if validated != dob_valid_exp:
-                        passed = False
-
-            # Phone validation check
-            phone_valid_exp = exp.get("phone_valid")
-            if phone_valid_exp is not None:
-                raw_phone = c.get("expected", {}).get("phone_input_override") or c.get("input", "")
-                _, err = validate_phone(raw_phone)
-                validated = err == ""
-                details["phone_validation"] = "ok" if validated else f"error: {err}"
-                if validated != phone_valid_exp:
-                    passed = False
-
-            # Address check
-            has_addr_exp = exp.get("has_address")
-            if has_addr_exp is not None:
-                got_addr = bool((det.get("address") or "").strip())
-                details["has_address"] = got_addr
-                if got_addr != has_addr_exp:
-                    passed = False
-
-            # Empty input check
-            if c.get("expected_empty"):
-                all_empty = all(not v for v in det.values())
-                details["all_empty"] = all_empty
-                if not all_empty:
-                    passed = False
-
-        except Exception as e:
-            passed = False
-            details["exception"] = str(e)
-
-        if passed:
-            metrics.passed += 1
-        results.append(CaseResult(id=cid, category="identity_extraction",
-                                   label=label, passed=passed, details=details,
-                                   notes=c.get("notes", "")))
-    return metrics, results
-
 
 def run_binary_detection_evals(
     category: str,
@@ -1035,11 +944,7 @@ def main():
         print(f"  Running {cat} ({len(cases)} cases)...", flush=True)
 
         try:
-            if cat == "identity_extraction":
-                from app.extract import extract_identity_deterministic  # noqa: F401
-                m, r = run_identity_evals(cases, args.verbose)
-
-            elif cat == "emergency_detection":
+            if cat == "emergency_detection":
                 from app.extract import detect_emergency_red_flags
                 m, r = run_binary_detection_evals(cat, cases, detect_emergency_red_flags, args.verbose)
 

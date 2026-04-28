@@ -4,18 +4,7 @@ fhir_client.py — Direct FHIR R4 server integration.
 Supports any FHIR R4-compliant server (HAPI FHIR, Azure Health Data Services,
 Google Cloud Healthcare API, Epic sandbox).
 
-Usage
-─────
 Configure FHIR_SERVER_URL in .env to point at your server:
-
-    # Local HAPI FHIR (docker-compose)
-    FHIR_SERVER_URL=http://hapi-fhir:8080/fhir
-
-    # Azure Health Data Services
-    FHIR_SERVER_URL=https://<workspace>.fhir.azurehealthcareapis.com
-
-    # Google Cloud Healthcare API
-    FHIR_SERVER_URL=https://healthcare.googleapis.com/v1/projects/<proj>/locations/<loc>/datasets/<ds>/fhirStores/<store>/fhir
 
 The client sends a FHIR Transaction Bundle (type=transaction) so all resources
 are created atomically.  Each resource gets a PUT with a conditional-create URL
@@ -85,7 +74,8 @@ def push_bundle(fhir_bundle_json: str, thread_id: str) -> dict[str, Any]:
     the patient-facing intake flow.  The original bundle is always saved to the
     local DB regardless of FHIR server availability.
     """
-    url = getattr(settings, "fhir_server_url", "")
+    cfg = settings()
+    url = cfg.fhir_server_url or ""
     if not url:
         return {"ok": False, "status": 0, "response": {}, "error": "FHIR_SERVER_URL not configured"}
 
@@ -102,7 +92,7 @@ def push_bundle(fhir_bundle_json: str, thread_id: str) -> dict[str, Any]:
         "X-Thread-Id":  thread_id,
     }
     # Optional bearer token for authenticated FHIR servers
-    bearer = getattr(settings, "fhir_server_bearer_token", "")
+    bearer = cfg.fhir_server_bearer_token or ""
     if bearer:
         headers["Authorization"] = f"Bearer {bearer}"
 

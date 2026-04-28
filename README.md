@@ -1,151 +1,173 @@
-# Clinical AI Workflow
+# Clinical AI Intake
 
-A state-machine-driven conversational agent that guides patients through structured clinical intake, extracts information from natural language, triages urgency, and outputs a clinician note and FHIR R4 health record.
+A conversational intake agent for clinical settings. The patient types or speaks, the system collects their identity, symptoms, allergies, medications, and history through natural conversation, triages urgency in real time, and outputs a clinician note + FHIR R4 bundle.
 
-Built on a core principle: LLM handles language, state machine handles control.
+> **Demo**: _add 30–60s screen recording — chest pain emergency → escalation → clinician dashboard → FHIR bundle_
 
-The AI extracts what patients say. It cannot skip phases, override clinical logic, or advance the workflow without deterministic validation at every step.
+## Problem
 
-## Problem Context
+Clinical intake today is a paper form or a dropdown tablet. Neither produces structured output an EHR can actually ingest, and neither can detect mid-conversation that a patient is describing a cardiac event.
 
-Most clinical intake today is a paper form or a dropdown-based tablet app. Both share the same flaw: patients don't speak in structured fields.
+I wanted to fix that but not by just handing everything to an LLM. An LLM alone will skip allergies, mark intake complete while required fields are missing, and treat an escalation as a routine follow-up. In healthcare those aren't acceptable failure modes. So the architecture is specifically designed to prevent them: the LLM handles language understanding and extraction. A fixed state machine controls flow, phase transitions, and safety checks.
 
-A patient says "it's been hurting on and off since Tuesday, worse when I breathe in." A dropdown gives them "chest pain: yes/no." Information gets lost, fields are left blank, and clinicians spend time reformatting notes. And a static form can't detect mid-conversation that a patient is describing a medical emergency and flag it immediately.
+## Architecture Overview
 
-This project bridges that gap by converting natural patient language into structured clinical documentation while continuously monitoring for urgency, without forcing patients to adapt to the system.
-
-## Why this approach
-
-In a clinical setting, an LLM alone cannot be allowed to decide what to ask, when intake is complete, or whether something is serious. A model might skip allergies, treat escalations as routine, or mark intake complete while key fields are missing. In healthcare, these are not acceptable failure modes.
-
-The architecture of this system is specifically designed to prevent those failure modes. The LLM handles language understanding and extracting structure from natural text.
-
-Everything else — what to ask, what order, what constitutes an emergency, when to escalate — is deterministic code.
-
-## What it does
-
-- Full conversational intake covering identity, chief complaint, OPQRST symptom assessment, allergies, medications, past medical history, and recent labs.
-- A centralised `guard_node` runs crisis detection before every single business node. If a patient mentions self-harm in any phase, they get the 988 Lifeline response regardless of how far along they are. Identity is never a prerequisite for a safety response.
-- Two-tier crisis detection: keyword/regex fires first at zero latency; a second LLM classifier handles soft distress signals ("I can't take it anymore") that don't match exact phrases.
-- Two-tier intent classification replaces hardcoded yes/no word lists. Exact matches are free. Ambiguous short messages ("I think so", "not really") go to a lightweight LLM call (max_tokens=40, temperature=0.0).
-- LLM-based identity extraction with Pydantic schema validators: name normalised to Title Case, DOB to ISO 8601 from any format including "March 3rd 1992", phone to 10 digits stripping +1.
-- Emergency detection that runs in the subjective node. If a patient mentions chest pain or a seizure, they get immediate escalation regardless of what else they said. Emergency phrases are stored in the database; clinicians can add or remove them without a redeploy.
-- Patients confirm AI-assisted intake before any data is collected.
-- Identity verification against an EHR record. Returning patients get a warm acknowledgment with their details on file. Discrepancies are flagged for nurse review.
-- Layer-2 patient memory (`app/memory.py`): after each completed intake, allergies and chronic conditions are unioned into a cross-visit summary, medications are replaced with the current list, and the last five chief complaints are kept. On the next visit, this context is injected into LLM prompts so the model doesn't ask a returning patient with known penicillin allergy to list their allergies from scratch.
-- `None` vs `[]` sentinel distinction: clinical fields start as `None` (not yet asked) rather than `[]` (asked, none reported), so lookahead skipping works correctly when patients volunteer information early.
-- If the server goes down mid-intake, the patient resumes exactly where they left off, with a context-aware summary of what was collected.
-- Three guards in `/chat` before any graph invocation: circuit breaker open, max session turns reached (30), active report job already running.
-- All tunable knobs in `IntakeConfig`: quality thresholds, cost caps, LLM pricing constants, identity max attempts, session TTL. A single place to A/B test or adjust operational parameters without grepping the codebase.
-- Generates a structured clinician note and a FHIR R4 Bundle. Both are shown in the chat on completion and sent to the clinician team.
-- Operations dashboard at `/dashboard` showing session KPIs, escalation breakdown, LLM health, circuit breaker state, and API cost — auto-refreshes every 30 seconds.
-- Clinician portal for reviewing and resolving escalations.
-- Slack notifications for emergencies, crisis language (includes what the patient typed and whatever identity was collected), and completed intakes. FHIR Bundle posted via HMAC-signed webhook on completion.
-- Dead-letter webhook recovery: exhausted deliveries are re-queued on startup and hourly so a transient downstream outage doesn't drop records permanently.
-- Database schema versioned with Alembic. Every schema change is a migration file with an `upgrade()` and `downgrade()`. CI runs `alembic upgrade head` before deploy so schema drift between environments is impossible.
-
-## How it works
+I used LangGraph to build a fixed state machine, each phase of intake is a separate node with a single job. The LLM runs inside each node but has no control over flow, phase transitions, or safety checks. Those are all code.
 
 ```
+Browser / Voice
+    ↓
+FastAPI — rate limiting · authentication · input validation
+         · cost cap · circuit breaker
+    ↓
+LangGraph state machine — checkpointed to SQLite after every node
+    ├── guard_node — crisis + emergency screen, runs before every node
+    ├── consent → identity → identity_review → subjective
+          → clinical_history → confirm → report
+    └── handoff_node — reached on crisis or emergency; directs to 988 or 911
+    ↓
+SQLite — app.db (sessions, reports, escalations, LLM usage, webhooks, patient memory)
+       — checkpoints.db (LangGraph graph state, kept separate)
+    ↓ background threads
+Slack alerts · HMAC-signed FHIR webhook
+```
+
+## Flow
+
 Patient opens the app and clicks New Session
          ↓
-guard_node (runs before every step below)
-  Two-tier crisis detection on every message
-  Keyword/regex Tier 1 → immediate 988 Lifeline response
-  Soft distress Tier 2 → LLM classifier confirms or clears
+guard_node — runs on every message, regardless of which phase intake is in
+  Crisis detection: keyword/regex first, LLM only if inconclusive
+  Emergency detection: phrase list with negation and context guards
+  If crisis detected → 988 Lifeline message, session ends
+  If emergency detected → 911/ER message, clinician notified via Slack, session ends
+  Otherwise → continues to the current phase
          ↓
 Consent
   Patient is shown an AI disclosure before any data is collected
-  Must explicitly agree to continue — declining ends the session
-  Two-tier intent classification: "I suppose" → LLM → confirm
+  Must explicitly agree to continue, declining ends the session
          ↓
 Identity
-  LLM extraction with schema-level normalisation (IdentityOut)
-  Name → Title Case, DOB → ISO 8601, phone → 10 digits
-  Name looked up in EHR
-    Returning patient → warm acknowledgment with details on file
-    New patient → confirms details before continuing
-    Discrepancy → escalated for nurse review
+  The patient provides 4 fields: name, DOB, phone, address
+  LLM extracts and normalises into a typed schema (IdentityOut)
+  Name looked up in database to detect returning patients
          ↓
-Symptom collection (subjective)
-  Emergency check on every message (before LLM)
-  LLM extracts chief complaint + full OPQRST in one call
+Identity review
+  Returning patient: system shows details on file, patient confirms or requests update
+    Update → identity_review escalation created, session continues with patient's version
+    Keep → stored info used, no escalation
+  New patient: system reads back what it extracted, patient confirms or corrects
+    Correction → routes back to Identity to re-collect
+         ↓
+Subjective
+  LLM extracts chief complaint + full OPQRST
   Also classifies intake type: emergency/routine/specialist/mental health/pediatric
-  Quality gate: score < threshold → deterministic gap-fill question, up to 2 retries
+  Quality gate: if OPQRST completeness below threshold (0.75 ED / 0.60 clinic), retries up to 2 times with a deterministic gap-fill question
          ↓
-Validation gate (silent node)
+Validation gate (transparent — runs without pausing the patient)
   Checks required fields before allowing phase transitions
-  Fails gracefully with targeted patient-facing messages
          ↓
 Clinical history
-  Lookahead: if patient volunteered allergies/meds/PMH earlier, those steps skip
-  Allergies → Medications → Past medical history → Recent labs
-  Questions adapt to intake classification (pediatric meds ask differently)
-  Dosage follow-up: asks once with a warm phrasing, accepts "I don't know" on second attempt
+  Collects Allergies → Medications → Past medical history → Recent labs
+  Questions adapt to intake classification (pediatric/spealist/mental health meds ask differently)
+  Dosage follow-up: asks with warm phrasing; accepts no answer on second attempt and moves on
          ↓
 Confirm
-  Natural-language paragraph summary — not a raw data table
-  Patient can correct any section; system routes back to that phase
+  Natural-language paragraph summary of everything collected
+  Patient can correct any section — type "I need to change my allergies" and the system
+  routes back to that step without losing other collected data
   Must explicitly confirm before proceeding
          ↓
 Report generation
-  Safety preflight: blocks if chief complaint, name, or clinical history missing
   LLM generates plain text clinician note
   FHIR R4 Bundle built from the same validated state
-  Full report shown directly in chat (not just "click here")
+  Full report shown directly in chat
   Both saved to database
   Slack notification sent to clinician channel
   FHIR Bundle posted to configured webhook URL (HMAC-signed)
   FHIR Bundle pushed directly to HAPI/Azure/Epic if FHIR_SERVER_URL is set
          ↓
 Clinician receives complete note in the portal
-```
 
-## Setup
 
-Docker and Docker Compose installed on your machine.
+Clinician opens the portal
+  Go to /dashboard and enter the clinician password in the auth bar at the top, then click Auth to load case notes
+  Click View Escalations to see all flagged cases
+  Click an escalation to populate the resolve form, add a nurse note, and click Resolve
 
-Set these variables in `.env` (copy from `.env.example`):
-- `GEMINI_API_KEY`
-- `JWT_SECRET`
-- `CLINICIAN_PASSWORD`
-- `SLACK_WEBHOOK_URL` (optional)
 
-```
+## Technical decisions 
+
+**Guard node runs before every node, not just at entry.**
+Crisis and emergency detection aren't a filter at the front door. Guard_node is wired into the graph so it runs before consent, identity, subjective, history — every step. Once a session is flagged it stays flagged; all subsequent messages return the safety response immediately regardless of which phase intake is in.
+
+**Two-tier crisis detection to keep LLM calls cheap.**
+The first pass is keyword/regex — handles obvious cases at zero cost. The LLM only comes in when the first pass finds nothing but soft distress signals are present (hopelessness, burden language, passive ideation). Same pattern for intent classification.
+
+**Three levels of LLM degradation so the session never crashes.**
+Primary call → Pydantic validation. If that fails but the model responded, a repair call sends the exact validation error back to the model in a "REPAIR REQUIRED" prompt. If that also fails, a hardcoded fallback dict. The patient always gets a response.
+
+**OPQRST completeness is scored deterministically, not by the LLM.**
+Each field has a weight (chief complaint 0.25, onset 0.20, severity 0.20, etc). Score below 0.75 for ED or 0.60 for clinic and the system asks a targeted gap-fill question — no LLM involved. After two failed quality checks it switches to an "I have X, still need Y" summary so the patient isn't stuck in a loop.
+
+**Circuit breaker on the LLM so load spikes don't cascade.**
+After 5 consecutive failures the circuit opens and /chat returns 503 without spending a token. After 60 seconds it half-opens and lets one probe through. A successful probe closes it; a failure resets the timer.
+
+**Correction routing to specific fields, not just sections.**
+If a patient says "I want to change my medications", they go directly to the medications step, not the top of clinical history. The system recognizes section-level corrections via regex across identity, symptom, and history sub-fields, and routes back to the right step without losing anything else collected.
+
+**Safety preflight before report generation.**
+Before generating a clinician note, a weighted scoring pass runs over the session state. Hard blocks — missing chief complaint, incomplete clinical history — prevent the report from being written entirely and create an escalation record so the clinician knows why. Review signals (active emergency, identity mismatch, low extraction quality) raise the score and can flag the case for mandatory clinician review.
+
+**Cross-visit memory with field-level merge rules.**
+Allergies and conditions union across visits. Medications replace each visit. Last five chief complaints kept as a rolling list. Crisis flags are never dropped. On the next visit this summary is injected into prompts so returning patients aren't re-asked things the system already knows.
+
+**Session resumption after restart.**
+LangGraph checkpoints the full graph state to SQLite after every node. If the server restarts mid-intake, the next request with the same thread_id picks up from exactly the interrupted node — the patient doesn't start over. This works as long as checkpoints.db is on a persistent volume, which is why it's kept separate from app.db rather than bundled together.
+
+**Prompt caching via Gemini's CachedContent API — infrastructure built, not yet active.**
+The infrastructure is there — cache registry, TTL, hash invalidation on prompt changes, fallback to inline if creation fails. What's not active yet: Gemini requires a 2,048-token minimum and none of the current prompts clear it. In future if we add more examples  that activates caching on the node that runs most often.
+
+**Outbound webhook idempotency via payload hash.**
+A SHA-256 hash of the payload is used as an idempotency key for outbound FHIR webhooks so the same notification is never delivered twice. Failed deliveries retry with exponential backoff; exhausted deliveries go to a dead-letter table for manual replay.
+
+**Voice hallucination filter on Whisper output.**
+Whisper occasionally hallucinates YouTube caption phrases ("thanks for watching", "[music]") on silent or low-audio clips. These are filtered out before the transcript reaches the chat pipeline, and the patient gets a "didn't catch that" prompt instead.
+
+**Medication name spelling correction.**
+The LLM silently corrects common misspellings ("lisonopril" → "lisinopril", "metfornim" → "metformin"). Unrecognizable names trigger a re-prompt rather than storing garbage in the record.
+
+## Quick start
+
+Requires Docker and Docker Compose.
+
+Copy `.env.example` → `.env` and fill in:
+
+| Variable | Required | Notes |
+|---|---|---|
+| `GEMINI_API_KEY` | Yes | |
+| `JWT_SECRET` | Yes | any strong random string |
+| `CLINICIAN_PASSWORD` | Yes | for dashboard auth |
+| `SLACK_WEBHOOK_URL` | No | Slack alerts on escalations |
+| `GROQ_API_KEY` | Voice only | Whisper transcription |
+
+```sh
 docker compose up --build
 ```
 
-The app starts at `http://localhost:8000`. A HAPI FHIR R4 reference server starts at `http://localhost:8080` (takes ~90 seconds to boot the first time).
+- App: http://localhost:8000
+- HAPI FHIR server: http://localhost:8080 (takes ~90s on first boot)
+- Clinician dashboard: `/dashboard` → enter clinician password → click Auth
+- Admin panel: linked from dashboard
 
-## Using the app
+## Data
 
-**As a patient:**
+- **app.db** (SQLite WAL): sessions, messages, reports, escalations, LLM usage, webhooks, patient memory
+- **checkpoints.db**: LangGraph conversation state — this is what enables session resumption after a server restart
+- **Dead-letter table**: exhausted webhook deliveries stored here for manual replay
 
-- Click New Session
-- Read the AI disclosure and type yes to begin
-- Answer the agent's questions naturally — no need to worry about formatting
-- If you need to correct something, say so and the agent routes back to that section
-- Review the full summary at the end and confirm
-- The clinician note appears in the chat and is sent to the care team
-
-**As a clinician:**
-
-- Open `http://localhost:8000/dashboard` for the operations dashboard
-- Enter your password in the Clinician Access section of the patient UI sidebar and click Auth to load case notes
-- Click View Escalations to see all flagged cases
-- Click an escalation to populate the resolve form, add a nurse note, and click Resolve
-
-**Admin API (all require clinician token):**
-
-- `GET /analytics` — operational metrics for the last 7 days including LLM cost
-- `GET /analytics/summary` — dashboard summary (KPIs only)
-- `POST /demo/reset` — wipes session data and re-seeds mock EHR patients
-- `GET /admin/emergency-phrases` — lists active emergency phrases
-- `POST /admin/emergency-phrases` — adds a new phrase, takes effect within 60 seconds
-- `DELETE /admin/emergency-phrases` — removes a phrase
-- `GET /clinician/webhooks` — outbound webhook delivery log
-- `GET /clinician/case/{thread_id}` — full session detail: transcript, escalations, safety score
+All log events run through a PHI redaction pass before writing to stdout — names, DOBs, and phone numbers are replaced with `[REDACTED]` before any log aggregation sees them.
 
 ## Tech stack
 
-FastAPI · LangGraph · Pydantic v2 · Google Gemini 2.5 Flash Lite (google-genai) · SQLite WAL · Alembic · FHIR R4 · JWT · HMAC-SHA256 · Docker · pytest · slowapi · bandit · pip-audit · Slack · Chart.js
+FastAPI · LangGraph · Pydantic v2 · Google Gemini API · SQLite WAL · FHIR R4 · JWT · HMAC-SHA256 · Docker · pytest · slowapi · bandit · pip-audit · Slack · Chart.js

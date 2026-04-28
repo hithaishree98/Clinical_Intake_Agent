@@ -19,6 +19,9 @@ venv/
 htmlcov/
 .coverage
 
+# Load test artifacts — locustfile is committed, results are local-only
+loadtest/results/
+
 # OS
 .DS_Store
 Thumbs.db

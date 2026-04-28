@@ -1,18 +1,17 @@
 """
 cases.py — Synthetic evaluation dataset for the clinical intake system.
 
-157 cases across 11 categories:
-  1. identity_extraction    (20)  — extract_identity_deterministic + validate_dob/phone
-  2. emergency_detection    (22)  — detect_emergency_red_flags
-  3. crisis_detection       (15)  — detect_crisis (includes morphological variant tests)
-  4. opqrst_extraction      (15)  — run_json_step + subjective_extract_system   [LLM]
-  5. llm_reliability        (5)   — run_json_step meta: fallback_used, repair_used [LLM]
-  6. response_safety        (10)  — validate_llm_response (diagnosis language filter)
-  7. unsafe_output          (14)  — extended filter tests, FP/FN taxonomy
-  8. human_review_threshold (12)  — SafetyChecker.compute() against synthetic states
-  9. validate_gate          (9)   — validate_node completeness gate, edge cases
- 10. fhir_input_validation  (16)  — fhir_builder.validate_fhir_input + build_bundle resource counts
- 11. report_content         (9)   — _validate_report_content structural + safety checks
+137 cases across 10 categories:
+  1. emergency_detection    (22)  — detect_emergency_red_flags
+  2. crisis_detection       (15)  — detect_crisis (includes morphological variant tests)
+  3. opqrst_extraction      (15)  — run_json_step + subjective_extract_system   [LLM]
+  4. llm_reliability        (5)   — run_json_step meta: fallback_used, repair_used [LLM]
+  5. response_safety        (10)  — validate_llm_response (diagnosis language filter)
+  6. unsafe_output          (14)  — extended filter tests, FP/FN taxonomy
+  7. human_review_threshold (12)  — SafetyChecker.compute() against synthetic states
+  8. validate_gate          (9)   — validate_node completeness gate, edge cases
+  9. fhir_input_validation  (16)  — fhir_builder.validate_fhir_input + build_bundle resource counts
+ 10. report_content         (9)   — _validate_report_content structural + safety checks
 
 Each case is a dict with:
   id           unique string identifier
@@ -23,156 +22,7 @@ LLM cases require GEMINI_API_KEY and are skipped when --llm is not passed.
 """
 
 # ---------------------------------------------------------------------------
-# 1. Identity extraction  (20 cases)
-# ---------------------------------------------------------------------------
-# Tests extract_identity_deterministic(text) → {name, dob, phone, address}
-# and validate_dob / validate_phone on the extracted values.
-#
-# Convention for `expected`:
-#   name        expected name string, or None to skip name check
-#   dob         expected raw dob string from regex (before validate_dob), or None
-#   phone       expected raw phone string from regex, or None
-#   has_address True/False — whether address was extracted (full value is messy)
-#   dob_valid   None=skip, True=validate_dob should succeed, False=should error
-#   phone_valid None=skip, True=validate_phone should succeed, False=should error
-
-IDENTITY_CASES = [
-    {
-        "id": "id_001",
-        "label": "Two-word name only",
-        "input": "Sarah Johnson",
-        "expected": {"name": "Sarah Johnson", "dob": None, "phone": None, "has_address": False},
-    },
-    {
-        "id": "id_002",
-        "label": "Three-word name only",
-        "input": "James Earl Carter",
-        "expected": {"name": "James Earl Carter", "dob": None, "phone": None, "has_address": False},
-    },
-    {
-        "id": "id_003",
-        "label": "Hyphenated surname",
-        "input": "Maria Lopez-Gonzalez",
-        "expected": {"name": "Maria Lopez-Gonzalez", "dob": None, "phone": None, "has_address": False},
-    },
-    {
-        "id": "id_004",
-        "label": "Name with apostrophe",
-        "input": "Patrick O'Brien",
-        "expected": {"name": "Patrick O'Brien", "dob": None, "phone": None, "has_address": False},
-    },
-    {
-        "id": "id_005",
-        "label": "MM/DD/YYYY date of birth",
-        "input": "04/15/1985",
-        "expected": {"name": None, "dob": "04/15/1985", "phone": None, "has_address": False,
-                     "dob_valid": True},
-    },
-    {
-        "id": "id_006",
-        "label": "YYYY-MM-DD date of birth",
-        "input": "1985-04-15",
-        "expected": {"name": None, "dob": "1985-04-15", "phone": None, "has_address": False,
-                     "dob_valid": True},
-    },
-    {
-        "id": "id_007",
-        "label": "MM-DD-YYYY date of birth",
-        "input": "04-15-1985",
-        "expected": {"name": None, "dob": "04-15-1985", "phone": None, "has_address": False,
-                     "dob_valid": True},
-    },
-    {
-        "id": "id_008",
-        "label": "Phone with dashes",
-        "input": "555-867-5309",
-        "expected": {"name": None, "dob": None, "phone": "555-867-5309", "has_address": False,
-                     "phone_valid": True},
-    },
-    {
-        "id": "id_009",
-        "label": "Phone with country code +1",
-        "input": "+1-555-867-5309",
-        "expected": {"name": None, "dob": None, "phone": "+1-555-867-5309", "has_address": False,
-                     "phone_valid": True},
-    },
-    {
-        "id": "id_010",
-        "label": "Phone with parentheses",
-        "input": "(555) 867-5309",
-        "expected": {"name": None, "dob": None, "phone": None, "has_address": False,
-                     "phone_valid": True,
-                     "phone_input_override": "(555) 867-5309"},
-    },
-    {
-        "id": "id_011",
-        "label": "Address with Street",
-        "input": "123 Oak Street, Springfield",
-        "expected": {"name": None, "dob": None, "phone": None, "has_address": True},
-    },
-    {
-        "id": "id_012",
-        "label": "Address with Avenue",
-        "input": "456 Fifth Avenue",
-        "expected": {"name": None, "dob": None, "phone": None, "has_address": True},
-    },
-    {
-        "id": "id_013",
-        "label": "DOB embedded in sentence",
-        "input": "My date of birth is 03/22/1968",
-        "expected": {"name": None, "dob": "03/22/1968", "phone": None, "has_address": False,
-                     "dob_valid": True},
-    },
-    {
-        "id": "id_014",
-        "label": "Empty input",
-        "input": "",
-        "expected": {"name": None, "dob": None, "phone": None, "has_address": False},
-        "expected_empty": True,
-    },
-    {
-        "id": "id_015",
-        "label": "Future DOB — should fail validation",
-        "input": "01/01/2045",
-        "expected": {"dob": "01/01/2045", "dob_valid": False},
-    },
-    {
-        "id": "id_016",
-        "label": "Impossible DOB (>130 years ago) — should fail validation",
-        "input": "01/01/1850",
-        "expected": {"dob": "01/01/1850", "dob_valid": False},
-    },
-    {
-        "id": "id_017",
-        "label": "Phone too short — should fail validation",
-        "input": "555-1234",
-        "expected": {"phone_valid": False, "phone_input_override": "555-1234"},
-    },
-    {
-        "id": "id_018",
-        "label": "Phone 11 digits with leading 1 — should strip and pass",
-        "input": "15558675309",
-        "expected": {"phone_valid": True, "phone_input_override": "15558675309"},
-    },
-    {
-        "id": "id_019",
-        "label": "Name not extracted from long sentence",
-        "input": "My name is Sarah Johnson and I live at 123 Main Street",
-        "expected": {"name": None, "has_address": True},
-        "notes": "Long sentence — name extractor requires exactly 2-3 words; address wins",
-    },
-    {
-        "id": "id_020",
-        "label": "DOB with two-digit year",
-        "input": "04/15/85",
-        "expected": {"dob_valid": True},
-        "notes": "Two-digit year parsed as 1985",
-    },
-]
-
-
-# ---------------------------------------------------------------------------
-# 2. Emergency detection  (22 cases)
+# 1. Emergency detection  (22 cases)
 # ---------------------------------------------------------------------------
 # Tests detect_emergency_red_flags(cc, opqrst, user_text)
 #
@@ -475,15 +325,15 @@ OPQRST_CASES = [
     },
     {
         "id": "op_003",
-        "label": "All three completion criteria met — is_complete true",
+        "label": "Three of four completion criteria met — quality still missing → not complete",
         "current_state": {"chief_complaint": "headache", "opqrst": {
             **EMPTY_OP, "severity": "7/10", "onset": "this morning"}},
         "user_message": "It started suddenly when I woke up",
         "expected": {
-            "is_complete": True,
+            "is_complete": False,
             "cc_extracted": True,
             "fields_present": ["severity", "onset", "timing"],
-            "fields_absent": [],
+            "fields_absent": ["quality"],
             "no_invent": False,
         },
     },
@@ -563,25 +413,27 @@ OPQRST_CASES = [
     },
     {
         "id": "op_010",
-        "label": "Provocation / aggravating factor",
+        "label": "Provocation / aggravating factor — quality still missing → not complete",
         "current_state": {"chief_complaint": "lower back pain", "opqrst": {
             **EMPTY_OP, "onset": "2 days ago", "severity": "6/10"}},
         "user_message": "It gets worse when I bend forward and better when I lie down",
         "expected": {
-            "is_complete": True,
+            "is_complete": False,
             "fields_present": ["provocation"],
+            "fields_absent": ["quality"],
             "no_invent": True,
         },
     },
     {
         "id": "op_011",
-        "label": "Timing — intermittent vs constant",
+        "label": "Timing — intermittent vs constant, quality still missing → not complete",
         "current_state": {"chief_complaint": "abdominal pain", "opqrst": {
             **EMPTY_OP, "onset": "yesterday", "severity": "5/10"}},
         "user_message": "The pain comes and goes, maybe every hour",
         "expected": {
-            "is_complete": True,
+            "is_complete": False,
             "fields_present": ["timing"],
+            "fields_absent": ["quality"],
             "no_invent": True,
         },
     },
@@ -1403,7 +1255,6 @@ REPORT_CONTENT_CASES = [
 # ---------------------------------------------------------------------------
 
 ALL_CASES = {
-    "identity_extraction":    IDENTITY_CASES,
     "emergency_detection":    EMERGENCY_CASES,
     "crisis_detection":       CRISIS_CASES,
     "opqrst_extraction":      OPQRST_CASES,

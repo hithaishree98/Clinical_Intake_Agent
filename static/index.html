@@ -3,11 +3,17 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="description" content="AI-assisted clinical intake — collects identity, symptoms, allergies, and history, then generates a clinician note and FHIR R4 bundle." />
+  <meta name="theme-color" content="#ffffff" />
   <title>Clinical Intake</title>
+  <!-- Inline SVG favicon: medical cross on the brand teal.  Inlined so the
+       page renders fully without a second request, and survives any CDN /
+       cache-busting hassle. -->
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='4' fill='%231a4d4d'/%3E%3Cpath d='M10 5h4v5h5v4h-5v5h-4v-5H5v-4h5z' fill='%23fff'/%3E%3C/svg%3E" />
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Instrument+Serif:ital@0;1&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/styles.css?v=2" />
-  <script defer src="/static/app.js?v=2"></script>
+  <link rel="stylesheet" href="/static/styles.css?v=6" />
+  <script defer src="/static/app.js?v=6"></script>
 </head>
 <body>
   <div class="layout">
@@ -36,6 +42,10 @@
           </button>
         </span>
         <div id="statusDot" class="status-dot" title="No session"></div>
+        <button class="icon-btn hidden" id="ttsToggleBtn" type="button"
+                title="Read assistant replies aloud" aria-pressed="false">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M19.07 4.93a10 10 0 010 14.14M15.54 8.46a5 5 0 010 7.07"/></svg>
+        </button>
         <a href="/dashboard" class="btn-outline-sm" title="Operations dashboard">Dashboard</a>
         <button class="btn-primary" id="startBtn">New Session</button>
       </div>
@@ -54,19 +64,34 @@
             <div class="empty-icon">
               <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
             </div>
-            <p>Begin a new session to start<br>the patient intake flow.</p>
+            <p>Click <strong>New Session</strong> to begin.</p>
           </div>
         </div>
-
-        <!-- Demo scenario presets — populated by JS from /demo/scenarios -->
-        <div id="demo-scenarios" class="demo-scenarios"></div>
 
         <div id="typing" class="typing hidden">
           <span></span><span></span><span></span>
           <span class="typing-label">Processing</span>
         </div>
 
+        <!-- Voice confirm strip — appears between transcript and send on
+             clinical-risk phases (identity / clinical_history) so the
+             patient can review what Whisper heard before it commits.  On
+             every other phase the transcript is auto-sent. -->
+        <div id="voiceConfirm" class="voice-confirm hidden">
+          <span class="vc-label">Heard:</span>
+          <span id="voiceConfirmText" class="vc-text"></span>
+          <button class="btn-outline small" id="vcEditBtn" type="button">Edit</button>
+          <button class="btn-primary small" id="vcSendBtn" type="button">Send</button>
+          <button class="icon-btn" id="vcCancelBtn" type="button" title="Discard">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+
         <div class="composer">
+          <button class="btn-mic hidden" id="micBtn" type="button" disabled
+                  title="Hold to speak" aria-label="Record voice message">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/></svg>
+          </button>
           <input id="msg" placeholder="Type your response…" autocomplete="off" disabled />
           <button class="btn-send" id="sendBtn" type="button" disabled>
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
@@ -74,58 +99,6 @@
         </div>
       </section>
 
-      <aside class="sidebar">
-
-        <div class="card">
-          <div class="card-header">
-            <span class="card-title">Session</span>
-            <span id="sessStatus" class="badge">inactive</span>
-          </div>
-          <div class="info-grid">
-            <span class="ig-label">Phase</span>
-            <span id="sidePhase" class="ig-value">—</span>
-          </div>
-          <button class="btn-outline full mt" id="viewReportBtn">Pull Clinician Note</button>
-        </div>
-
-        <div class="card card-report">
-          <div class="card-header">
-            <span class="card-title">Clinician Note</span>
-            <span class="card-tag">DRAFT</span>
-          </div>
-          <pre id="report" class="report-box">Complete the intake to generate the clinician note.</pre>
-        </div>
-
-        <div class="card">
-          <div class="card-header">
-            <span class="card-title">Clinician Access</span>
-          </div>
-
-          <div id="clinician-login">
-            <div class="field-row">
-              <input id="clinicianPwd" type="password" placeholder="Clinician password" class="field-input" />
-              <button class="btn-outline" id="loginBtn">Auth</button>
-            </div>
-          </div>
-
-          <div id="clinician-tools" class="hidden">
-            <div class="auth-badge">
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
-              Clinician authenticated
-            </div>
-            <button class="btn-outline full mt-sm" id="pendingBtn">View Escalations</button>
-            <div id="escalations-list" class="esc-list hidden"></div>
-            <div id="resolve-form" class="resolve-form hidden">
-              <div class="resolve-title">Resolve Escalation</div>
-              <input class="field-input" id="escThreadId" placeholder="Thread ID" />
-              <input class="field-input" id="escId" placeholder="Escalation ID" />
-              <input class="field-input" id="escNote" placeholder="Nurse note (optional)" />
-              <button class="btn-primary small" id="resolveBtn">Resolve</button>
-            </div>
-          </div>
-        </div>
-
-      </aside>
     </div>
   </div>
 

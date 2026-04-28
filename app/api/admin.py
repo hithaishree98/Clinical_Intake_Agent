@@ -1,70 +1,21 @@
 """
 admin.py — Operational / demo endpoints.
 
-Emergency-phrase management and demo-reset live here (not in clinician.py)
-because they are primarily ops-facing, not clinical-workflow-facing.
+Emergency-phrase management, demo-reset, full analytics, webhook delivery log,
+and prompt A/B experiments live here because they are ops-facing, not
+clinical-workflow-facing.  The clinician dashboard only needs /analytics/summary
+and /clinician/*; everything else is admin-only.
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Form, HTTPException
+from fastapi import APIRouter, Depends, Form, HTTPException, Request
 
 from .. import sqlite_db as db
 from ..logging_utils import log_event
-from .deps import require_clinician
+from .deps import limiter, require_clinician
 
 router = APIRouter(prefix="/admin")
 
-
-_DEMO_SCENARIOS = [
-    {
-        "id": "chest_pain",
-        "label": "Chest Pain (Emergency)",
-        "description": "Acute crushing chest pain radiating to left arm — triggers emergency escalation",
-        # Intentionally short: emergency path terminates after 4 messages (escalation triggered)
-        "messages": [
-            "yes",
-            "John Demo, 04/15/1978, 5551230000, 123 Main St, Chicago IL",
-            "yes",
-            "I have severe crushing chest pain radiating to my left arm, started 20 minutes ago, 9 out of 10",
-        ],
-    },
-    {
-        "id": "routine_checkup",
-        "label": "Routine Checkup",
-        "description": "Standard clinic visit — tension headache, medication refill — full intake flow",
-        "messages": [
-            "yes",
-            "Sarah Demo, 06/20/1990, 5559876543, 456 Oak Ave, Boston MA",
-            "yes",
-            "I've had a mild tension headache for two days, about 3 out of 10, also need a refill on my blood pressure meds",
-            # clinical history
-            "no known allergies",
-            "lisinopril 10mg once daily, last took it this morning",
-            "hypertension diagnosed 3 years ago, no surgeries",
-            "blood pressure check last month, results were normal",
-            "confirm",
-        ],
-    },
-    {
-        "id": "mental_health",
-        "label": "Mental Health",
-        "description": "Anxiety and panic attacks — mental health classification — full intake flow",
-        # NOTE: avoid emergency-phrase keywords ("shortness of breath", "chest pain") so the
-        # demo exercises the mental-health classification path rather than emergency escalation.
-        "messages": [
-            "yes",
-            "Alex Demo, 03/12/1995, 5554443333, 789 Pine Rd, Seattle WA",
-            "yes",
-            "I've been having panic attacks almost daily for two weeks — my heart races, I feel extremely anxious and on edge, about a 7 out of 10",
-            # clinical history
-            "no known allergies",
-            "sertraline 50mg once daily, last took it this morning",
-            "generalized anxiety disorder diagnosed last year, no surgeries",
-            "therapist session two weeks ago, no recent lab work",
-            "confirm",
-        ],
-    },
-]
 
 
 @router.get("/emergency-phrases")
@@ -77,7 +28,8 @@ def list_emergency_phrases(_: None = Depends(require_clinician)):
 
 
 @router.post("/emergency-phrases")
-def add_emergency_phrase(phrase: str = Form(...), _: None = Depends(require_clinician)):
+@limiter.limit("30/minute")
+def add_emergency_phrase(request: Request, phrase: str = Form(...), _: None = Depends(require_clinician)):
     phrase = phrase.strip().lower()
     if not phrase:
         raise HTTPException(status_code=400, detail="Phrase cannot be empty.")
@@ -90,7 +42,8 @@ def add_emergency_phrase(phrase: str = Form(...), _: None = Depends(require_clin
 
 
 @router.delete("/emergency-phrases")
-def delete_emergency_phrase(phrase: str = Form(...), _: None = Depends(require_clinician)):
+@limiter.limit("30/minute")
+def delete_emergency_phrase(request: Request, phrase: str = Form(...), _: None = Depends(require_clinician)):
     phrase = phrase.strip().lower()
     deleted = db.delete_emergency_phrase(phrase)
     if not deleted:
@@ -99,16 +52,92 @@ def delete_emergency_phrase(phrase: str = Form(...), _: None = Depends(require_c
     return {"ok": True, "phrase": phrase}
 
 
-@router.get("/demo/scenarios")
-def demo_scenarios():
-    """Demo scenario presets — no auth required (public facing)."""
-    return {"scenarios": _DEMO_SCENARIOS}
-
-
 @router.post("/demo/reset")
-def demo_reset(_: None = Depends(require_clinician)):
+@limiter.limit("10/minute")
+def demo_reset(request: Request, _: None = Depends(require_clinician)):
     """Wipe all session data and re-seed mock EHR patients. Requires clinician token."""
     db.reset_demo_data()
     db.seed_demo_patients()
     log_event("demo_reset", msg="Demo data wiped and re-seeded")
     return {"ok": True, "message": "Demo data reset. 3 mock patients re-seeded."}
+
+
+# ---------------------------------------------------------------------------
+# Full analytics (admin-only; clinician dashboard uses /analytics/summary)
+# ---------------------------------------------------------------------------
+
+@router.get("/analytics")
+def analytics(_: None = Depends(require_clinician)):
+    """Full operational metrics for the last 7 days. Requires clinician token."""
+    from ..llm import _breaker
+    data = db.get_analytics()
+    data["llm_circuit_state"] = _breaker.state
+    return data
+
+
+# ---------------------------------------------------------------------------
+# Webhook delivery log
+# ---------------------------------------------------------------------------
+
+@router.get("/webhooks")
+@limiter.limit("30/minute")
+def list_webhook_deliveries(
+    request: Request,
+    thread_id: str | None = None,
+    limit: int = 50,
+    _: None = Depends(require_clinician),
+):
+    rows = db.get_webhook_deliveries(thread_id=thread_id, limit=min(limit, 200))
+    return {"count": len(rows), "deliveries": [dict(r) for r in rows]}
+
+
+# ---------------------------------------------------------------------------
+# Prompt A/B experiment management
+# ---------------------------------------------------------------------------
+
+@router.post("/experiments")
+@limiter.limit("30/minute")
+def create_experiment(
+    request: Request,
+    name: str = Form(...),
+    prompt_key: str = Form(...),
+    variant_a: str = Form(...),
+    variant_b: str = Form(...),
+    _: None = Depends(require_clinician),
+):
+    from ..prompts import PROMPT_VERSIONS
+    if prompt_key not in PROMPT_VERSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown prompt_key '{prompt_key}'. Valid keys: {list(PROMPT_VERSIONS.keys())}",
+        )
+    existing = db.get_active_experiment(prompt_key)
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Active experiment already exists for '{prompt_key}': {existing['experiment_id']}",
+        )
+    exp_id = db.create_experiment(name, prompt_key, variant_a, variant_b)
+    log_event("experiment_created", experiment_id=exp_id, prompt_key=prompt_key,
+              variant_a=variant_a, variant_b=variant_b)
+    return {"experiment_id": exp_id, "status": "active"}
+
+
+@router.get("/experiments")
+def list_experiments(_: None = Depends(require_clinician)):
+    return {"experiments": db.list_experiments()}
+
+
+@router.patch("/experiments/{experiment_id}")
+@limiter.limit("30/minute")
+def update_experiment(
+    request: Request,
+    experiment_id: str,
+    status: str = Form(...),
+    _: None = Depends(require_clinician),
+):
+    if status not in ("active", "paused", "concluded"):
+        raise HTTPException(status_code=400, detail="status must be active|paused|concluded")
+    db.update_experiment_status(experiment_id, status)
+    log_event("experiment_updated", experiment_id=experiment_id, new_status=status)
+    return {"ok": True, "experiment_id": experiment_id, "status": status}

@@ -13,35 +13,82 @@ from typing import Literal
 from .logging_utils import log_event
 from .settings import get_settings as settings
 
-_db_lock = threading.Lock()
-_db_conn: sqlite3.Connection | None = None
+# Per-thread connections.  SQLite WAL mode supports many concurrent readers
+# and one writer; the only contention point is at the SQLite layer itself,
+# bounded by busy_timeout=10s.  Routing every read through a single Python
+# mutex (the previous design) was the throughput ceiling for /jobs polling
+# plus chat traffic — unnecessary, since WAL already gives us per-row safety.
+#
+# Each thread that touches the DB lazily opens its own connection.  We keep
+# a registry so tests and shutdown paths can close every open connection
+# (otherwise sqlite3 leaves -wal/-shm files behind on Windows).
+_local = threading.local()
+_open_connections: list[sqlite3.Connection] = []
+_open_connections_lock = threading.Lock()
+
 
 def conn() -> sqlite3.Connection:
-    global _db_conn
-    if _db_conn is None:
-        Path(settings().app_db_path).parent.mkdir(parents=True, exist_ok=True)
-        c = sqlite3.connect(settings().app_db_path, timeout=10.0, check_same_thread=False)
-        c.row_factory = sqlite3.Row
-        c.execute("PRAGMA journal_mode=WAL;")
-        c.execute("PRAGMA synchronous=NORMAL;")
-        c.execute("PRAGMA busy_timeout=10000;")
-        _db_conn = c
-    return _db_conn
+    """
+    Return this thread's SQLite connection, opening it on first call.
+
+    Caller is responsible for committing writes (or using transaction()).
+    Connections are closed by close_all_connections() at process shutdown
+    or test teardown.
+    """
+    c = getattr(_local, "conn", None)
+    if c is not None:
+        return c
+    Path(settings().app_db_path).parent.mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(settings().app_db_path, timeout=10.0, check_same_thread=False)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA journal_mode=WAL;")
+    c.execute("PRAGMA synchronous=NORMAL;")
+    c.execute("PRAGMA busy_timeout=10000;")
+    _local.conn = c
+    with _open_connections_lock:
+        _open_connections.append(c)
+    return c
+
+
+def close_all_connections() -> None:
+    """
+    Close every per-thread SQLite connection opened so far.
+
+    Used by lifespan shutdown and the tmp_db test fixture.  After this call
+    the next conn() invocation in any thread will open a fresh connection
+    pointing at the (possibly newly-configured) app_db_path.
+    """
+    with _open_connections_lock:
+        for c in _open_connections:
+            try:
+                c.close()
+            except Exception:
+                pass
+        _open_connections.clear()
+    if hasattr(_local, "conn"):
+        delattr(_local, "conn")
 
 
 @contextmanager
 def transaction():
-    global _db_conn
-    with _db_lock:
-        c = conn()
-        try:
-            yield c
-            c.commit()
-        except Exception:
-            c.rollback()
-            raise
+    c = conn()
+    try:
+        yield c
+        c.commit()
+    except Exception:
+        c.rollback()
+        raise
+
 
 def _retry_db_operation(func, max_retries: int = 3):
+    """
+    Retry a DB operation on SQLITE_BUSY.
+
+    With per-thread connections plus busy_timeout=10s, contention is rare —
+    SQLite waits internally before raising.  This wrapper catches the
+    residual cases (e.g. a long-running write transaction holding the file
+    lock past the timeout) so callers don't see transient errors.
+    """
     for attempt in range(max_retries):
         try:
             return func()
@@ -52,69 +99,277 @@ def _retry_db_operation(func, max_retries: int = 3):
                 continue
             raise
 
-def init_schema() -> None:
-    schema_path = Path(__file__).with_name("schema.sql")
-    if not schema_path.exists():
-        raise RuntimeError(f"Schema file not found: {schema_path}")
-    sql = schema_path.read_text(encoding="utf-8")
+_init_lock = threading.Lock()
 
-    def _init():
-        with _db_lock:
+
+def init_schema() -> None:
+    """
+    Create all tables and indexes on first run.
+
+    Direct DDL — no Alembic dependency.  Safe to call on every startup:
+    every statement uses CREATE TABLE/INDEX IF NOT EXISTS.
+    Guarded by _init_lock so concurrent calls don't contend.
+    """
+    def _create():
+        with _init_lock:
             c = conn()
-            c.executescript(sql)
-            # Migration: add fhir_bundle column to reports if it doesn't exist yet.
-            existing_reports = {
-                row[1]
-                for row in c.execute("PRAGMA table_info(reports)").fetchall()
-            }
-            if "fhir_bundle" not in existing_reports:
-                c.execute("ALTER TABLE reports ADD COLUMN fhir_bundle TEXT")
-            if "pending_review" not in existing_reports:
-                c.execute(
-                    "ALTER TABLE reports ADD COLUMN pending_review INTEGER NOT NULL DEFAULT 0"
+            c.execute("PRAGMA foreign_keys = ON")
+
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS sessions (
+                    thread_id     TEXT PRIMARY KEY,
+                    status        TEXT NOT NULL DEFAULT 'active',
+                    session_token TEXT,
+                    patient_id    TEXT,
+                    clinic_id     TEXT NOT NULL DEFAULT 'default',
+                    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
                 )
-            # Migration: add session_token column to sessions for patient auth.
-            existing_sessions = {
-                row[1]
-                for row in c.execute("PRAGMA table_info(sessions)").fetchall()
-            }
-            if "session_token" not in existing_sessions:
-                c.execute("ALTER TABLE sessions ADD COLUMN session_token TEXT")
+            """)
+            try:
+                c.execute("ALTER TABLE sessions ADD COLUMN clinic_id TEXT NOT NULL DEFAULT 'default'")
+            except sqlite3.OperationalError:
+                pass  # column already exists
+            c.execute("CREATE INDEX IF NOT EXISTS idx_sessions_patient ON sessions(patient_id)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_sessions_clinic  ON sessions(clinic_id)")
+
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS messages (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    thread_id  TEXT NOT NULL,
+                    role       TEXT NOT NULL,
+                    text       TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+            """)
+            c.execute("""
+                CREATE INDEX IF NOT EXISTS idx_messages_thread_created
+                ON messages(thread_id, created_at)
+            """)
+
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS reports (
+                    report_id      TEXT PRIMARY KEY,
+                    thread_id      TEXT NOT NULL,
+                    risk_level     TEXT NOT NULL,
+                    visit_type     TEXT NOT NULL,
+                    report_text    TEXT NOT NULL,
+                    fhir_bundle    TEXT,
+                    pending_review INTEGER NOT NULL DEFAULT 0,
+                    created_at     TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+            """)
+            c.execute("""
+                CREATE INDEX IF NOT EXISTS idx_reports_thread_created
+                ON reports(thread_id, created_at)
+            """)
+            c.execute("CREATE INDEX IF NOT EXISTS idx_reports_patient ON reports(thread_id)")
+
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS escalations (
+                    esc_id       TEXT PRIMARY KEY,
+                    thread_id    TEXT NOT NULL,
+                    kind         TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    resolved     INTEGER NOT NULL DEFAULT 0,
+                    nurse_note   TEXT,
+                    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+            """)
+            c.execute("""
+                CREATE INDEX IF NOT EXISTS idx_escalations_thread_resolved_created
+                ON escalations(thread_id, resolved, created_at)
+            """)
+
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS mock_ehr (
+                    patient_id TEXT PRIMARY KEY,
+                    name       TEXT NOT NULL,
+                    history    TEXT,
+                    data_json  TEXT
+                )
+            """)
+
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS idempotency (
+                    thread_id     TEXT NOT NULL,
+                    key           TEXT NOT NULL,
+                    request_hash  TEXT NOT NULL,
+                    response_json TEXT NOT NULL,
+                    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY(thread_id, key)
+                )
+            """)
+
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS jobs (
+                    job_id     TEXT PRIMARY KEY,
+                    thread_id  TEXT NOT NULL,
+                    kind       TEXT NOT NULL,
+                    status     TEXT NOT NULL,
+                    error      TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+            """)
+            c.execute("CREATE INDEX IF NOT EXISTS idx_jobs_thread ON jobs(thread_id)")
+
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS session_state (
+                    thread_id  TEXT PRIMARY KEY,
+                    state_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+            """)
+
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS emergency_phrases (
+                    phrase   TEXT PRIMARY KEY,
+                    added_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+            """)
+
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS llm_failure_log (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    thread_id    TEXT NOT NULL,
+                    node         TEXT NOT NULL,
+                    failure_type TEXT NOT NULL,
+                    raw_snippet  TEXT,
+                    error_detail TEXT,
+                    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+            """)
+            c.execute("""
+                CREATE INDEX IF NOT EXISTS idx_llm_failure_thread_created
+                ON llm_failure_log(thread_id, created_at)
+            """)
+            c.execute("""
+                CREATE INDEX IF NOT EXISTS idx_llm_failure_type_created
+                ON llm_failure_log(failure_type, created_at)
+            """)
+
+            # payload_body added in migration 002 — included here from the start
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS webhook_deliveries (
+                    delivery_id      TEXT PRIMARY KEY,
+                    thread_id        TEXT NOT NULL,
+                    event_type       TEXT NOT NULL,
+                    url_hash         TEXT NOT NULL,
+                    payload_hash     TEXT NOT NULL,
+                    payload_body     BLOB,
+                    status           TEXT NOT NULL DEFAULT 'pending',
+                    attempts         INTEGER NOT NULL DEFAULT 0,
+                    last_http_status INTEGER,
+                    last_error       TEXT,
+                    next_retry_at    TEXT,
+                    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+            """)
+            c.execute("""
+                CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_thread
+                ON webhook_deliveries(thread_id, created_at DESC)
+            """)
+            c.execute("""
+                CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_status
+                ON webhook_deliveries(status, next_retry_at)
+            """)
+
+            # provider + cached_input_tokens added in migration 003 — included here
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS llm_usage (
+                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                    thread_id           TEXT NOT NULL,
+                    node                TEXT NOT NULL,
+                    input_tokens        INTEGER NOT NULL DEFAULT 0,
+                    output_tokens       INTEGER NOT NULL DEFAULT 0,
+                    cost_usd            REAL NOT NULL DEFAULT 0.0,
+                    provider            TEXT NOT NULL DEFAULT 'gemini',
+                    cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+                    created_at          TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+            """)
+            c.execute("""
+                CREATE INDEX IF NOT EXISTS idx_llm_usage_thread
+                ON llm_usage(thread_id, created_at)
+            """)
+
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS prompt_experiments (
+                    experiment_id TEXT PRIMARY KEY,
+                    name          TEXT NOT NULL,
+                    prompt_key    TEXT NOT NULL,
+                    variant_a     TEXT NOT NULL,
+                    variant_b     TEXT NOT NULL,
+                    status        TEXT NOT NULL DEFAULT 'active',
+                    sessions_a    INTEGER NOT NULL DEFAULT 0,
+                    sessions_b    INTEGER NOT NULL DEFAULT 0,
+                    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+            """)
+            c.execute("""
+                CREATE INDEX IF NOT EXISTS idx_experiments_status
+                ON prompt_experiments(status, prompt_key)
+            """)
+
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS patient_summary (
+                    patient_id             TEXT PRIMARY KEY,
+                    identity_json          TEXT NOT NULL DEFAULT '{}',
+                    allergies_json         TEXT NOT NULL DEFAULT '[]',
+                    medications_json       TEXT NOT NULL DEFAULT '[]',
+                    conditions_json        TEXT NOT NULL DEFAULT '[]',
+                    recent_complaints_json TEXT NOT NULL DEFAULT '[]',
+                    flags_json             TEXT NOT NULL DEFAULT '[]',
+                    visit_count            INTEGER NOT NULL DEFAULT 0,
+                    first_seen_at          TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at             TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+            """)
+
+            # Upgrade path: add clinic_id to sessions tables created before this revision
+            try:
+                c.execute("ALTER TABLE sessions ADD COLUMN clinic_id TEXT NOT NULL DEFAULT 'default'")
+            except sqlite3.OperationalError:
+                pass  # column already exists
+
             c.commit()
 
-    _retry_db_operation(_init)
+    _retry_db_operation(_create)
+
 
 def exec_one(q: str, p: tuple = ()) -> None:
     def _exec():
-        with _db_lock:
-            c = conn()
-            c.execute(q, p)
-            c.commit()
+        c = conn()
+        c.execute(q, p)
+        c.commit()
     _retry_db_operation(_exec)
+
 
 def fetch_one(q: str, p: tuple = ()):
     def _fetch():
-        with _db_lock:
-            c = conn()
-            row = c.execute(q, p).fetchone()
-            return dict(row) if row else None
+        c = conn()
+        row = c.execute(q, p).fetchone()
+        return dict(row) if row else None
     return _retry_db_operation(_fetch)
+
 
 def fetch_all(q: str, p: tuple = ()):
     def _fetch():
-        with _db_lock:
-            c = conn()
-            rows = c.execute(q, p).fetchall() or []
-            return [dict(r) for r in rows]
+        c = conn()
+        rows = c.execute(q, p).fetchall() or []
+        return [dict(r) for r in rows]
     return _retry_db_operation(_fetch)
 
 
-def create_session(thread_id: str, session_token: str | None = None):
+def create_session(thread_id: str, session_token: str | None = None, clinic_id: str = "default"):
     # Store the hash, never the raw token. Verification uses the same hash path.
     token_hash = _hash_token(session_token) if session_token else None
     exec_one(
-        "INSERT INTO sessions (thread_id, status, session_token) VALUES (?, 'active', ?)",
-        (thread_id, token_hash),
+        "INSERT INTO sessions (thread_id, status, session_token, clinic_id) VALUES (?, 'active', ?, ?)",
+        (thread_id, token_hash, clinic_id),
     )
 
 
@@ -191,6 +446,16 @@ def persist_chat_turn(
     response_obj: dict,
     job_id: str | None = None,
 ) -> None:
+    """
+    Atomically persist one chat turn: state snapshot + user message +
+    assistant reply + session status + idempotency response.
+
+    job_id is informational only — the row was already inserted by
+    create_job() upstream so the worker could be submitted before persistence
+    runs.  We accept the parameter to keep the call-site contract stable but
+    do NOT re-INSERT (duplicate insert hit UNIQUE constraint and 500'd the
+    confirm→report transition).
+    """
     with transaction() as c:
         c.execute(
             "INSERT INTO session_state(thread_id, state_json, updated_at) VALUES (?,?,datetime('now')) "
@@ -213,27 +478,110 @@ def persist_chat_turn(
             "INSERT OR REPLACE INTO idempotency(thread_id, key, request_hash, response_json) VALUES (?,?,?,?)",
             (thread_id, client_msg_id, request_hash, json.dumps(response_obj)),
         )
-        if job_id:
+
+def persist_report_turn(
+    *,
+    thread_id: str,
+    state_snapshot: dict,
+    assistant_reply: str | None,
+) -> None:
+    """
+    Atomic post-report persistence: write the worker's state snapshot AND
+    the final assistant reply (the long clinician note) in a single
+    transaction.
+
+    Rationale:
+      _run_report_job used to call save_session_state + save_message as
+      two separate writes.  If the second write hit a transient lock or
+      crashed, the snapshot showed phase=done while the messages table
+      didn't include the report — clinicians loading /clinician/case
+      would see a transcript that ended at "generating the clinician
+      note now…" with no report.  Wrapping both in one transaction means
+      either both land or neither does, so the job-status / messages /
+      session_state tables stay consistent.
+
+    `assistant_reply` may be None or "" — we then skip the messages insert
+    (the snapshot still lands).  Caller decides whether to extract the
+    last message from graph state.
+    """
+    with transaction() as c:
+        c.execute(
+            "INSERT INTO session_state(thread_id, state_json, updated_at) "
+            "VALUES (?,?,datetime('now')) "
+            "ON CONFLICT(thread_id) DO UPDATE SET "
+            "state_json=excluded.state_json, updated_at=datetime('now')",
+            (thread_id, json.dumps(state_snapshot)),
+        )
+        if assistant_reply:
             c.execute(
-                "INSERT INTO jobs(job_id, thread_id, kind, status) VALUES (?,?,?,?)",
-                (job_id, thread_id, "report", "queued"),
+                "INSERT INTO messages (thread_id, role, text) VALUES (?,?,?)",
+                (thread_id, "assistant", assistant_reply),
             )
 
-def get_stored_identity_by_name(name: str):
-    q = "SELECT name, data_json FROM mock_ehr WHERE LOWER(TRIM(name))=LOWER(TRIM(?))"
-    row = fetch_one(q, (name,))
-    if not row:
+
+def get_stored_identity_by_name(name: str, dob: str = "") -> dict | None:
+    """
+    Look up a patient in the EHR via FHIR R4 Patient search.
+
+    Defaults to HAPI's public FHIR R4 test server (no auth, works out of the
+    box for demos).  For Epic/Cerner production: set EHR_FHIR_URL to the
+    endpoint base URL and EHR_FHIR_BEARER_TOKEN to an OAuth2 bearer token.
+
+    Falls back gracefully — returns None on any network or parse error so
+    the intake continues without a prior record.
+    """
+    import urllib.request
+    import urllib.parse
+    import urllib.error
+
+    base_url = (settings().ehr_fhir_url or "").rstrip("/")
+    if not base_url:
         return None
+
+    params: dict = {"name": name, "_count": "1"}
+    if dob:
+        params["birthdate"] = dob
+
+    url = f"{base_url}/Patient?{urllib.parse.urlencode(params)}"
+    headers = {"Accept": "application/fhir+json"}
+
+    bearer = settings().ehr_fhir_bearer_token or ""
+    if bearer:
+        headers["Authorization"] = f"Bearer {bearer}"
+
     try:
-        data = json.loads(row.get("data_json") or "{}")
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            bundle = json.loads(resp.read().decode("utf-8", errors="replace"))
     except Exception:
-        data = {}
-    ident = data.get("identity") or {}
+        return None
+
+    entries = bundle.get("entry") or []
+    if not entries:
+        return None
+
+    resource = entries[0].get("resource") or {}
+    if resource.get("resourceType") != "Patient":
+        return None
+
+    names = resource.get("name") or [{}]
+    official = next((n for n in names if n.get("use") == "official"), names[0])
+    given  = " ".join(official.get("given") or [])
+    family = official.get("family") or ""
+    full_name = f"{given} {family}".strip()
+
+    telecoms = resource.get("telecom") or []
+    phone = next((t.get("value", "") for t in telecoms if t.get("system") == "phone"), "")
+
+    addresses = resource.get("address") or [{}]
+    addr = addresses[0] if addresses else {}
+    address = addr.get("text") or ""
+
     return {
-        "name": row.get("name") or "",
-        "dob": ident.get("dob", "") or "",
-        "phone": ident.get("phone", "") or "",
-        "address": ident.get("address", "") or "",
+        "name":    full_name,
+        "dob":     resource.get("birthDate") or "",
+        "phone":   phone,
+        "address": address,
     }
 
 
@@ -354,16 +702,6 @@ def upsert_patient_summary(patient_id: str, merged: dict) -> None:
     )
 
 
-def get_fhir_bundle(thread_id: str) -> str | None:
-    """Return the raw FHIR R4 Bundle JSON for the latest report, or None."""
-    row = fetch_one(
-        "SELECT fhir_bundle FROM reports WHERE thread_id=? ORDER BY rowid DESC LIMIT 1",
-        (thread_id,),
-    )
-    if not row:
-        return None
-    return row.get("fhir_bundle")
-
 def get_latest_report(thread_id: str):
     return fetch_one(
         "SELECT rowid, * FROM reports WHERE thread_id=? ORDER BY rowid DESC LIMIT 1",
@@ -384,30 +722,24 @@ def update_job(job_id: str, status: str, error: str | None = None):
         (status, error, job_id),
     )
 
-def get_job(job_id: str):
-    return fetch_one("SELECT * FROM jobs WHERE job_id=?", (job_id,))
-
-def get_jobs_for_thread(thread_id: str) -> list:
-    return fetch_all("SELECT * FROM jobs WHERE thread_id=? ORDER BY created_at DESC", (thread_id,))
-
 def mark_stale_jobs_failed(stale_minutes: int = 10) -> int:
     """
     Mark jobs that have been 'running' for longer than stale_minutes as failed.
-    Called on job-status reads so stale background tasks are always surfaced.
+    Called from the hourly background loop (see app.main) so stale background
+    tasks are surfaced without scanning the table on every /jobs poll.
     Returns the number of rows updated.
     """
     def _mark():
-        with _db_lock:
-            c = conn()
-            cur = c.execute(
-                "UPDATE jobs SET status='failed', "
-                "error='stale: job exceeded time limit without completing', "
-                "updated_at=datetime('now') "
-                "WHERE status='running' AND updated_at <= datetime('now', ?)",
-                (f"-{stale_minutes} minutes",),
-            )
-            c.commit()
-            return cur.rowcount
+        c = conn()
+        cur = c.execute(
+            "UPDATE jobs SET status='failed', "
+            "error='stale: job exceeded time limit without completing', "
+            "updated_at=datetime('now') "
+            "WHERE status='running' AND updated_at <= datetime('now', ?)",
+            (f"-{stale_minutes} minutes",),
+        )
+        c.commit()
+        return cur.rowcount
     return _retry_db_operation(_mark)
 
 
@@ -452,12 +784,21 @@ def get_llm_failure_stats(days: int = 7) -> dict:
         "WHERE created_at >= date('now', ?) GROUP BY node ORDER BY n DESC LIMIT 1",
         (date_bound,),
     )
+    parse_errors = by_type.get("parse_error", 0)
+    api_errors   = by_type.get("api_error",   0)
+    # fallbacks_used is the umbrella "we served the hardcoded fallback" count.
+    # We no longer write rows with literally that failure_type (the taxonomy
+    # is mutually exclusive — see _track_llm_failure), so derive it from
+    # parse_error + api_error for backwards-compatible dashboards.  Any
+    # legacy rows still carrying failure_type='fallback_used' from before
+    # the migration are folded in too.
+    fallbacks_used = parse_errors + api_errors + by_type.get("fallback_used", 0)
     return {
         "total_llm_failures": total.get("n", 0),
-        "fallbacks_used":     by_type.get("fallback_used", 0),
+        "fallbacks_used":     fallbacks_used,
         "repairs_used":       by_type.get("repair_used", 0),
-        "parse_errors":       by_type.get("parse_error", 0),
-        "api_errors":         by_type.get("api_error", 0),
+        "parse_errors":       parse_errors,
+        "api_errors":         api_errors,
         "most_failing_node":  (top_node or {}).get("node"),
     }
 
@@ -479,6 +820,10 @@ def get_session_state(thread_id: str):
         return None
 
 
+def get_session_row(thread_id: str):
+    return fetch_one("SELECT thread_id, status FROM sessions WHERE thread_id=?", (thread_id,))
+
+
 def get_emergency_phrases() -> list[str]:
     """
     Load emergency phrases from the DB. Falls back to an empty list if the
@@ -498,14 +843,13 @@ def add_emergency_phrase(phrase: str) -> None:
 def delete_emergency_phrase(phrase: str) -> bool:
     """Returns True if a row was deleted, False if phrase didn't exist."""
     def _del():
-        with _db_lock:
-            c = conn()
-            cur = c.execute(
-                "DELETE FROM emergency_phrases WHERE phrase = ?",
-                (phrase.strip().lower(),),
-            )
-            c.commit()
-            return cur.rowcount > 0
+        c = conn()
+        cur = c.execute(
+            "DELETE FROM emergency_phrases WHERE phrase = ?",
+            (phrase.strip().lower(),),
+        )
+        c.commit()
+        return cur.rowcount > 0
     return _retry_db_operation(_del)
 
 
@@ -524,12 +868,24 @@ def record_llm_usage(
     node: str,
     input_tokens: int,
     output_tokens: int,
+    *,
+    cached_input_tokens: int = 0,
+    provider: str = "gemini",
 ) -> None:
     """
     Persist token counts and cost for one LLM call.
 
     cost_usd is computed here so billing queries never need to re-derive it.
     Failures are silently swallowed — usage tracking must never break the call path.
+
+    Parameters:
+      cached_input_tokens — count of input tokens served from a provider-side
+        prefix cache (Gemini's `cached_content_token_count`).  These are still
+        billed (at a discount on some tiers) but tracking them separately lets
+        the dashboard report a meaningful cache hit rate.
+      provider — string identifying the upstream service ("gemini", "groq_stt").
+        The cost-cap query at /chat filters on provider='gemini' so that voice
+        transcription tokens don't pollute Gemini-priced cost calculations.
     """
     try:
         _cfg = settings().intake
@@ -538,9 +894,11 @@ def record_llm_usage(
             + (output_tokens / 1_000_000) * _cfg.gemini_output_cost_per_million
         )
         exec_one(
-            "INSERT INTO llm_usage (thread_id, node, input_tokens, output_tokens, cost_usd)"
-            " VALUES (?,?,?,?,?)",
-            (thread_id, node, input_tokens, output_tokens, round(cost, 8)),
+            "INSERT INTO llm_usage (thread_id, node, input_tokens, output_tokens,"
+            " cost_usd, cached_input_tokens, provider)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (thread_id, node, input_tokens, output_tokens,
+             round(cost, 8), cached_input_tokens, provider),
         )
     except Exception as _e:
         log_event("llm_usage_record_failed", level="warning",
@@ -548,20 +906,44 @@ def record_llm_usage(
         pass  # never break the happy path over accounting
 
 
-def get_llm_usage_for_thread(thread_id: str) -> dict:
-    """Return aggregated token counts and cost for a single session."""
-    row = fetch_one(
-        "SELECT SUM(input_tokens) AS inp, SUM(output_tokens) AS out,"
-        "       SUM(cost_usd) AS cost, COUNT(*) AS calls"
-        " FROM llm_usage WHERE thread_id=?",
-        (thread_id,),
-    ) or {}
-    return {
-        "total_input_tokens":  row.get("inp") or 0,
-        "total_output_tokens": row.get("out") or 0,
-        "total_cost_usd":      round(row.get("cost") or 0.0, 6),
-        "llm_calls":           row.get("calls") or 0,
-    }
+def record_voice_usage(
+    thread_id: str,
+    *,
+    audio_bytes: int,
+    duration_ms: int,
+    empty: bool,
+    error: bool = False,
+) -> None:
+    """
+    Persist a /transcribe call so the dashboard can show voice activity.
+
+    We piggyback on the llm_usage table (provider='groq_stt') instead of
+    creating a separate voice_usage table — the columns we need (thread_id,
+    counter-style aggregation, created_at) are identical, and one schema
+    is easier to query.  Cost stays 0 because Groq STT is priced per audio-
+    second, not per token; we record the audio_bytes count in input_tokens
+    purely as a cheap analytical signal.
+
+    The `node` field encodes the result so dashboard queries can break
+    voice activity down by ok / empty / error without a second table.
+    """
+    if error:
+        node = "voice_error"
+    elif empty:
+        node = "voice_empty"
+    else:
+        node = "voice_ok"
+    try:
+        exec_one(
+            "INSERT INTO llm_usage (thread_id, node, input_tokens, output_tokens,"
+            " cost_usd, cached_input_tokens, provider)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (thread_id, node, int(audio_bytes), int(duration_ms),
+             0.0, 0, "groq_stt"),
+        )
+    except Exception as _e:
+        log_event("voice_usage_record_failed", level="warning",
+                  thread_id=thread_id, error=str(_e)[:100])
 
 
 # ---------------------------------------------------------------------------
@@ -574,13 +956,14 @@ def create_webhook_delivery(
     event_type: str,
     url_hash: str,
     payload_hash: str,
+    payload_body: bytes | None = None,
 ) -> None:
     """Insert a new delivery record in 'pending' status."""
     exec_one(
         "INSERT INTO webhook_deliveries"
-        " (delivery_id, thread_id, event_type, url_hash, payload_hash, status, attempts)"
-        " VALUES (?,?,?,?,?,'pending',0)",
-        (delivery_id, thread_id, event_type, url_hash, payload_hash),
+        " (delivery_id, thread_id, event_type, url_hash, payload_hash, payload_body, status, attempts)"
+        " VALUES (?,?,?,?,?,?,'pending',0)",
+        (delivery_id, thread_id, event_type, url_hash, payload_hash, payload_body),
     )
 
 
@@ -651,23 +1034,6 @@ def get_exhausted_webhooks(older_than_hours: int = 24, max_lifetime_attempts: in
     )
 
 
-def requeue_webhook_delivery(delivery_id: str) -> None:
-    """
-    Reset an exhausted delivery to 'pending' so the dispatcher will retry it.
-
-    Keeps the existing attempt count intact so the lifetime cap in
-    get_exhausted_webhooks() continues to work correctly.
-    """
-    exec_one(
-        "UPDATE webhook_deliveries"
-        " SET status='pending', next_retry_at=datetime('now'),"
-        "     last_error='requeued_by_dead_letter_worker',"
-        "     updated_at=datetime('now')"
-        " WHERE delivery_id=?",
-        (delivery_id,),
-    )
-
-
 def expire_stale_sessions(ttl_hours: int = 4) -> int:
     """
     Mark sessions that have been 'active' (not done/escalated/expired) for longer
@@ -680,16 +1046,15 @@ def expire_stale_sessions(ttl_hours: int = 4) -> int:
     Returns the number of sessions marked expired.
     """
     def _expire():
-        with _db_lock:
-            c = conn()
-            cur = c.execute(
-                "UPDATE sessions SET status='expired', updated_at=datetime('now')"
-                " WHERE status='active'"
-                "   AND updated_at <= datetime('now', ?)",
-                (f"-{ttl_hours} hours",),
-            )
-            c.commit()
-            return cur.rowcount
+        c = conn()
+        cur = c.execute(
+            "UPDATE sessions SET status='expired', updated_at=datetime('now')"
+            " WHERE status='active'"
+            "   AND updated_at <= datetime('now', ?)",
+            (f"-{ttl_hours} hours",),
+        )
+        c.commit()
+        return cur.rowcount
     return _retry_db_operation(_expire)
 
 
@@ -734,15 +1099,14 @@ def prune_old_checkpoints(days: int = 30) -> int:
 def reset_demo_data() -> None:
     """Wipe all session data. Does not touch emergency_phrases or checkpoint DB."""
     def _reset():
-        with _db_lock:
-            c = conn()
-            for table in [
-                "sessions", "messages", "reports", "escalations",
-                "jobs", "session_state", "idempotency", "llm_failure_log",
-                "webhook_deliveries",
-            ]:
-                c.execute(f"DELETE FROM {table}")
-            c.commit()
+        c = conn()
+        for table in [
+            "sessions", "messages", "reports", "escalations",
+            "jobs", "session_state", "idempotency", "llm_failure_log",
+            "webhook_deliveries",
+        ]:
+            c.execute(f"DELETE FROM {table}")
+        c.commit()
     _retry_db_operation(_reset)
 
 
@@ -789,15 +1153,14 @@ _DEMO_PATIENTS = [
 def seed_demo_patients() -> None:
     """Re-seed mock EHR demo patients, replacing any existing demo rows."""
     def _seed():
-        with _db_lock:
-            c = conn()
-            c.execute("DELETE FROM mock_ehr WHERE patient_id LIKE 'demo-%'")
-            for p in _DEMO_PATIENTS:
-                c.execute(
-                    "INSERT INTO mock_ehr (patient_id, name, history, data_json) VALUES (?,?,?,?)",
-                    (p["patient_id"], p["name"], p["history"], p["data_json"]),
-                )
-            c.commit()
+        c = conn()
+        c.execute("DELETE FROM mock_ehr WHERE patient_id LIKE 'demo-%'")
+        for p in _DEMO_PATIENTS:
+            c.execute(
+                "INSERT INTO mock_ehr (patient_id, name, history, data_json) VALUES (?,?,?,?)",
+                (p["patient_id"], p["name"], p["history"], p["data_json"]),
+            )
+        c.commit()
     _retry_db_operation(_seed)
 
 
@@ -831,7 +1194,10 @@ def assign_experiment_variant(thread_id: str, experiment_id: str) -> str:
     Same thread always gets the same variant. Increments the session counter.
     Returns 'a' or 'b'.
     """
-    variant = "a" if int(hashlib.md5(thread_id.encode()).hexdigest(), 16) % 2 == 0 else "b"
+    # Not security-sensitive (deterministic A/B routing) but lint rules
+    # routinely flag md5; sha256 sliced to 16 hex chars is just as fast and
+    # avoids the noise.
+    variant = "a" if int(hashlib.sha256(thread_id.encode()).hexdigest()[:16], 16) % 2 == 0 else "b"
     col = f"sessions_{variant}"
     exec_one(
         f"UPDATE prompt_experiments SET {col}={col}+1, updated_at=datetime('now')"
@@ -909,17 +1275,20 @@ def get_analytics() -> dict:
     llm_stats = get_llm_failure_stats(days=7)
 
     _pricing = settings().intake
+    # All cost queries filter on provider='gemini' so voice transcription
+    # rows (provider='groq_stt') don't pollute Gemini-priced cost totals.
     cost_row = fetch_one(
         "SELECT COALESCE(SUM(CAST(input_tokens AS REAL)/1000000.0*? "
         "     + CAST(output_tokens AS REAL)/1000000.0*?), 0.0) AS cost "
-        "FROM llm_usage WHERE created_at >= date('now', '-7 days')",
+        "FROM llm_usage "
+        "WHERE provider='gemini' AND created_at >= date('now', '-7 days')",
         (_pricing.gemini_input_cost_per_million, _pricing.gemini_output_cost_per_million),
     ) or {}
     llm_cost_7d = round(float(cost_row.get("cost") or 0.0), 6)
 
     sessions_with_cost = fetch_one(
         "SELECT COUNT(DISTINCT thread_id) AS n FROM llm_usage "
-        "WHERE created_at >= date('now', '-7 days')"
+        "WHERE provider='gemini' AND created_at >= date('now', '-7 days')"
     ) or {}
     sessions_n = sessions_with_cost.get("n") or 0
     avg_cost = round(llm_cost_7d / sessions_n, 6) if sessions_n else 0.0
@@ -927,10 +1296,59 @@ def get_analytics() -> dict:
     cost_today_row = fetch_one(
         "SELECT COALESCE(SUM(CAST(input_tokens AS REAL)/1000000.0*? "
         "     + CAST(output_tokens AS REAL)/1000000.0*?), 0.0) AS cost "
-        "FROM llm_usage WHERE created_at >= date('now')",
+        "FROM llm_usage "
+        "WHERE provider='gemini' AND created_at >= date('now')",
         (_pricing.gemini_input_cost_per_million, _pricing.gemini_output_cost_per_million),
     ) or {}
     llm_cost_today = round(float(cost_today_row.get("cost") or 0.0), 6)
+
+    # Cache hit rate over 7 days — fraction of input tokens served from
+    # Gemini's implicit prefix cache.  Surfacing this lets ops spot prompt
+    # regressions (a sudden drop in hit rate often means a system prompt
+    # changed in a way that broke prefix-caching).
+    cache_row = fetch_one(
+        "SELECT COALESCE(SUM(input_tokens), 0)        AS total_in,"
+        "       COALESCE(SUM(cached_input_tokens), 0) AS cached_in"
+        " FROM llm_usage WHERE provider='gemini' "
+        " AND created_at >= date('now', '-7 days')"
+    ) or {}
+    total_in_7d  = int(cache_row.get("total_in")  or 0)
+    cached_in_7d = int(cache_row.get("cached_in") or 0)
+    cache_hit_rate_pct = round(cached_in_7d / total_in_7d * 100, 1) if total_in_7d else 0.0
+
+    # Per-node cost breakdown (Gemini only).  Lets the dashboard show which
+    # nodes drive spend — useful when tuning prompts or deciding which
+    # node to swap to a cheaper model tier.
+    node_cost_rows = fetch_all(
+        "SELECT node,"
+        "       COUNT(*) AS calls,"
+        "       SUM(input_tokens) AS in_tok,"
+        "       SUM(output_tokens) AS out_tok,"
+        "       ROUND(SUM(CAST(input_tokens AS REAL)/1000000.0*?"
+        "                 + CAST(output_tokens AS REAL)/1000000.0*?), 6) AS cost_usd"
+        " FROM llm_usage"
+        " WHERE provider='gemini' AND created_at >= date('now', '-7 days')"
+        " GROUP BY node"
+        " ORDER BY cost_usd DESC",
+        (_pricing.gemini_input_cost_per_million, _pricing.gemini_output_cost_per_million),
+    )
+
+    # Voice transcription stats (groq_stt rows).  node encodes the result:
+    # voice_ok / voice_empty / voice_error — see record_voice_usage.
+    voice_today_row = fetch_one(
+        "SELECT COUNT(*) AS n FROM llm_usage "
+        "WHERE provider='groq_stt' AND created_at >= date('now')"
+    ) or {}
+    voice_breakdown = fetch_all(
+        "SELECT node, COUNT(*) AS n FROM llm_usage "
+        "WHERE provider='groq_stt' AND created_at >= date('now', '-7 days')"
+        " GROUP BY node"
+    )
+    voice_counts = {row["node"]: int(row["n"]) for row in voice_breakdown}
+    voice_total_7d = sum(voice_counts.values())
+    voice_empty_pct_7d = round(
+        voice_counts.get("voice_empty", 0) / voice_total_7d * 100, 1
+    ) if voice_total_7d else 0.0
 
     # Repair rate over the last hour — a sudden spike signals a prompt regression
     # that silently doubles LLM cost for affected calls.
@@ -976,4 +1394,16 @@ def get_analytics() -> dict:
         "avg_cost_per_session_usd": avg_cost,
         "repair_rate_last_1h": repair_rate_1h,
         "repair_rate_alert": repair_rate_alert,
+        # Cache + cost breakdown — drives the new dashboard panels.
+        "cache_hit_rate_pct_7d":   cache_hit_rate_pct,
+        "input_tokens_7d":         total_in_7d,
+        "cached_input_tokens_7d":  cached_in_7d,
+        "cost_by_node_7d":         node_cost_rows,
+        # Voice (groq_stt) — present even when feature is off (counts will be 0).
+        "voice_transcribes_today": int(voice_today_row.get("n") or 0),
+        "voice_transcribes_7d":    voice_total_7d,
+        "voice_ok_7d":             voice_counts.get("voice_ok", 0),
+        "voice_empty_7d":          voice_counts.get("voice_empty", 0),
+        "voice_error_7d":          voice_counts.get("voice_error", 0),
+        "voice_empty_pct_7d":      voice_empty_pct_7d,
     }

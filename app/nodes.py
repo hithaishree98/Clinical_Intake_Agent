@@ -8,13 +8,22 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime as _dt
 from typing import Dict, List
 
-from .prompts import subjective_extract_system, meds_extract_system, report_system, identity_extract_system, intent_classify_system, PROMPT_VERSIONS
+from .prompts import (
+    subjective_extract_system,
+    meds_extract_system,
+    report_system,
+    identity_extract_system,
+    list_extract_system,
+    PROMPT_VERSIONS,
+)
 from .state import IntakeState
-from .schemas import SubjectiveOut, MedsOut, ReportInputState, IdentityOut, IntentOut
-from .llm import run_json_step, get_gemini, validate_llm_response
+from .schemas import (
+    SubjectiveOut, MedsOut, ReportInputState, IdentityOut, IntentOut,
+    ListExtractOut,
+)
+from .llm import run_json_step, get_provider, validate_llm_response
 from .agentic import (
     adapt_clinical_question,
     score_extraction_quality,
@@ -27,16 +36,26 @@ from . import sqlite_db as db
 from . import fhir_builder
 from . import webhook
 from .integrations.fhir_client import push_bundle as _fhir_push_bundle
+from .intent import (
+    classify_intent,
+    is_bare_acknowledgment,
+    _CORRECTION_RE,
+    _IDENTITY_FIELDS_RE,
+    _SYMPTOM_FIELDS_RE,
+    _HISTORY_FIELDS_RE,
+    _ALLERGY_FIELDS_RE,
+    _MEDS_FIELDS_RE,
+    _PMH_FIELDS_RE,
+    _RESULTS_FIELDS_RE,
+)
 from .extract import (
-    is_yes,
-    is_no,
-    is_ack,
     detect_emergency_red_flags,
     extract_allergies_simple,
     extract_list_simple,
     detect_crisis,
     has_soft_distress,
     llm_crisis_score,
+    _is_none_response,
     CRISIS_RESOURCE,
     CONSENT_MESSAGE,
     validate_dob,
@@ -98,81 +117,21 @@ def _summary_identity(x: Dict[str, str]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Intent classification — replaces hardcoded yes/no keyword lists
+# Intent classification — see app/intent.py.
+#
+# This file used to define `_classify_intent`, `_HARD_YES`, `_HARD_NO`,
+# `_INTENT_MAX_WORDS_FOR_LLM`, and the four correction regexes.  Those have
+# moved to app/intent.py so every phase classifies patient messages through
+# one well-tested path.  Old in-file copies are gone — call classify_intent()
+# (imported above) directly with the thread_id for token-usage accounting.
+#
+# A thin local adapter is kept so existing call sites that pass `state`
+# rather than `thread_id` continue to read naturally.
 # ---------------------------------------------------------------------------
 
-# Fast-path thresholds — messages longer than this are almost never bare yes/no,
-# so we skip the LLM classifier and treat them as provide_info directly.
-_INTENT_MAX_WORDS_FOR_LLM = 8
-
-# Hard yes/no that are unambiguous even without LLM — exact matches only.
-# Anything beyond this short list goes to the LLM.
-_HARD_YES = {"yes", "y", "yeah", "yep", "yup", "ok", "okay", "sure", "mhm",
-             "correct", "right", "confirm", "confirmed", "looks good", "that's right",
-             "thats right", "sounds right", "go ahead", "proceed"}
-_HARD_NO  = {"no", "n", "nope", "nah", "no thanks", "nah thanks"}
-
-
 def _classify_intent(user: str, state: IntakeState) -> IntentOut:
-    """
-    Classify patient message intent using a two-tier approach.
-
-    Tier 1 (free): exact match on a small set of unambiguous tokens.
-      - Long messages (> 8 words) → provide_info without any LLM call.
-      - Exact match in _HARD_YES → confirm.
-      - Exact match in _HARD_NO  → decline.
-      - Obvious correction regex  → correction + section detection.
-
-    Tier 2 (LLM): short ambiguous messages only.
-      - "I think so", "not really", "hmm yeah", "I suppose".
-      - run_json_step with IntentOut schema + intent_classify_system.
-      - Fast: max_tokens=40, temperature=0.0.
-      - Falls back to "unclear" on LLM error — callers handle "unclear"
-        by asking the patient to rephrase.
-
-    This replaces is_yes() / is_no() / is_ack() everywhere they are used
-    to classify intent (not to extract facts).
-    """
-    t = (user or "").strip()
-    tl = t.lower()
-
-    # Long messages are never bare yes/no
-    if len(t.split()) > _INTENT_MAX_WORDS_FOR_LLM:
-        return IntentOut(intent="provide_info")
-
-    if tl in _HARD_YES:
-        return IntentOut(intent="confirm")
-    if tl in _HARD_NO:
-        return IntentOut(intent="decline")
-
-    # Obvious correction patterns — regex is fine for explicit language like
-    # "go back", "change my name", "I said the wrong DOB".
-    if _CORRECTION_RE.search(t):
-        section = "none"
-        if _IDENTITY_FIELDS_RE.search(t):
-            section = "identity"
-        elif _SYMPTOM_FIELDS_RE.search(t):
-            section = "symptoms"
-        elif _HISTORY_FIELDS_RE.search(t):
-            section = "history"
-        return IntentOut(intent="correction", correcting_section=section)
-
-    # Tier 2: LLM for genuinely ambiguous short messages
-    thread_id = (state or {}).get("thread_id", "")
-    obj, meta = run_json_step(
-        system=intent_classify_system(),
-        prompt=f"PATIENT_MESSAGE={t}",
-        schema=IntentOut,
-        fallback={"intent": "unclear", "correcting_section": "none"},
-        temperature=0.0,
-        max_tokens=40,
-    )
-    inp = meta.get("input_tokens") or 0
-    out = meta.get("output_tokens") or 0
-    if inp or out:
-        db.record_llm_usage(thread_id=thread_id, node="intent_classify",
-                            input_tokens=inp, output_tokens=out)
-    return obj
+    """Adapter: route an in-node call to intent.classify_intent with thread_id."""
+    return classify_intent(user, (state or {}).get("thread_id", ""))
 
 
 # ---------------------------------------------------------------------------
@@ -201,8 +160,34 @@ def guard_node(state: IntakeState):
       - Testable in isolation without running the full state machine.
     """
     user = last_user(state).strip()
+    # LangGraph 0.2.x rejects an empty {} from a node — every return must
+    # write at least one declared state field.  When the guard has nothing
+    # to do (no user message, or no crisis), we re-write `crisis_detected`
+    # to its current value: a structural no-op that satisfies the framework
+    # without altering semantics.  Pulled into a constant so both early-exit
+    # paths use the same idiom.
+    _guard_noop = {"crisis_detected": bool(state.get("crisis_detected"))}
+
     if not user:
-        return {}   # nothing to check — first turn or empty message
+        return _guard_noop   # nothing to check — first turn or empty message
+
+    # Once a crisis fired, every subsequent message would otherwise re-run
+    # detection, file another escalation row, and re-page Slack.  We've
+    # already alerted clinicians; keep replying with the safety message
+    # and let the graph route to END via route_after_guard.
+    if state.get("crisis_detected"):
+        return {
+            "crisis_detected":         True,
+            "current_phase":           "handoff",
+            "validation_target_phase": None,
+            "validation_errors":       [],
+            "messages": [{"role": "assistant", "text":
+                "I want to make sure you're safe. Please call or text 988 — "
+                "they're available 24/7. A clinician at this facility has been notified."}],
+        }
+
+    if state.get("needs_emergency_review"):
+        return _guard_noop   # already escalated — don't double-alert
 
     thread_id    = state.get("thread_id", "")
     patient_name = (state.get("identity") or {}).get("name") or "unknown patient"
@@ -224,12 +209,15 @@ def guard_node(state: IntakeState):
             patient_name=patient_name,
             matched_phrases=crisis_flags,
             partial_identity=state.get("identity") or {},
-            message_preview=user,
         )
         return {
-            "crisis_detected":      True,
-            "human_review_required": True,
-            "current_phase":        "handoff",
+            "crisis_detected":          True,
+            "human_review_required":    True,
+            "current_phase":            "handoff",
+            # Clear validation routing so the snapshot can't yield
+            # Confirm/Make-a-change quick-replies over the 988 message.
+            "validation_target_phase":  None,
+            "validation_errors":        [],
             "messages": [{"role": "assistant", "text": CRISIS_RESOURCE}],
         }
 
@@ -253,45 +241,75 @@ def guard_node(state: IntakeState):
                 thread_id=thread_id, patient_name=patient_name,
                 matched_phrases=[f"llm_detected ({score.confidence}): {score.reasoning}"],
                 partial_identity=state.get("identity") or {},
-                message_preview=user,
             )
             return {
-                "crisis_detected":       True,
-                "human_review_required": True,
-                "current_phase":         "handoff",
+                "crisis_detected":          True,
+                "human_review_required":    True,
+                "current_phase":            "handoff",
+                "validation_target_phase":  None,
+                "validation_errors":        [],
                 "messages": [{"role": "assistant", "text": CRISIS_RESOURCE}],
             }
         if score.is_crisis_risk and score.confidence == "low":
             log_event("soft_distress_flagged", level="info",
                       thread_id=thread_id, reasoning=score.reasoning)
 
-    return {}   # no crisis — proceed to business node
+    # ── Emergency red flag detection — covers every phase ────────────────────
+    # Centralised here so consent, identity, clinical_history, and confirm
+    # phases all receive emergency detection, not just subjective.
+    cc        = state.get("chief_complaint") or ""
+    op        = state.get("opqrst") or {}
+    red_flags = detect_emergency_red_flags(cc, op, user)
+    if red_flags:
+        triage = {
+            "emergency_flag": True,
+            "risk_level":     "high",
+            "visit_type":     "emergency",
+            "red_flags":      red_flags,
+            "confidence":     "high",
+            "rationale":      "Red-flag phrase detected in patient input.",
+        }
+        db.create_escalation(
+            thread_id=thread_id,
+            kind="emergency",
+            payload=build_reason_trail(
+                "emergency",
+                {**state, "triage": triage},
+                extra_data={"red_flags": red_flags, "triage": triage},
+            ),
+        )
+        db.set_session_status(thread_id, "escalated")
+        log_event("emergency_escalation", level="warning",
+                  thread_id=thread_id, red_flags=red_flags)
+        webhook.dispatch_emergency_alert(
+            thread_id=thread_id,
+            patient_name=patient_name,
+            red_flags=red_flags,
+            session_short=thread_id[:8],
+        )
+        return {
+            "triage":                  triage,
+            "needs_emergency_review":  True,
+            "current_phase":           "handoff",
+            "validation_target_phase": None,
+            "validation_errors":       [],
+            "messages": [{"role": "assistant", "text":
+                "Based on what you shared, this could be urgent. "
+                "Please call 911 or go to the nearest emergency room now. "
+                "A clinician has been notified."}],
+        }
+
+    return _guard_noop   # no crisis or emergency — proceed to business node
 
 
 # ---------------------------------------------------------------------------
-# Global correction intent — shared by every interactive node
+# Global correction intent — shared by every interactive node.
+#
+# Regexes (_CORRECTION_RE, _IDENTITY_FIELDS_RE, _SYMPTOM_FIELDS_RE,
+# _HISTORY_FIELDS_RE) live in app/intent.py and are imported above.  Keep them
+# in one place so intent classification and "what did the patient want to
+# correct?" detection always agree.
 # ---------------------------------------------------------------------------
-
-_CORRECTION_RE = re.compile(
-    r"\b(go\s+back|start\s+over|change\s+my|fix\s+my|correct\s+my|"
-    r"update\s+my|i\s+made\s+a\s+mistake|that('?s|\s+is)\s+(wrong|incorrect|not\s+right)|"
-    r"actually\s+my|wait[,\s]+my|i\s+said\s+(the\s+)?wrong|let\s+me\s+(change|correct|fix)|"
-    r"can\s+i\s+(change|correct|fix|go\s+back))\b",
-    re.IGNORECASE,
-)
-
-_IDENTITY_FIELDS_RE = re.compile(
-    r"\b(name|dob|date\s+of\s+birth|birthday|phone|number|address|contact)\b",
-    re.IGNORECASE,
-)
-_SYMPTOM_FIELDS_RE = re.compile(
-    r"\b(symptom|pain|complaint|onset|quality|severity|timing|radiation|provocation|headache|hurt|ache)\b",
-    re.IGNORECASE,
-)
-_HISTORY_FIELDS_RE = re.compile(
-    r"\b(allerg|med(ication|icine|s)?|history|pmh|surgeri|surgery|test|lab|imaging|result)\b",
-    re.IGNORECASE,
-)
 
 
 def _try_correction(user: str, state: IntakeState) -> dict | None:
@@ -325,22 +343,56 @@ def _try_correction(user: str, state: IntakeState) -> dict | None:
                 "No problem — what would you like to change about your symptoms?"}],
         }
     if _HISTORY_FIELDS_RE.search(user):
+        # Route to the specific clinical step the patient named.  Previously
+        # this always reset to allergies regardless of which field they
+        # mentioned — "change my medications" cleared only allergies, so
+        # _next_clinical_step_needed found medications still in state and
+        # skipped it, leaving the old data unchanged and looping back to
+        # confirm.
+        if _ALLERGY_FIELDS_RE.search(user):
+            return {
+                "current_phase": "clinical_history",
+                "clinical_step": "allergies",
+                "allergies": None,
+                "messages": [{"role": "assistant", "text":
+                    "Of course — what allergies would you like to correct?"}],
+            }
+        if _MEDS_FIELDS_RE.search(user):
+            return {
+                "current_phase": "clinical_history",
+                "clinical_step": "meds",
+                "medications": None,
+                "messages": [{"role": "assistant", "text":
+                    "Of course — what medications would you like to update?"}],
+            }
+        if _PMH_FIELDS_RE.search(user):
+            return {
+                "current_phase": "clinical_history",
+                "clinical_step": "pmh",
+                "pmh": None,
+                "messages": [{"role": "assistant", "text":
+                    "Of course — what would you like to change about your past medical history?"}],
+            }
+        if _RESULTS_FIELDS_RE.search(user):
+            return {
+                "current_phase": "clinical_history",
+                "clinical_step": "results",
+                "recent_results": None,
+                "messages": [{"role": "assistant", "text":
+                    "Of course — what lab or imaging results would you like to update?"}],
+            }
+        # Generic "go back to history" with no specific field named — restart
+        # from allergies so no step is skipped.
         return {
             "current_phase": "clinical_history",
             "clinical_step": "allergies",
-            "medications": None,
-            "pmh": None,
-            "recent_results": None,
+            "allergies": None,
             "messages": [{"role": "assistant", "text":
                 "Sure — let's go through your health history again. "
                 "Do you have any allergies?"}],
         }
     # Generic go-back without specifying what — show a menu
     phase = state.get("current_phase") or "identity"
-    _phase_labels = {
-        "subjective": "symptoms", "clinical_history": "health history",
-        "confirm": "review", "identity": "contact details",
-    }
     options = [
         "your contact details (name, DOB, phone, address)",
         "your symptoms",
@@ -351,6 +403,81 @@ def _try_correction(user: str, state: IntakeState) -> dict | None:
         "messages": [{"role": "assistant", "text":
             "Of course — what would you like to go back and change?\n" +
             "\n".join(f"  • {o}" for o in options)}],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Clinical-history step ordering — used to skip past fields the patient
+# already filled in earlier turns (e.g. after a "go back to allergies"
+# correction we don't re-ask meds / PMH / recent results).
+# ---------------------------------------------------------------------------
+
+_CLINICAL_STEP_ORDER: tuple[str, ...] = ("allergies", "meds", "pmh", "results")
+_CLINICAL_STEP_FIELD: dict[str, str] = {
+    "allergies": "allergies",
+    "meds":      "medications",
+    "pmh":       "pmh",
+    "results":   "recent_results",
+}
+
+
+def _next_clinical_step_needed(state: dict, *, starting_at: str) -> str:
+    """
+    Return the first clinical step at or after `starting_at` whose
+    corresponding state field is still ``None``.  Returns ``"done"`` when
+    every step's data has been collected.
+
+    Drives the post-step transitions in clinical_history_node so that a
+    correction (e.g. "edit allergies" while in meds) does not force the
+    patient to re-answer questions whose answers are still in state.
+    """
+    try:
+        i = _CLINICAL_STEP_ORDER.index(starting_at)
+    except ValueError:
+        return "done"
+    for s in _CLINICAL_STEP_ORDER[i:]:
+        if state.get(_CLINICAL_STEP_FIELD[s]) is None:
+            return s
+    return "done"
+
+
+_CLINICAL_STEP_DEFAULT_QUESTION: dict[str, str] = {
+    "meds": (
+        "Are you currently taking any medications — prescription, over-the-counter, "
+        "vitamins, or supplements? If you're not on anything at the moment, just let me know."
+    ),
+    "pmh": (
+        "Almost there. Have you had any significant health conditions in the past, "
+        "or any surgeries? If nothing comes to mind, that's perfectly fine."
+    ),
+    "results": (
+        "Last one — have you had any recent tests done, like blood work, X-rays, or scans? "
+        "If not, we're all set."
+    ),
+}
+
+
+def _question_for_clinical_step(step: str, classification: str) -> str:
+    """Return the prompt text for `step`, preferring the classification-aware
+    variant from adapt_clinical_question when available."""
+    return adapt_clinical_question(step, classification) or _CLINICAL_STEP_DEFAULT_QUESTION.get(step, "")
+
+
+def _clinical_history_done_patch(state: dict) -> dict:
+    """
+    Build the state-patch that ends clinical_history and routes to
+    validate→confirm.  Used when every step's data is already filled.
+    """
+    summary = _confirm_summary(state)
+    return {
+        "clinical_complete": True,
+        "clinical_step": "done",
+        "validation_target_phase": "confirm",
+        "validation_errors": [],
+        "current_phase": "validate",
+        "messages": [{"role": "assistant", "text":
+            summary + "\n\nDoes everything look right? Reply 'confirm' and I'll prepare "
+            "the note for your care team, or let me know what needs changing."}],
     }
 
 
@@ -388,18 +515,46 @@ def _track_llm_failure(thread_id: str, node: str, meta: dict) -> None:
 
     Token usage is always recorded regardless of success/failure so billing
     can aggregate per-session costs accurately.
+
+    failure_type taxonomy (mutually exclusive):
+      api_error    — provider call itself failed (llm_ok=False); fallback dict served.
+      parse_error  — provider returned text but it never parsed into the schema,
+                     not even after a repair attempt.  Fallback dict served.
+      repair_used  — primary parse failed; the repair call succeeded.  No fallback.
+
+    The previous code overloaded "fallback_used" to mean either api_error or
+    parse_error, which made the analytics 'most-failing-node' query ambiguous
+    (was the node hitting a flaky API or a bad prompt?).  The split is the
+    same one promised by the schema docstring and get_llm_failure_stats.
+
     Does not raise — tracking must never break the happy path.
     """
     # Always record token usage (even on clean runs).
-    inp = meta.get("input_tokens") or 0
-    out = meta.get("output_tokens") or 0
+    inp    = meta.get("input_tokens") or 0
+    out    = meta.get("output_tokens") or 0
+    cached = meta.get("cached_input_tokens") or 0
     if inp or out:
-        db.record_llm_usage(thread_id=thread_id, node=node,
-                            input_tokens=inp, output_tokens=out)
+        db.record_llm_usage(
+            thread_id=thread_id,
+            node=node,
+            input_tokens=inp,
+            output_tokens=out,
+            cached_input_tokens=cached,
+        )
 
-    if not (meta.get("fallback_used") or meta.get("repair_used")):
-        return
-    failure_type = "fallback_used" if meta.get("fallback_used") else "repair_used"
+    fallback = bool(meta.get("fallback_used"))
+    repair   = bool(meta.get("repair_used"))
+    llm_ok   = bool(meta.get("llm_ok"))
+
+    if fallback and not llm_ok:
+        failure_type = "api_error"
+    elif fallback:
+        failure_type = "parse_error"
+    elif repair:
+        failure_type = "repair_used"
+    else:
+        return  # primary call succeeded — nothing to log
+
     try:
         db.record_llm_failure(
             thread_id=thread_id,
@@ -454,6 +609,123 @@ def _failure_state_patch(meta: dict, phase: str) -> dict:
             "last_failure_reason": f"repair_used: {(meta.get('parse_error') or 'unknown')[:120]}",
         }
     return {}
+
+
+def _regex_list_fallback(user: str, field_kind: str) -> list[str]:
+    """Legacy regex extractor — used when the LLM list extractor is disabled
+    or has fallen back.  Allergies get drug-name normalization (Tylenol →
+    acetaminophen); PMH and recent_results are returned verbatim."""
+    if field_kind == "allergies":
+        return extract_allergies_simple(user)
+    return extract_list_simple(user)
+
+
+def _extract_clinical_list(
+    *,
+    user: str,
+    field_kind: str,
+    thread_id: str,
+) -> tuple[list[str], bool, str, dict]:
+    """
+    LLM-driven extraction of a clinical list field.
+
+    Replaces the regex-based extract_allergies_simple / extract_list_simple
+    in clinical_history_node so that messages like:
+      "yes I'm allergic to peanuts and pollen"
+      "had a heart attack in 2019 and gallbladder removed in 2021"
+      "blood pressure check last month, results were normal"
+    parse into clean clinical entries instead of being stored as a single
+    sentence (or split mid-clause by `\\band\\b`).
+
+    Args:
+      field_kind: one of "allergies", "pmh", "recent_results".
+
+    Returns:
+      (items, items_complete, reply, meta)
+
+    items_complete = False  → caller should re-prompt with the LLM's `reply`
+                              and stay on this clinical_step.
+    items_complete = True   → caller advances; items may be empty for a
+                              "no allergies" / "no PMH" / "no recent tests"
+                              answer.
+
+    Resilience:
+      - meta is the standard run_json_step metadata so callers can apply
+        _failure_state_patch and _cost_patch uniformly.
+      - On a complete LLM transport failure the runner already returns the
+        hardcoded fallback (items=[], items_complete=True), which means the
+        caller advances with an empty list rather than stalling.  We also
+        cross-check by falling back to the legacy regex parser so a degraded
+        Gemini doesn't silently drop a patient's allergies.
+      - settings.intake.use_llm_list_extractor=False bypasses the LLM
+        entirely and uses the regex parser.  Useful for cost A/B tests or
+        as an emergency switch if the prompt regresses.
+    """
+    # Feature-flagged regex-only path.  Returns a synthetic meta with the
+    # SAME shape as run_json_step's so _failure_state_patch / _cost_patch
+    # / log_event(**meta) contracts stay identical to the LLM path.
+    # fallback_used=False is deliberate — the regex is the configured
+    # choice, not a degradation, and we don't want it counted in
+    # llm_failure_log analytics.
+    if not settings().intake.use_llm_list_extractor:
+        regex_meta = {
+            "llm_ok":              True,
+            "llm_error":           "",
+            "latency_ms":          0,
+            "parse_ok":            True,
+            "parse_error":         "",
+            "repair_used":         False,
+            "fallback_used":       False,
+            "raw_preview":         "",
+            "cleaned_preview":     "",
+            "input_tokens":        0,
+            "output_tokens":       0,
+            "cached_input_tokens": 0,
+            "cost_usd":            0.0,
+            "model":               "regex_only",
+        }
+        items = _regex_list_fallback(user, field_kind)
+        log_event("llm_step", thread_id=thread_id,
+                  node=f"clinical_history:{field_kind}",
+                  prompt_version="regex_only", experiment_id=None,
+                  **regex_meta)
+        return items, True, "", regex_meta
+
+    obj, meta = run_json_step(
+        system=list_extract_system(field_kind, RESPONSE_RULES),
+        prompt=f"NEW_USER_MESSAGE={user}",
+        schema=ListExtractOut,
+        fallback={"items": [], "items_complete": True, "reply": ""},
+        temperature=0.1,
+        max_tokens=300,
+        cache_key=f"list_extract:{field_kind}",
+    )
+    list_version, exp_id = db.resolve_prompt_variant(
+        thread_id, "list_extract", PROMPT_VERSIONS.get("list_extract", "")
+    )
+    log_event("llm_step", thread_id=thread_id, node=f"clinical_history:{field_kind}",
+              prompt_version=list_version, experiment_id=exp_id, **meta)
+    _track_llm_failure(thread_id, f"clinical_history:{field_kind}", meta)
+
+    items = list(obj.items)
+    complete = bool(obj.items_complete)
+    reply = _safe_reply((obj.reply or "").strip())
+
+    # Belt-and-suspenders: when the LLM completely fell back (network down,
+    # repair failed) the runner returns items=[] with fallback_used=True.
+    # An empty list from the LLM is ambiguous in that case — it might mean
+    # "no allergies" or "I had nothing to extract because the call failed".
+    # Re-run the legacy regex parser as a sanity check; if it found anything,
+    # prefer that so we don't silently lose patient data.
+    if meta.get("fallback_used") and not items:
+        regex_items = _regex_list_fallback(user, field_kind)
+        if regex_items:
+            log_event("list_extract_regex_recovery", level="warning",
+                      thread_id=thread_id, field=field_kind,
+                      recovered_count=len(regex_items))
+            items = regex_items
+
+    return items, complete, reply, meta
 
 
 def _build_validated_report_state(state: IntakeState) -> ReportInputState:
@@ -587,10 +859,11 @@ def identity_node(state: IntakeState):
         if val and not (identity.get(field) or "").strip():
             identity[field] = val
 
-    # Sanity-check DOB (future date, impossible age) — validate_dob accepts ISO 8601
+    # Sanity-check DOB (future date, impossible age) — validate_dob accepts ISO 8601.
+    # dob_raw is already ISO 8601 from IdentityOut._norm_dob so no reformatting is needed.
     dob_raw = (identity.get("dob") or "").strip()
     if dob_raw:
-        dob_clean, dob_err = validate_dob(dob_raw)
+        _, dob_err = validate_dob(dob_raw)
         if dob_err:
             identity["dob"] = ""
             return {
@@ -601,11 +874,6 @@ def identity_node(state: IntakeState):
                     "Any format works, like '15 March 1985' or '1985-03-15'."}],
                 "current_phase": "identity",
             }
-        # validate_dob returns MM/DD/YYYY — keep storage as ISO 8601 for consistency
-        try:
-            identity["dob"] = _dt.strptime(dob_clean, "%m/%d/%Y").strftime("%Y-%m-%d")
-        except ValueError:
-            pass  # already ISO 8601 if strptime failed (shouldn't happen)
 
     attempts += 1
     missing = [k for k in ["name", "dob", "phone", "address"] if not (identity.get(k) or "").strip()]
@@ -624,10 +892,10 @@ def identity_node(state: IntakeState):
                 "current_phase": "done",
             }
         q = {
-            "name":    "What's your full name?",
+            "name":    "What's your full name? Please include both your first and last name.",
             "dob":     "What's your date of birth? Any format works — for example '15 March 1985' or '1985-03-15'.",
             "phone":   "What's the best phone number to reach you?",
-            "address": "What's your home address?",
+            "address": "What's your home address? Please include your street, city, state, and zip code — for example, '123 Main St, Pittsburgh, PA 15213'.",
         }[missing[0]]
         return {
             "identity": identity,
@@ -638,6 +906,24 @@ def identity_node(state: IntakeState):
         }
 
     stored = db.get_stored_identity_by_name(identity["name"])
+
+    # Derive a stable patient_id now that name + dob are both captured.
+    # Must run before the stored-identity branch so returning mock EHR patients
+    # also get their patient_id persisted and Layer-2 memory merged on report.
+    pid = db.derive_patient_id(identity.get("name", ""), identity.get("dob", ""))
+    prior_summary = None
+    if pid:
+        db.set_session_patient_id(thread_id, pid)
+        prior_summary = db.get_patient_summary(pid)
+        if prior_summary:
+            log_event("returning_patient_loaded", thread_id=thread_id,
+                      patient_id=pid, visit_count=prior_summary["visit_count"])
+
+    # patient_id is also persisted on the sessions row above for SQL-side
+    # joins, but report_node and memory.merge_summary read it from
+    # IntakeState — so it must travel through the graph state too, otherwise
+    # FHIR Patient.id falls back to thread-derived and Layer-2 memory upsert
+    # silently no-ops.
     if stored:
         name    = (stored.get("name")    or "").strip()
         phone   = (stored.get("phone")   or "").strip()
@@ -650,28 +936,22 @@ def identity_node(state: IntakeState):
         return {
             "identity": identity,
             "stored_identity": stored,
+            "prior_summary": prior_summary or {},
+            "patient_id": pid,
             "messages": [{"role": "assistant", "text":
                 f"Welcome back{', ' + name if name else ''}!{details} "
                 "Does everything still look right, or has anything changed? "
                 "(reply 'yes' to keep, 'no' to update)"
             }],
             "current_phase": "identity_review",
+            **_cost_patch(state, meta),
         }
-
-        # Derive a stable patient_id now that name + dob are both captured.
-    # All future retrieval (prior visits, patient summary) keys off this.
-    pid = db.derive_patient_id(identity.get("name", ""), identity.get("dob", ""))
-    prior_summary = None
-    if pid:
-        db.set_session_patient_id(thread_id, pid)
-        prior_summary = db.get_patient_summary(pid)
-        if prior_summary:
-            log_event("returning_patient_loaded", thread_id=thread_id,
-                      patient_id=pid, visit_count=prior_summary["visit_count"])
 
     return {
         "identity": identity,
         "stored_identity": None,
+        "prior_summary": prior_summary or {},
+        "patient_id": pid,
         "identity_status": "unverified",
         "needs_identity_review": True,
         "messages": [{"role": "assistant", "text":
@@ -767,7 +1047,7 @@ def identity_review_node(state: IntakeState):
 # Needs-ED-followup heuristic
 # ---------------------------------------------------------------------------
 
-def needs_ed_followup(cc: str, _op: Dict[str, str]) -> bool:
+def needs_ed_followup(cc: str) -> bool:
     t = (cc or "").lower()
     breathing = any(k in t for k in ["shortness of breath", "sob", "difficulty breathing"])
     neuro     = any(k in t for k in ["weakness", "numbness", "slurred speech", "face droop", "confusion"])
@@ -841,7 +1121,15 @@ def subjective_node(state: IntakeState):
                 {"onset": "", "provocation": "", "quality": "", "radiation": "", "severity": "", "timing": ""})
     thread_id = state.get("thread_id", "")
 
-    if not cc and (not user or is_ack(user) or is_yes(user) or is_no(user)):
+    # Re-prompt only when the patient has not said anything yet.  Earlier
+    # versions also short-circuited on is_yes/is_no/is_ack to save one LLM
+    # call, but the prefix-based helpers matched substantive messages like
+    # "yes I have chest pain" and "no I just have a headache" and re-asked
+    # the chief-complaint question, discarding the actual symptom.  Hand any
+    # substantive text to the LLM extraction path instead — the cost of one
+    # extra extraction call is preferable to losing a chief complaint on
+    # turn one.
+    if not cc and not user:
         return {
             "messages": [{"role": "assistant", "text": "What's the main reason for your visit today? (in your own words)"}],
             "current_phase": "subjective",
@@ -853,47 +1141,6 @@ def subjective_node(state: IntakeState):
         correction = _try_correction(user, state)
         if correction and correction.get("current_phase") != "subjective":
             return correction
-
-    # Emergency red flag detection
-    flags = detect_emergency_red_flags(cc, op, user)
-    if flags:
-        triage = {
-            "emergency_flag": True,
-            "risk_level": "high",
-            "visit_type": "emergency",
-            "red_flags": flags,
-            "confidence": "high",
-            "rationale": "Red-flag phrase detected in patient input.",
-        }
-        db.create_escalation(
-            thread_id=thread_id,
-            kind="emergency",
-            payload=build_reason_trail(
-                "emergency",
-                {**state, "triage": triage, "current_phase": "subjective"},
-                extra_data={"red_flags": flags, "triage": triage},
-            ),
-        )
-        db.set_session_status(thread_id, "escalated")
-        log_event("emergency_escalation", level="warning",
-                  thread_id=thread_id, red_flags=flags)
-
-        patient_name = (state.get("identity") or {}).get("name") or "unknown patient"
-        webhook.dispatch_emergency_alert(
-            thread_id=thread_id,
-            patient_name=patient_name,
-            red_flags=flags,
-            session_short=thread_id[:8],
-        )
-        return {
-            "triage": triage,
-            "needs_emergency_review": True,
-            "messages": [{"role": "assistant", "text":
-                "Based on what you shared, this could be urgent. "
-                "Please call 911 or go to the nearest emergency room now. "
-                "A clinician has been notified."}],
-            "current_phase": "handoff",
-        }
 
     # LLM extraction
     prior_ctx = format_for_prompt(state.get("prior_summary") or {})
@@ -971,7 +1218,7 @@ def subjective_node(state: IntakeState):
         mode     = state.get("mode") or "clinic"
         attempts = int(state.get("triage_attempts") or 0)
 
-        if mode == "ed" and attempts < 1 and needs_ed_followup(cc, op):
+        if mode == "ed" and attempts < 1 and needs_ed_followup(cc):
             return {
                 "chief_complaint": cc,
                 "opqrst": op,
@@ -1010,7 +1257,22 @@ def subjective_node(state: IntakeState):
             }
 
         triage = compute_basic_triage(mode, cc, op)
-        # Feature 4: route through validate_node before advancing to clinical_history
+        # Advance directly to clinical_history and emit the first allergy
+        # question on this same turn.  We used to set current_phase="validate"
+        # and let validate_node route to clinical_history on the next /chat
+        # invocation — but interrupt_after subjective_node paused before
+        # validate_node could fire, so the patient saw an empty assistant reply
+        # for one turn and then their next message was treated as the allergy
+        # answer without ever being asked the question.
+        # Quality gating above already enforces the same minima validate_node
+        # would check (chief_complaint + 2 of {onset, severity, quality}, plus
+        # ED severity), so skipping validate_node on the success path is safe.
+        allergy_q = (
+            "Just a few quick questions about your health background — "
+            "this helps your care team prepare. "
+            "Do you have any allergies we should know about, like to medications, latex, or foods? "
+            "If you don't have any, that's completely fine."
+        )
         return {
             "chief_complaint": cc,
             "opqrst": op,
@@ -1022,11 +1284,11 @@ def subjective_node(state: IntakeState):
             "triage": triage,
             "needs_emergency_review": False,
             "subjective_complete": True,
-            "subjective_incomplete_turns": 0,   # reset on successful completion
+            "subjective_incomplete_turns": 0,
             "clinical_step": "allergies",
-            "validation_target_phase": "clinical_history",
             "validation_errors": [],
-            "current_phase": "validate",
+            "current_phase": "clinical_history",
+            "messages": [{"role": "assistant", "text": allergy_q}],
         }
 
     # On 3rd+ incomplete turn, generate a deterministic progress message so the
@@ -1152,45 +1414,6 @@ def _confirm_summary(state: IntakeState) -> str:
 # Clinical history node
 # ---------------------------------------------------------------------------
 
-def _prescan_volunteered_clinical(text: str) -> dict:
-    """
-    Lookahead: if the patient volunteers negative info about upcoming steps
-    in the current message, pre-fill those fields so we can skip the questions.
-
-    Returns a partial state patch — empty dict means nothing was volunteered.
-    Uses simple substring matching (intentionally no LLM call — this is a
-    lightweight optimistic scan, not a classification step).
-    """
-    t = (text or "").lower()
-    patch: dict = {}
-
-    _NO_MEDS = [
-        "no med", "no medication", "not on any med", "not taking any",
-        "no prescription", "no pills", "no current med", "not taking anything",
-        "no meds", "don't take any", "dont take any",
-    ]
-    _NO_PMH = [
-        "no past", "no prior condition", "no previous condition", "no history",
-        "no medical history", "no surgeries", "no surgery", "no conditions",
-        "no chronic", "otherwise healthy", "healthy otherwise", "no significant",
-        "nothing significant", "no previous",
-    ]
-    _NO_RESULTS = [
-        "no recent test", "no test", "no lab", "no labs", "no imaging",
-        "no bloodwork", "no scan", "no x-ray", "no xray", "no mri",
-        "no recent", "haven't had any test", "haven't had any lab",
-        "no recent imaging", "haven't had", "no results",
-    ]
-
-    if any(s in t for s in _NO_MEDS):
-        patch["medications"] = []
-    if any(s in t for s in _NO_PMH):
-        patch["pmh"] = []
-    if any(s in t for s in _NO_RESULTS):
-        patch["recent_results"] = []
-    return patch
-
-
 def clinical_history_node(state: IntakeState):
     user = last_user(state).strip()
     step = state.get("clinical_step") or "allergies"
@@ -1198,15 +1421,30 @@ def clinical_history_node(state: IntakeState):
     # Feature 2: adapt questions based on intake classification
     cls = state.get("intake_classification") or "routine_checkup"
 
-    # Go-back intent — patient wants to correct identity or symptoms from clinical phase
+    # Go-back intent — patient wants to correct identity, symptoms, or jump
+    # back within clinical_history (e.g. "go back to allergies" while in meds).
+    #
+    # The previous guard `current_phase not in ("clinical_history", None)`
+    # rejected within-phase corrections because the target phase matched the
+    # current phase — meaning a "go back to allergies" intent was silently
+    # dropped, the node continued in step=meds, and the next user message
+    # ("Pensillin?") was misclassified as a medication and triggered the
+    # dose follow-up loop.
+    #
+    # Now we apply the correction whenever it actually changes something:
+    # a different phase OR a different clinical_step.  Generic "go back"
+    # messages (no field specified) still pass through to the menu prompt
+    # because they don't change clinical_step.
     if user:
         correction = _try_correction(user, state)
-        if correction and correction.get("current_phase") not in ("clinical_history", None):
-            return correction
-
-    # Lookahead: if the patient volunteers negative info about upcoming steps,
-    # pre-fill those fields now so we can skip the questions later.
-    volunteered = _prescan_volunteered_clinical(user) if user else {}
+        if correction:
+            next_phase = correction.get("current_phase")
+            next_step  = correction.get("clinical_step")
+            cur_step   = state.get("clinical_step")
+            if next_phase not in ("clinical_history", None):
+                return correction
+            if next_step and next_step != cur_step:
+                return correction
 
     prior = state.get("prior_summary") or {}
     # Skip allergy collection entirely if we have a recent summary and
@@ -1214,7 +1452,9 @@ def clinical_history_node(state: IntakeState):
     # For the simple version: pre-populate from memory and move on.
     if step == "allergies" and prior and prior.get("visit_count", 0) >= 1:
         known_allergies = prior.get("allergies") or []
-        if known_allergies:
+        # Only show the confirmation prompt on the first entry (no user response yet).
+        # When the patient has responded, fall through to normal extraction below.
+        if known_allergies and (not user or is_bare_acknowledgment(user)):
             return {
                 "messages": [{"role": "assistant", "text":
                     f"I see we have {', '.join(known_allergies)} on file for your allergies. "
@@ -1222,7 +1462,7 @@ def clinical_history_node(state: IntakeState):
                 "current_phase": "clinical_history",
                 "clinical_step": "allergies",
             }
-            
+
     if step == "allergies":
         allergy_q = (
             "Just a few quick questions about your health background — "
@@ -1230,66 +1470,87 @@ def clinical_history_node(state: IntakeState):
             "Do you have any allergies we should know about, like to medications, latex, or foods? "
             "If you don't have any, that's completely fine."
         )
-        if not user or is_ack(user):
+        if not user or is_bare_acknowledgment(user):
             return {
                 "messages": [{"role": "assistant", "text": allergy_q}],
                 "current_phase": "clinical_history",
                 "clinical_step": "allergies",
             }
-        # "yes" means the patient wants to list allergies but didn't name them yet
-        if is_yes(user):
+
+        # LLM extraction.  Replaces extract_allergies_simple (which split on
+        # "," / ";" / "and" and corrupted "yes I'm allergic to peanuts and
+        # pollen") and the standalone is_yes("re-ask") branch (which treated
+        # any "yes …" prefix as a non-answer and discarded the actual allergy
+        # list).  See _extract_clinical_list — it returns items_complete=False
+        # when the patient agreed but didn't list anything, so we keep the
+        # re-prompt behaviour without the data-loss bug.
+        items, complete, list_reply, list_meta = _extract_clinical_list(
+            user=user, field_kind="allergies", thread_id=thread_id,
+        )
+        if not complete:
             return {
                 "messages": [{"role": "assistant", "text":
-                    "Of course — what are you allergic to? "
-                    "Please list them (for example, 'penicillin, latex, peanuts')."}],
+                    list_reply or "Could you list what you're allergic to? "
+                    "For example: 'penicillin, latex, peanuts'."}],
                 "current_phase": "clinical_history",
                 "clinical_step": "allergies",
+                **_failure_state_patch(list_meta, "clinical_history"),
+                **_cost_patch(state, list_meta),
             }
-        allergies = extract_allergies_simple(user)
 
-        # Apply any volunteered skips from the same message
-        state_patch: dict = {"allergies": allergies, **volunteered}
+        allergies = list(items)
+        # Returning-patient carry-forward.  The bot has just shown
+        # "I see we have <allergies> on file. Anything new to add, or is
+        # this still accurate?" — so an empty extraction can mean either
+        # "no changes" (carry the prior list forward) OR "I have no
+        # allergies anymore" (genuine update to empty).
+        #
+        # We carry forward when the user message contains a confirmation
+        # keyword (same/correct/still/yes/those/good/unchanged) OR a
+        # "nothing-changed" negative ("no", "nothing", "nothing new",
+        # "none new").  The latter set is what makes "no" or "nothing
+        # new" preserve known allergies instead of wiping them — a real
+        # patient-safety bug pre-dating this branch.
+        #
+        # If the patient genuinely wants to remove a known allergy they
+        # say so explicitly ("I'm not allergic to penicillin anymore"),
+        # which the LLM extracts as a non-empty list AND wouldn't trip
+        # this carry-forward path because items would be non-empty.
+        if not allergies:
+            _prior_a = (state.get("prior_summary") or {}).get("allergies") or []
+            _user_l  = user.lower()
+            _affirm  = ("same", "yes", "correct", "unchanged", "still", "those", "good")
+            _negate  = ("no", "none", "nothing", "nothing new", "none new", "nope")
+            if _prior_a and (
+                any(w in _user_l for w in _affirm)
+                or _user_l.strip() in _negate
+                or any(_user_l.startswith(p) for p in ("no ", "none ", "nothing"))
+            ):
+                allergies = list(_prior_a)
+                log_event("returning_patient_allergies_carried_forward",
+                          thread_id=thread_id, count=len(allergies))
 
-        # Determine next step — skip steps already answered by lookahead
-        if "medications" not in state_patch:
-            next_step = "meds"
-            next_q = adapt_clinical_question("meds", cls) or (
-                "Are you currently taking any medications — prescription, over-the-counter, "
-                "vitamins, or supplements? If you're not on anything at the moment, just let me know."
-            )
-        elif "pmh" not in state_patch:
-            next_step = "pmh"
-            next_q = adapt_clinical_question("pmh", cls) or (
-                "Almost there. Have you had any significant health conditions in the past, "
-                "or any surgeries? If nothing comes to mind, that's perfectly fine."
-            )
-        elif "recent_results" not in state_patch:
-            next_step = "results"
-            next_q = adapt_clinical_question("results", cls) or (
-                "Last one — have you had any recent tests done, like blood work, X-rays, or scans? "
-                "If not, we're all set."
-            )
-        else:
-            # All fields volunteered — skip straight to confirm
-            results = state_patch.get("recent_results", [])
-            summary = _confirm_summary({**state, **state_patch})
+        # Find the next step that still needs input.  After a within-history
+        # correction (patient went back to allergies) meds/PMH/results may
+        # already be filled — _next_clinical_step_needed walks past them so
+        # we don't re-ask questions whose answers are still in state.
+        new_state = {**state, "allergies": allergies}
+        next_step = _next_clinical_step_needed(new_state, starting_at="meds")
+        if next_step == "done":
             return {
-                **state_patch,
-                "clinical_complete": True,
-                "clinical_step": "done",
-                "validation_target_phase": "confirm",
-                "validation_errors": [],
-                "current_phase": "validate",
-                "messages": [{"role": "assistant", "text":
-                    summary + "\n\nDoes everything look right? Reply 'confirm' and I'll prepare "
-                    "the note for your care team, or let me know what needs changing."}],
+                "allergies": allergies,
+                **_clinical_history_done_patch(new_state),
+                **_failure_state_patch(list_meta, "clinical_history"),
+                **_cost_patch(state, list_meta),
             }
-
         return {
-            **state_patch,
+            "allergies": allergies,
             "clinical_step": next_step,
-            "messages": [{"role": "assistant", "text": next_q}],
+            "messages": [{"role": "assistant", "text":
+                _question_for_clinical_step(next_step, cls)}],
             "current_phase": "clinical_history",
+            **_failure_state_patch(list_meta, "clinical_history"),
+            **_cost_patch(state, list_meta),
         }
 
     if step == "meds":
@@ -1297,16 +1558,15 @@ def clinical_history_node(state: IntakeState):
             "Are you currently taking any medications — prescription, over-the-counter, "
             "vitamins, or supplements? If you're not on anything at the moment, just let me know."
         )
-        if not user or is_ack(user):
+        if not user or is_bare_acknowledgment(user):
             return {
                 "messages": [{"role": "assistant", "text": meds_q}],
                 "current_phase": "clinical_history",
                 "clinical_step": "meds",
             }
 
-        from .extract import _is_none_response
         if _is_none_response(user):
-            state_patch = {"medications": [], **volunteered}
+            state_patch: dict = {"medications": []}
         else:
             # Pass any already-collected partial meds so the LLM can merge new details
             existing_meds = state.get("medications") or []
@@ -1342,35 +1602,38 @@ def clinical_history_node(state: IntakeState):
                     "current_phase": "clinical_history",
                     "clinical_step": "meds",
                     **_failure_state_patch(meta, "clinical_history"),
+                    **_cost_patch(state, meta),
                 }
 
-            # Only ask a follow-up if a medication has name but BOTH dose AND freq are absent
-            name_only = [
+            # Ask a follow-up if any medication has a name but freq is still missing.
+            # Freq is more clinically important than dose — ask even when dose is present.
+            no_freq = [
                 m for m in parsed
                 if (m.get("name") or "").strip()
-                and not (m.get("dose") or "").strip()
                 and not (m.get("freq") or "").strip()
             ]
-            if name_only:
-                names = ", ".join(m["name"] for m in name_only)
-                # First follow-up: brief prompt
+            if no_freq:
+                names = ", ".join(m["name"] for m in no_freq)
+                # Determine what's already known to tailor the question
+                has_dose = all((m.get("dose") or "").strip() for m in no_freq)
                 already_asked_once = bool(
                     existing_meds and any(
-                        not (m.get("dose") or "").strip() and not (m.get("freq") or "").strip()
+                        not (m.get("freq") or "").strip()
                         for m in existing_meds
                         if (m.get("name") or "").strip()
                     )
                 )
                 if already_asked_once:
-                    # Second attempt — patient gave vague info ("twice a day" without a dose).
-                    # Be explicit: show a concrete example so they know exactly what format works.
                     follow_up = (
                         f"I want to make sure I capture this correctly for your care team. "
-                        f"For {names}, could you tell me:\n"
-                        f"  • The dose (e.g. 500mg, 10mg)\n"
-                        f"  • How often (e.g. once a day, twice daily, every morning)\n"
-                        f"For example: '{names.split(',')[0].strip()} 500mg, twice a day'. "
-                        f"If you don't know the exact dose, that's okay — just say what you can."
+                        f"For {names}, could you tell me how often you take it "
+                        f"(e.g. once a day, twice daily, every morning)?"
+                        + ("" if has_dose else f" And the dose if you know it (e.g. 10mg, 500mg)?")
+                    )
+                elif has_dose:
+                    follow_up = (
+                        f"How often do you take {names}? "
+                        f"(e.g. once a day, twice daily, every morning)"
                     )
                 else:
                     follow_up = (
@@ -1383,41 +1646,29 @@ def clinical_history_node(state: IntakeState):
                     "messages": [{"role": "assistant", "text": follow_up}],
                     "current_phase": "clinical_history",
                     **_failure_state_patch(meta, "clinical_history"),
+                    **_cost_patch(state, meta),
                 }
 
-            state_patch = {"medications": parsed, **volunteered, **_failure_state_patch(meta, "clinical_history"), **_cost_patch(state, meta)}
-
-        # Determine next step
-        if "pmh" not in state_patch:
-            next_step = "pmh"
-            next_q = adapt_clinical_question("pmh", cls) or (
-                "Almost there. Have you had any significant health conditions in the past, "
-                "or any surgeries? If nothing comes to mind, that's perfectly fine."
-            )
-        elif "recent_results" not in state_patch:
-            next_step = "results"
-            next_q = adapt_clinical_question("results", cls) or (
-                "Last one — have you had any recent tests done, like blood work, X-rays, or scans? "
-                "If not, we're all set."
-            )
-        else:
-            summary = _confirm_summary({**state, **state_patch})
-            return {
-                **state_patch,
-                "clinical_complete": True,
-                "clinical_step": "done",
-                "validation_target_phase": "confirm",
-                "validation_errors": [],
-                "current_phase": "validate",
-                "messages": [{"role": "assistant", "text":
-                    summary + "\n\nDoes everything look right? Reply 'confirm' and I'll prepare "
-                    "the note for your care team, or let me know what needs changing."}],
+            state_patch = {
+                "medications": parsed,
+                **_failure_state_patch(meta, "clinical_history"),
+                **_cost_patch(state, meta),
             }
 
+        # Skip past pmh / results when those were already collected before
+        # a correction routed us back to meds.
+        new_state = {**state, **state_patch}
+        next_step = _next_clinical_step_needed(new_state, starting_at="pmh")
+        if next_step == "done":
+            return {
+                **state_patch,
+                **_clinical_history_done_patch(new_state),
+            }
         return {
             **state_patch,
             "clinical_step": next_step,
-            "messages": [{"role": "assistant", "text": next_q}],
+            "messages": [{"role": "assistant", "text":
+                _question_for_clinical_step(next_step, cls)}],
             "current_phase": "clinical_history",
         }
 
@@ -1426,40 +1677,49 @@ def clinical_history_node(state: IntakeState):
             "Almost there. Have you had any significant health conditions in the past, "
             "or any surgeries? If nothing comes to mind, that's perfectly fine."
         )
-        if not user or is_ack(user):
+        if not user or is_bare_acknowledgment(user):
             return {
                 "messages": [{"role": "assistant", "text": pmh_q}],
                 "current_phase": "clinical_history",
                 "clinical_step": "pmh",
             }
-        pmh = extract_list_simple(user)
-        state_patch = {"pmh": pmh, **volunteered}
 
-        if "recent_results" not in state_patch:
-            next_step = "results"
-            next_q = adapt_clinical_question("results", cls) or (
-                "Last one — have you had any recent tests done, like blood work, X-rays, or scans? "
-                "If not, we're all set."
-            )
+        # LLM extraction.  Replaces extract_list_simple, which split sentences
+        # like "had a heart attack in 2019 and gallbladder removed in 2021"
+        # on the literal token "and" and stored the resulting fragments as
+        # opaque strings.  The LLM keeps each condition as a clinical phrase
+        # (e.g. "myocardial infarction (2019)").
+        items, complete, list_reply, list_meta = _extract_clinical_list(
+            user=user, field_kind="pmh", thread_id=thread_id,
+        )
+        if not complete:
             return {
-                **state_patch,
-                "clinical_step": next_step,
-                "messages": [{"role": "assistant", "text": next_q}],
+                "messages": [{"role": "assistant", "text":
+                    list_reply or "Could you tell me a bit more about your medical history?"}],
                 "current_phase": "clinical_history",
+                "clinical_step": "pmh",
+                **_failure_state_patch(list_meta, "clinical_history"),
+                **_cost_patch(state, list_meta),
             }
-
-        # Results were volunteered — skip to confirm
-        summary = _confirm_summary({**state, **state_patch})
+        # Skip past results when it was already collected before a
+        # correction routed us back to pmh.
+        new_state = {**state, "pmh": list(items)}
+        next_step = _next_clinical_step_needed(new_state, starting_at="results")
+        if next_step == "done":
+            return {
+                "pmh": list(items),
+                **_clinical_history_done_patch(new_state),
+                **_failure_state_patch(list_meta, "clinical_history"),
+                **_cost_patch(state, list_meta),
+            }
         return {
-            **state_patch,
-            "clinical_complete": True,
-            "clinical_step": "done",
-            "validation_target_phase": "confirm",
-            "validation_errors": [],
-            "current_phase": "validate",
+            "pmh": list(items),
+            "clinical_step": next_step,
             "messages": [{"role": "assistant", "text":
-                summary + "\n\nDoes everything look right? Reply 'confirm' and I'll prepare "
-                "the note for your care team, or let me know what needs changing."}],
+                _question_for_clinical_step(next_step, cls)}],
+            "current_phase": "clinical_history",
+            **_failure_state_patch(list_meta, "clinical_history"),
+            **_cost_patch(state, list_meta),
         }
 
     if step == "results":
@@ -1467,13 +1727,29 @@ def clinical_history_node(state: IntakeState):
             "Last one — have you had any recent tests done, like blood work, X-rays, or scans? "
             "If not, we're all set."
         )
-        if not user or is_ack(user):
+        if not user or is_bare_acknowledgment(user):
             return {
                 "messages": [{"role": "assistant", "text": results_q}],
                 "current_phase": "clinical_history",
                 "clinical_step": "results",
             }
-        results = extract_list_simple(user)
+
+        # LLM extraction for recent labs / imaging / vital trends.  Replaces
+        # extract_list_simple which split on "and" (e.g. "CBC last week and
+        # A1c was 6.8 in March" → two fragments missing context).
+        items, complete, list_reply, list_meta = _extract_clinical_list(
+            user=user, field_kind="recent_results", thread_id=thread_id,
+        )
+        if not complete:
+            return {
+                "messages": [{"role": "assistant", "text":
+                    list_reply or "Could you tell me which tests or scans you've had recently?"}],
+                "current_phase": "clinical_history",
+                "clinical_step": "results",
+                **_failure_state_patch(list_meta, "clinical_history"),
+                **_cost_patch(state, list_meta),
+            }
+        results = list(items)
         summary = _confirm_summary({**state, "recent_results": results})
         # Feature 4: route through validate_node before confirm
         return {
@@ -1486,6 +1762,8 @@ def clinical_history_node(state: IntakeState):
             "messages": [{"role": "assistant", "text":
                 summary + "\n\nDoes everything look right? Reply 'confirm' and I'll prepare "
                 "the note for your care team, or let me know what needs changing."}],
+            **_failure_state_patch(list_meta, "clinical_history"),
+            **_cost_patch(state, list_meta),
         }
 
     return {"current_phase": "report"}
@@ -1745,7 +2023,7 @@ def report_node(state: IntakeState):
             "recent_results": results, "triage": validated.triage,
         }
         try:
-            res = get_gemini().generate_text(
+            res = get_provider().generate_text(
                 system=report_system(),
                 prompt=json.dumps(payload, indent=2),
                 temperature=0.2,
@@ -1753,8 +2031,12 @@ def report_node(state: IntakeState):
                 response_mime_type="text/plain",
             )
             if res.input_tokens or res.output_tokens:
-                db.record_llm_usage(thread_id=thread_id, node="report_node",
-                                    input_tokens=res.input_tokens, output_tokens=res.output_tokens)
+                db.record_llm_usage(
+                    thread_id=thread_id, node="report_node",
+                    input_tokens=res.input_tokens,
+                    output_tokens=res.output_tokens,
+                    cached_input_tokens=res.cached_input_tokens,
+                )
             if res.ok and res.text.strip():
                 report_text = res.text.strip()
             else:
@@ -1780,13 +2062,19 @@ def report_node(state: IntakeState):
 
     # FHIR bundle — validate input first, then build from validated state.
     # Failure never blocks the clinician note.
+    # Augment the validated dict with session metadata so build_bundle can
+    # set Patient.id to the deterministic patient_id (stable across visits).
+    fhir_state = validated.model_dump()
+    fhir_state["thread_id"]  = thread_id
+    fhir_state["patient_id"] = state.get("patient_id") or ""
+
     fhir_json: str | None = None
-    fhir_warnings = fhir_builder.validate_fhir_input(validated.model_dump())
+    fhir_warnings = fhir_builder.validate_fhir_input(fhir_state)
     if fhir_warnings:
         log_event("fhir_input_warnings", level="warning",
                   thread_id=thread_id, warnings=fhir_warnings)
     try:
-        bundle    = fhir_builder.build_bundle(validated.model_dump())
+        bundle    = fhir_builder.build_bundle(fhir_state)
         # Structural validation — catches malformed bundles before EHR delivery.
         struct_errors = fhir_builder.validate_fhir_bundle(bundle)
         if struct_errors:
@@ -1838,14 +2126,11 @@ def report_node(state: IntakeState):
         mode=state.get("mode") or "clinic",
     )
 
-    # Push to direct FHIR server (best-effort, non-blocking).
+    # Push to direct FHIR server (best-effort — failure never blocks the patient).
+    fhir_push_ok = False
     if fhir_json and settings().fhir_server_url:
-        import threading
-        threading.Thread(
-            target=_fhir_push_bundle,
-            kwargs={"fhir_bundle_json": fhir_json, "thread_id": thread_id},
-            daemon=True,
-        ).start()
+        result = _fhir_push_bundle(fhir_bundle_json=fhir_json, thread_id=thread_id)
+        fhir_push_ok = bool(result.get("ok"))
 
     patient_name = (identity or {}).get("name") or "unknown patient"
     webhook.dispatch_intake_complete(
@@ -1855,15 +2140,17 @@ def report_node(state: IntakeState):
         fhir_json=fhir_json,
     )
 
+    ehr_line = " Your record has been sent to the clinic system." if fhir_push_ok else ""
     return {
         "human_review_required": preflight.review_required,
         "human_review_reasons":  preflight.review_reasons,
         "safety_score":          preflight.safety_score,
+        "fhir_push_ok":          fhir_push_ok,
         "messages": [{"role": "assistant", "text":
             f"Your intake is complete. Here is the clinician note prepared for your visit:\n\n"
             f"---\n{report_text}\n---\n\n"
-            "A copy has been sent to your care team. If anything looks incorrect, "
-            "please let the front desk know when you arrive."}],
+            f"A copy has been sent to your care team.{ehr_line} "
+            "If anything looks incorrect, please let the front desk know when you arrive."}],
         "current_phase": "done",
     }
 
@@ -1872,7 +2159,7 @@ def report_node(state: IntakeState):
 # Handoff node
 # ---------------------------------------------------------------------------
 
-def handoff_node(state: IntakeState):
+def handoff_node(state: IntakeState):  # noqa: ARG001 — required by LangGraph node signature
     return {
         "messages": [{"role": "assistant", "text":
             "To prioritize your safety, please call 911 or go to the nearest emergency room now. "
