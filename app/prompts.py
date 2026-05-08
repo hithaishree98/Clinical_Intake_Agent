@@ -31,12 +31,12 @@ dashboards can detect prompt regressions across deploys without code changes.
 # ---------------------------------------------------------------------------
 
 PROMPT_VERSIONS: dict[str, str] = {
-    "identity":        "v1.0",   # LLM extraction: name, dob (ISO 8601), phone, address
+    "identity":        "v1.2",   # require first+last name; single-word name returns ""
     "subjective":      "v1.5",   # descriptive severity, format hints, new examples
-    "medications":     "v1.2",   # CURRENT_MEDICATIONS merge + no hollow affirmatives
-    "classification":  "v1.1",
+    "medications":     "v1.3",   # spelling correction + unrecognizable name handling
     "report":          "v1.1",
     "crisis_score":    "v1.0",   # LLM borderline-crisis classifier (Tier 2 safety layer)
+    "list_extract":    "v1.1",   # spelling correction + unrecognizable name handling for allergies
 }
 
 
@@ -91,15 +91,18 @@ Extract name, date of birth, phone, and home address. Return ONLY a JSON object.
 
 OUTPUT SCHEMA:
 {
-  "name":    "Full name in Title Case — e.g. Jane Smith",
+  "name":    "Exactly what the patient said, in Title Case — e.g. 'Rita' or 'John Smith'",
   "dob":     "Date of birth as YYYY-MM-DD — e.g. 1990-06-01",
   "phone":   "10-digit US phone, digits only — e.g. 4125550199",
-  "address": "Home address verbatim — e.g. 123 Main St Philadelphia PA"
+  "address": "Full address including street, city, state, and zip — e.g. 123 Main St Philadelphia PA 15213"
 }
 
 RULES:
-- Return "" for any field not present. Never invent.
-- name: Title Case. Strip honorifics (Mr/Mrs/Dr) unless part of the name.
+- Return "" for any field not present. Never invent or complete partial data.
+- name: Store the name ONLY when both a first name AND a last name are present.
+    If the patient gave only one word (e.g. "Rita", "Smith"), return "" — the caller will re-ask for the full name.
+    Never invent or complete a partial name. Never add a surname that was not spoken.
+    Strip honorifics (Mr/Mrs/Dr) unless part of the legal name.
 - dob: Convert ANY format to YYYY-MM-DD. Examples:
     "1st June 1990"   → "1990-06-01"
     "13/08/1998"      → "1998-08-13"
@@ -107,14 +110,26 @@ RULES:
     "3/15/85"         → "1985-03-15"
     "march 15 1985"   → "1985-03-15"
 - phone: Strip non-digits, remove leading +1 or 1, keep 10 digits only.
+- address: Return "" if the message is missing ANY of: street number+name, city, state, or zip code.
+    A partial address ("123 Main St" with no city/zip, or "Pittsburgh PA" with no street) must return "".
+    Only store when all four components are present.
 - Return ONLY JSON. No markdown. No explanation.
 
 EXAMPLES:
+Input: "My name is Rita"
+Output: {"name": "", "dob": "", "phone": "", "address": ""}
+
+Input: "My name is Rita Johnson"
+Output: {"name": "Rita Johnson", "dob": "", "phone": "", "address": ""}
+
 Input: "My name is john smith, born on the 3rd of march 1975. Call me at 412 555 0199"
 Output: {"name": "John Smith", "dob": "1975-03-03", "phone": "4125550199", "address": ""}
 
-Input: "Jane Doe, DOB 1st June 1990, I live at 123 Main Street Philadelphia"
-Output: {"name": "Jane Doe", "dob": "1990-06-01", "phone": "", "address": "123 Main Street Philadelphia"}
+Input: "Jane Doe, DOB 1st June 1990, I live at 123 Main Street Philadelphia PA 15213"
+Output: {"name": "Jane Doe", "dob": "1990-06-01", "phone": "", "address": "123 Main Street Philadelphia PA 15213"}
+
+Input: "I live at 123 Main Street Philadelphia"
+Output: {"name": "", "dob": "", "phone": "", "address": ""}
 
 Input: "Just calling about an appointment"
 Output: {"name": "", "dob": "", "phone": "", "address": ""}
@@ -141,10 +156,14 @@ HARD CONSTRAINTS:
 - severity accepts BOTH numeric (e.g. "6/10", "7 out of 10") AND descriptive
   (e.g. "mild", "moderate", "severe", "very painful", "unbearable", "bearable", "not too bad").
   Both count as substantive — do NOT ask again if the patient described severity in words.
-- is_complete = true ONLY when ALL THREE are present:
+- Severity update exception: if severity is currently a vague word (e.g. "really badly", "a lot",
+  "very bad", "not great") and the patient now gives a numeric value (e.g. "8 out of 10", "7"),
+  replace severity with the number — the numeric value is more precise and clinically useful.
+- is_complete = true ONLY when ALL FOUR are present:
     (a) chief_complaint is non-empty
     (b) severity is non-empty (numeric OR descriptive)
     (c) onset OR timing is non-empty
+    (d) quality is non-empty
 - When is_complete = true, reply MUST be "" (empty string — no follow-up question).
 - When is_complete = false, ask EXACTLY ONE question in reply. Not two. Not zero.
 - reply must end with "?". Never start reply with "Yes", "Yeah", "Sure", "I see", "I understand",
@@ -153,6 +172,7 @@ HARD CONSTRAINTS:
 - reply MUST include a brief format hint so the patient knows what to type:
     * Asking for severity → include "(e.g. '7 out of 10', or say mild / moderate / severe)"
     * Asking for onset   → include "(e.g. 'this morning', '2 days ago', 'for about 3 weeks')"
+    * Asking for quality → include "(e.g. 'sharp', 'dull', 'burning', 'pressure', 'aching')"
 - Never use diagnosis language (e.g. "you have", "this sounds like", "consistent with").
 - extraction_confidence = "high" when patient stated all extracted fields clearly.
 - extraction_confidence = "medium" when fields are likely correct but required some interpretation.
@@ -173,22 +193,22 @@ Output:
 
 Example 2 — All required fields present → is_complete true:
 Input:
-  CURRENT_STATE={{"chief_complaint":"headache","opqrst":{{"onset":"this morning","provocation":"","quality":"","radiation":"","severity":"8/10","timing":""}}}}
+  CURRENT_STATE={{"chief_complaint":"headache","opqrst":{{"onset":"this morning","provocation":"","quality":"throbbing","radiation":"","severity":"8/10","timing":""}}}}
   NEW_USER_MESSAGE=It started suddenly when I woke up
 Output:
-  {{"chief_complaint":"headache","opqrst":{{"onset":"this morning","provocation":"","quality":"","radiation":"","severity":"8/10","timing":"sudden onset on waking"}},"is_complete":true,"reply":"","extraction_confidence":"high"}}
+  {{"chief_complaint":"headache","opqrst":{{"onset":"this morning","provocation":"","quality":"throbbing","radiation":"","severity":"8/10","timing":"sudden onset on waking"}},"is_complete":true,"reply":"","extraction_confidence":"high"}}
 
 Example 3 — Do NOT invent data:
 Patient says: "my stomach hurts"
 WRONG output: {{"chief_complaint":"abdominal pain","opqrst":{{"onset":"unknown","quality":"aching","severity":"moderate",...}},"is_complete":false,...}}
 RIGHT output: {{"chief_complaint":"stomach pain","opqrst":{{"onset":"","provocation":"","quality":"","radiation":"","severity":"","timing":""}},"is_complete":false,"reply":"How severe is the stomach pain? (e.g. '7 out of 10', or say mild / moderate / severe)","extraction_confidence":"high"}}
 
-Example 4 — Descriptive severity is valid → mark complete:
+Example 4 — Descriptive severity is valid but quality still missing → not complete yet:
 Input:
   CURRENT_STATE={{"chief_complaint":"stomach ache","opqrst":{{"onset":"","provocation":"","quality":"","radiation":"","severity":"","timing":""}}}}
   NEW_USER_MESSAGE=It's moderate, started about 6 days ago
 Output:
-  {{"chief_complaint":"stomach ache","opqrst":{{"onset":"6 days ago","provocation":"","quality":"","radiation":"","severity":"moderate","timing":""}},"is_complete":true,"reply":"","extraction_confidence":"high"}}
+  {{"chief_complaint":"stomach ache","opqrst":{{"onset":"6 days ago","provocation":"","quality":"","radiation":"","severity":"moderate","timing":""}},"is_complete":false,"reply":"How would you describe the stomach ache? (e.g. 'sharp', 'dull', 'burning', 'aching', 'cramping')","extraction_confidence":"high"}}
 
 Example 5 — Patient gave a vague severity description → extract it, then ask for onset if missing:
 Input:
@@ -196,6 +216,13 @@ Input:
   NEW_USER_MESSAGE=it's not too bad
 Output:
   {{"chief_complaint":"stomach ache","opqrst":{{"onset":"6 days ago","provocation":"","quality":"mild striking","radiation":"","severity":"mild","timing":""}},"is_complete":true,"reply":"","extraction_confidence":"medium"}}
+
+Example 6 — Quality extracted from current message fills the last gap → is_complete true:
+Input:
+  CURRENT_STATE={{"chief_complaint":"chest pain","opqrst":{{"onset":"1 hour ago","provocation":"","quality":"","radiation":"","severity":"8/10","timing":""}}}}
+  NEW_USER_MESSAGE=It feels like a sharp stabbing pressure
+Output:
+  {{"chief_complaint":"chest pain","opqrst":{{"onset":"1 hour ago","provocation":"","quality":"sharp stabbing pressure","radiation":"","severity":"8/10","timing":""}},"is_complete":true,"reply":"","extraction_confidence":"high"}}
 
 CLASSIFICATION (fill only when chief_complaint is non-empty):
 - intake_classification: one of "emergency_visit" | "routine_checkup" | "specialist_referral" | "mental_health" | "pediatric"
@@ -213,7 +240,7 @@ OUTPUT SCHEMA:
     "severity":    "",          // pain scale or descriptor, max 80 chars
     "timing":      ""           // constant, intermittent, getting worse..., max 150 chars
   }},
-  "is_complete": false,         // true only when all three completion criteria met
+  "is_complete": false,         // true only when all four completion criteria met
   "reply": "",                  // your next question (max 400 chars), or "" if complete
   "extraction_confidence": "",  // "high" | "medium" | "low" — your certainty about what you extracted
   "intake_classification": null,       // visit type, or null if cc still empty
@@ -245,6 +272,14 @@ HARD CONSTRAINTS:
 - When merging: only fill empty fields; never overwrite fields that already have a value.
 - reply must end with "?". Never start with "Yes", "Sure", "I see", or hollow affirmatives.
 
+SPELLING CORRECTION:
+- If a medication name is a clear misspelling of a known drug, correct the spelling silently in the "name" field.
+  Common corrections: "lisonopril" → "lisinopril", "metfornim" → "metformin", "ibuproven" → "ibuprofen",
+  "amoxysalin" → "amoxicillin", "atorvastatine" → "atorvastatin", "amlodapine" → "amlodipine".
+- If a name is completely unrecognizable (random characters, abbreviations with no medical meaning,
+  or not a plausible drug/supplement name), do NOT include it in medications.
+  Set reply to: "I wasn't able to recognize '[name]' as a medication. Could you check the name — it may be on the bottle or prescription label?"
+
 FEW-SHOT EXAMPLES:
 
 Example 1 — Full details:
@@ -268,6 +303,14 @@ Example 5 — Do NOT invent data:
   WRONG: {{"medications":[{{"name":"lisinopril","dose":"10mg",...}}],...}}
   RIGHT: {{"medications":[{{"name":"blood pressure medication","dose":"","freq":"","last_taken":""}}],"reply":""}}
 
+Example 7 — spelling correction (applied silently):
+  Input: "I take lisonopril 10mg daily and metfornim 500mg twice a day"
+  Output: {{"medications":[{{"name":"lisinopril","dose":"10mg","freq":"daily","last_taken":""}},{{"name":"metformin","dose":"500mg","freq":"twice daily","last_taken":""}}],"reply":""}}
+
+Example 8 — unrecognizable name (ask to clarify):
+  Input: "I take xzqmed 20mg"
+  Output: {{"medications":[],"reply":"I wasn't able to recognize 'xzqmed' as a medication. Could you check the name — it may be on the bottle or prescription label?"}}
+
 Example 6 — Merging follow-up details into CURRENT_MEDICATIONS:
   CURRENT_MEDICATIONS=[{{"name":"ibuprofen","dose":"200mg","freq":"","last_taken":""}}]
   NEW_USER_MESSAGE="I take it twice a day, last took it around noon"
@@ -286,53 +329,6 @@ OUTPUT SCHEMA:
   "reply": ""               // follow-up question, or "" if at least one med found
 }}
 """.strip()
-
-
-def classification_system() -> str:
-    return """
-ROLE:
-You are a clinical intake triage coordinator.
-
-TASK:
-Classify the patient intake type from the mode, chief complaint, and first user message.
-
-HARD CONSTRAINTS:
-- Return ONLY a JSON object matching the OUTPUT schema. No markdown, no prose.
-- intake_classification MUST be exactly one of: emergency_visit, routine_checkup, specialist_referral, mental_health, pediatric
-- confidence MUST be exactly one of: high, medium, low
-- Never diagnose. Never speculate beyond what the patient stated.
-
-FEW-SHOT EXAMPLES:
-
-Example 1 — ED mode with chest pain:
-  MODE=ed, CHIEF_COMPLAINT=chest pain, USER_TEXT=I have chest pain and feel dizzy
-  Output: {"intake_classification":"emergency_visit","confidence":"high","rationale":"ED mode with chest pain and dizziness."}
-
-Example 2 — Clinic mode with pediatric indicator:
-  MODE=clinic, CHIEF_COMPLAINT=fever, USER_TEXT=my 4 year old has a fever
-  Output: {"intake_classification":"pediatric","confidence":"high","rationale":"Patient described a child with fever."}
-
-Example 3 — Clinic mode with mental health:
-  MODE=clinic, CHIEF_COMPLAINT=anxiety, USER_TEXT=I've been really anxious and depressed for weeks
-  Output: {"intake_classification":"mental_health","confidence":"high","rationale":"Patient reported anxiety and depression."}
-
-Example 4 — Specialist language:
-  MODE=clinic, CHIEF_COMPLAINT=knee pain, USER_TEXT=my orthopedist referred me for knee pain
-  Output: {"intake_classification":"specialist_referral","confidence":"high","rationale":"Patient mentioned orthopedist referral."}
-
-Example 5 — Default, no strong signals:
-  MODE=clinic, CHIEF_COMPLAINT=back pain, USER_TEXT=my back hurts
-  Output: {"intake_classification":"routine_checkup","confidence":"medium","rationale":"No specialist, pediatric, or mental health signals."}
-
-OUTPUT SCHEMA:
-{
-  "intake_classification": "",   // one of: emergency_visit, routine_checkup, specialist_referral, mental_health, pediatric
-  "confidence": "",              // one of: high, medium, low
-  "rationale": ""                // brief, factual reason — no diagnosis language
-}
-""".strip()
-
-
 
 
 def crisis_score_system() -> str:
@@ -409,6 +405,144 @@ OUTPUT SCHEMA:
   "confidence": "low",       // "high" | "medium" | "low"
   "reasoning": ""            // one sentence, clinical language, ≤200 chars
 }
+""".strip()
+
+
+def list_extract_system(field_kind: str, style: str) -> str:
+    """
+    Generic clinical list extractor — replaces the regex splitters previously
+    used for allergies / PMH / recent results.
+
+    field_kind is the type of list to extract.  Each kind tweaks the
+    examples and the no-data phrasing but the output schema is identical.
+    Recognised kinds:
+      - "allergies":      drug, food, environmental allergies (NKDA = no allergies)
+      - "pmh":            past medical history, surgeries, chronic conditions
+      - "recent_results": labs, imaging, vital sign trends since last visit
+
+    Why one shared prompt:
+      - All three fields are short bullet-style content, not narrative.
+      - All three need the same "patient said none → empty list, no reply"
+        + "patient gave a sentence → extract clinical terms, no reply"
+        contract.
+      - One prompt per field would triple maintenance cost.
+    """
+    if field_kind == "allergies":
+        kind_label = "ALLERGIES"
+        none_phrase = "no known allergies / NKDA / 'I'm not allergic to anything'"
+        examples = """
+Example A — single allergy:
+  Input:  "yes I'm allergic to penicillin"
+  Output: {"items": ["penicillin"], "items_complete": true, "reply": ""}
+
+Example B — multiple allergies in one sentence:
+  Input:  "I'm allergic to peanuts and pollen, and latex makes me rash"
+  Output: {"items": ["peanuts", "pollen", "latex"], "items_complete": true, "reply": ""}
+
+Example C — none reported:
+  Input:  "no known allergies"
+  Output: {"items": [], "items_complete": true, "reply": ""}
+
+Example D — patient said yes but didn't list anything:
+  Input:  "yes I have allergies"
+  Output: {"items": [], "items_complete": false, "reply": "What are you allergic to? You can list a few separated by commas — for example: 'penicillin, latex, peanuts'."}
+
+Example E — brand name → keep generic + brand:
+  Input:  "Tylenol gives me hives"
+  Output: {"items": ["acetaminophen (Tylenol)"], "items_complete": true, "reply": ""}
+
+Example F — spelling correction (applied silently):
+  Input:  "I'm allergic to penislin and amoxasalin"
+  Output: {"items": ["penicillin", "amoxicillin"], "items_complete": true, "reply": ""}
+
+Example G — unrecognizable name (ask to clarify):
+  Input:  "I'm allergic to xqzstuff"
+  Output: {"items": [], "items_complete": false, "reply": "I wasn't able to recognize 'xqzstuff' as an allergen. Could you double-check the spelling?"}
+""".strip()
+    elif field_kind == "pmh":
+        kind_label = "PAST MEDICAL HISTORY"
+        none_phrase = "none / no past conditions / otherwise healthy"
+        examples = """
+Example A — chronic conditions:
+  Input:  "I have hypertension, diagnosed about 5 years ago"
+  Output: {"items": ["hypertension (diagnosed 5 years ago)"], "items_complete": true, "reply": ""}
+
+Example B — multiple conditions and surgeries:
+  Input:  "had a heart attack in 2019 and gallbladder removed in 2021, also have diabetes type 2"
+  Output: {"items": ["myocardial infarction (2019)", "cholecystectomy (2021)", "type 2 diabetes"], "items_complete": true, "reply": ""}
+
+Example C — none reported:
+  Input:  "nothing significant, I'm pretty healthy"
+  Output: {"items": [], "items_complete": true, "reply": ""}
+
+Example D — vague:
+  Input:  "I think I had something a while back"
+  Output: {"items": [], "items_complete": false, "reply": "Could you share what condition or surgery you mean, and roughly when? If nothing comes to mind, just say 'none'."}
+""".strip()
+    elif field_kind == "recent_results":
+        kind_label = "RECENT LAB / IMAGING RESULTS"
+        none_phrase = "none / no recent tests / haven't had any tests"
+        examples = """
+Example A — single lab:
+  Input:  "blood pressure check last month, results were normal"
+  Output: {"items": ["blood pressure (normal, last month)"], "items_complete": true, "reply": ""}
+
+Example B — multiple results:
+  Input:  "had a CBC last week, A1c was 6.8 in March, and a chest x-ray two months ago that was clear"
+  Output: {"items": ["CBC (last week)", "A1c 6.8 (March)", "chest x-ray clear (~2 months ago)"], "items_complete": true, "reply": ""}
+
+Example C — none:
+  Input:  "no recent tests"
+  Output: {"items": [], "items_complete": true, "reply": ""}
+""".strip()
+    else:
+        kind_label = field_kind.upper()
+        none_phrase = "none / not applicable"
+        examples = ""
+
+    return f"""
+ROLE:
+You are a clinical intake assistant extracting a list of {kind_label} items
+from a patient's natural-language reply.
+
+TASK:
+Parse NEW_USER_MESSAGE into a structured list.  Each list item must be a
+short clinical phrase (2–10 words), not a full sentence.
+
+RESPONSE RULES:
+{style}
+
+HARD CONSTRAINTS:
+- Return ONLY a JSON object matching the OUTPUT schema.  No markdown.
+- Never invent items.  If a field isn't stated, leave the list empty.
+- Strip filler words like "yes", "I have", "I'm allergic to" from items —
+  the items are clinical entries, not patient quotes.
+- Use generic drug names when the patient gives a brand name.  Keep the
+  brand name in parentheses so the clinician can see the original phrasing.
+- "{none_phrase}" → return {{"items": [], "items_complete": true, "reply": ""}}.
+- If the patient said yes/affirmative but didn't list anything, set
+  items_complete=false and ask EXACTLY ONE clarifying question in reply
+  ending with "?".
+- Never diagnose.  Never advise.  Never speculate.
+
+SPELLING CORRECTION (allergies only):
+- If an allergy name is a clear misspelling of a known drug, food, or substance, correct it silently in "items".
+  Common corrections: "penislin" → "penicillin", "amoxasalin" → "amoxicillin", "solfas" → "sulfa drugs",
+  "codeen" → "codeine", "asprin" → "aspirin".
+- If a name is completely unrecognizable (random characters, not a plausible allergen/drug/food/substance),
+  do NOT include it. Set items_complete=false and ask in reply:
+  "I wasn't able to recognize '[name]' as an allergen. Could you double-check the spelling?"
+
+FEW-SHOT EXAMPLES:
+
+{examples}
+
+OUTPUT SCHEMA:
+{{
+  "items":          [],     // list of short clinical phrases (max 30 items, max 200 chars each)
+  "items_complete": true,   // true when the list is settled (even when empty)
+  "reply":          ""      // follow-up question when items_complete=false
+}}
 """.strip()
 
 

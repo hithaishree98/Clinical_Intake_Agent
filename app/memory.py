@@ -15,7 +15,7 @@ Each field has its own merge rule:
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 
@@ -64,7 +64,7 @@ def merge_summary(prior: dict | None, visit: dict) -> dict:
     )[:_MAX_CONDITIONS]
 
     # recent_complaints — append with date, keep last N
-    today = datetime.utcnow().strftime("%Y-%m-%d")
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     new_cc = (visit.get("chief_complaint") or "").strip()
     prior_complaints = list(prior.get("recent_complaints") or [])
     if new_cc:

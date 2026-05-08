@@ -1,8 +1,8 @@
 import json
 import logging
-import datetime
 import re
 from contextvars import ContextVar
+from datetime import datetime, timezone
 from typing import Any
 
 logger = logging.getLogger("intake")
@@ -29,10 +29,6 @@ def set_job_id(job_id: str) -> None:
 
 def get_job_id() -> str | None:
     return _job_id_ctx.get()
-
-def set_node_id(node_id: str) -> None:
-    """Track which graph node is currently executing for distributed tracing."""
-    _node_id_ctx.set(node_id)
 
 def get_node_id() -> str | None:
     return _node_id_ctx.get()
@@ -93,7 +89,7 @@ def mask_phi(fields: dict[str, Any]) -> dict[str, Any]:
 
 def _base_payload(event: str, level: str, **fields) -> dict:
     payload = {
-        "ts": datetime.datetime.utcnow().isoformat() + "Z",
+        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
         "level": level,
         "event": event,
         **{k: v for k, v in fields.items() if v is not None},

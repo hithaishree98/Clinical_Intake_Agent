@@ -58,17 +58,17 @@ class IntakeState(TypedDict, total=False):
     needs_emergency_review: bool
 
     # ── Agentic fields ────────────────────────────────────────────────────
-    # Feature 1: intake classification
+    # Intake classification (set by subjective_node when CC first captured).
     intake_classification: Optional[str]   # "emergency_visit"|"routine_checkup"|"specialist_referral"|"mental_health"|"pediatric"
     classification_confidence: Optional[str]  # "high"|"medium"|"low"
 
-    # Feature 3: extraction quality retry
+    # Quality gate — re-asks if OPQRST is too thin before advancing.
     extraction_quality_score: Optional[float]  # 0.0–1.0
-    extraction_retry_count: int                 # increments on each quality-gate retry
+    extraction_retry_count: int                # increments on each quality-gate retry
 
-    # Feature 4: validation gate
-    validation_errors: List[str]                # error keys from validate_node; empty = passed
-    validation_target_phase: Optional[str]      # phase to advance to if validation passes
+    # Validation gate — runs between phase transitions; routes back on errors.
+    validation_errors: List[str]               # error keys from validate_node; empty = passed
+    validation_target_phase: Optional[str]     # phase to advance to if validation passes
 
     # ── Safety ────────────────────────────────────────────────────────────
     crisis_detected: bool                       # True if crisis language was detected in this session
@@ -86,6 +86,9 @@ class IntakeState(TypedDict, total=False):
 
     # ── Cost tracking ─────────────────────────────────────────────────────
     session_cost_usd: float                     # accumulated LLM spend for this session; checked against cap
+
+    # ── EHR delivery ─────────────────────────────────────────────────────
+    fhir_push_ok: bool                           # True if FHIR bundle was sent to EHR successfully
 
     # ── Memory (Layer 2) ──────────────────────────────────────────────────
     patient_id: Optional[str]

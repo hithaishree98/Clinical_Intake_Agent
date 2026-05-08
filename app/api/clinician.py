@@ -14,7 +14,6 @@ from fastapi import APIRouter, Depends, Form, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from .. import sqlite_db as db
-from ..logging_utils import log_event
 from ..settings import get_settings
 from .deps import limiter, require_clinician
 
@@ -27,16 +26,18 @@ def clinician_token(request: Request, password: str = Form(...)):
     settings = get_settings()
     if password != settings.clinician_password:
         raise HTTPException(status_code=401, detail="Invalid credentials.")
+    lifetime = int(settings.clinician_token_lifetime_seconds)
     token = jwt.encode(
-        {"sub": "clinician", "exp": time.time() + 86400},
+        {"sub": "clinician", "exp": time.time() + lifetime},
         settings.jwt_secret,
         algorithm="HS256",
     )
-    return {"access_token": token, "token_type": "bearer"}
+    return {"access_token": token, "token_type": "bearer", "expires_in": lifetime}
 
 
 @router.get("/pending")
-def clinician_pending(_: None = Depends(require_clinician)):
+@limiter.limit("60/minute")
+def clinician_pending(request: Request, _: None = Depends(require_clinician)):
     return JSONResponse(content=db.list_pending_escalations())
 
 
@@ -100,16 +101,6 @@ def clinician_case(thread_id: str, _: None = Depends(require_clinician)):
     }
 
 
-@router.get("/webhooks")
-@limiter.limit("30/minute")
-def list_webhook_deliveries(
-    request: Request,
-    thread_id: str | None = None,
-    limit: int = 50,
-    _: None = Depends(require_clinician),
-):
-    rows = db.get_webhook_deliveries(thread_id=thread_id, limit=min(limit, 200))
-    return {"count": len(rows), "deliveries": [dict(r) for r in rows]}
 
 
 @router.get("/report/{thread_id}/fhir")
@@ -133,50 +124,3 @@ def get_fhir_report(request: Request, thread_id: str, _: None = Depends(require_
         response.headers["X-Pending-Review"] = "true"
     return response
 
-
-# ---------------------------------------------------------------------------
-# Prompt A/B experiment management
-# ---------------------------------------------------------------------------
-
-@router.post("/experiments")
-def create_experiment(
-    name: str = Form(...),
-    prompt_key: str = Form(...),
-    variant_a: str = Form(...),
-    variant_b: str = Form(...),
-    _: None = Depends(require_clinician),
-):
-    from ..prompts import PROMPT_VERSIONS
-    if prompt_key not in PROMPT_VERSIONS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unknown prompt_key '{prompt_key}'. Valid keys: {list(PROMPT_VERSIONS.keys())}",
-        )
-    existing = db.get_active_experiment(prompt_key)
-    if existing:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Active experiment already exists for '{prompt_key}': {existing['experiment_id']}",
-        )
-    exp_id = db.create_experiment(name, prompt_key, variant_a, variant_b)
-    log_event("experiment_created", experiment_id=exp_id, prompt_key=prompt_key,
-              variant_a=variant_a, variant_b=variant_b)
-    return {"experiment_id": exp_id, "status": "active"}
-
-
-@router.get("/experiments")
-def list_experiments(_: None = Depends(require_clinician)):
-    return {"experiments": db.list_experiments()}
-
-
-@router.patch("/experiments/{experiment_id}")
-def update_experiment(
-    experiment_id: str,
-    status: str = Form(...),
-    _: None = Depends(require_clinician),
-):
-    if status not in ("active", "paused", "concluded"):
-        raise HTTPException(status_code=400, detail="status must be active|paused|concluded")
-    db.update_experiment_status(experiment_id, status)
-    log_event("experiment_updated", experiment_id=experiment_id, new_status=status)
-    return {"ok": True, "experiment_id": experiment_id, "status": status}

@@ -1,14 +1,13 @@
 """
 health.py — Observability endpoints.
 
-/health  — liveness probe (always 200 if the process is up)
-/ready   — readiness probe (503 if DB / graph / LLM circuit is degraded)
-/analytics      — full operational metrics (clinician-gated)
-/analytics/summary — dashboard summary (clinician-gated)
+/health            — liveness probe (always 200 if the process is up)
+/ready             — readiness probe (503 if DB / graph / LLM circuit is degraded)
+/analytics/summary — lightweight dashboard summary (clinician-gated, used by both dashboards)
 
-Keeping these in a dedicated router makes it trivial to add to a monitoring
-stack: point Kubernetes / ECS health checks at /health, readiness checks at
-/ready, and scrape /analytics for a Grafana dashboard.
+Full analytics (/admin/analytics), webhook log (/admin/webhooks), and A/B
+experiments (/admin/experiments) live in admin.py — they are ops-facing, not
+needed by the clinician workflow dashboard.
 """
 from __future__ import annotations
 
@@ -33,7 +32,7 @@ def health(request: Request):
     return {
         "status": "ok",
         "llm_circuit": _breaker.state,
-        "llm_failure_count": _breaker._failures,
+        "llm_failure_count": _breaker.failures,
         "version": "1.0.0",
     }
 
@@ -71,15 +70,6 @@ def ready(request: Request):
     return {"status": "ready", "llm_circuit": _breaker.state}
 
 
-@router.get("/analytics")
-def analytics(_: None = Depends(require_clinician)):
-    """Full operational metrics for the last 7 days. Requires clinician token."""
-    from ..llm import _breaker
-    data = db.get_analytics()
-    data["llm_circuit_state"] = _breaker.state
-    return data
-
-
 @router.get("/analytics/summary")
 def analytics_summary(_: None = Depends(require_clinician)):
     """Lightweight summary for the dashboard."""
@@ -98,6 +88,14 @@ def analytics_summary(_: None = Depends(require_clinician)):
         "llm_circuit_state":       _breaker.state,
         "failed_report_jobs":      data["failed_report_jobs_last_7_days"],
         "llm_cost_today_usd":      data.get("llm_cost_today_usd", 0.0),
+        "llm_cost_last_7_days_usd": data.get("llm_cost_last_7_days_usd", 0.0),
+        "avg_cost_per_session_usd": data.get("avg_cost_per_session_usd", 0.0),
         "repair_rate_last_1h":     data.get("repair_rate_last_1h", 0.0),
         "repair_rate_alert":       data.get("repair_rate_alert", False),
+        # Cache + voice — exposed here so the dashboard can show all KPI
+        # cards from a single endpoint without a second round-trip.
+        "cache_hit_rate_pct_7d":   data.get("cache_hit_rate_pct_7d", 0.0),
+        "voice_transcribes_today": data.get("voice_transcribes_today", 0),
+        "voice_transcribes_7d":    data.get("voice_transcribes_7d", 0),
+        "voice_empty_pct_7d":      data.get("voice_empty_pct_7d", 0.0),
     }

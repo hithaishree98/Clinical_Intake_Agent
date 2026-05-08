@@ -37,7 +37,7 @@ HOW IT CONNECTS TO AN EHR OR CASE-MANAGEMENT SYSTEM
      last_http_status HTTP response code from the EHR endpoint
      last_error       Error message on failure
      next_retry_at    ISO timestamp for the next attempt
-   Clinicians can query this via GET /clinician/webhooks.
+   Admins can query this via GET /admin/webhooks.
 
 6. Idempotency: if the same event_type + payload_hash was already
    delivered successfully for a thread, the dispatch is skipped.  This
@@ -100,14 +100,10 @@ def _dispatch_in_thread(target, kwargs: dict) -> None:
     Fire-and-forget: run `target(**kwargs)` in a daemon thread.
 
     Patient safety rationale: crisis and emergency alerts must not block graph
-    execution.  If the downstream Slack/FHIR endpoint is slow or down, the
-    synchronous retry delays (2s, 8s, 30s) would freeze the node and leave the
-    patient waiting.  Running in a daemon thread decouples alert delivery from
-    the patient-facing response path.  Delivery is still tracked and retried via
-    the webhook_deliveries table — no alert is silently dropped.
+    execution.  Delivery is tracked and retried via the webhook_deliveries
+    table — no alert is silently dropped even if the thread outlives the request.
     """
-    t = threading.Thread(target=target, kwargs=kwargs, daemon=True)
-    t.start()
+    threading.Thread(target=target, kwargs=kwargs, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -240,7 +236,10 @@ def _post_with_retry(
         }
 
     delivery_id = str(uuid.uuid4())
-    db.create_webhook_delivery(delivery_id, thread_id, event_type, uh, ph)
+    # Persist the raw body so the dead-letter worker can replay it later.
+    # URLs/headers are re-derived from event_type at replay time, so secrets
+    # and rotated webhook URLs aren't pinned to the row.
+    db.create_webhook_delivery(delivery_id, thread_id, event_type, uh, ph, data)
 
     cap = min(max_attempts, len(_RETRY_DELAYS) + 1)
     attempt = 0
@@ -387,10 +386,24 @@ def signed_fhir_webhook(
     if not url or not fhir_json:
         return False
 
+    # Refuse to dispatch without a signing secret.  An unsigned bundle is
+    # a security hole — receivers cannot tell it came from us, and some EHRs
+    # accept the empty header value silently.  If you genuinely need unsigned
+    # delivery (e.g. a sandbox), set COMPLETION_WEBHOOK_SECRET to any non-empty
+    # value the receiver expects (or accepts).
+    if not secret:
+        log_event(
+            "fhir_webhook_blocked_no_secret",
+            level="warning",
+            thread_id=thread_id,
+            reason="completion_webhook_secret unset; refusing to send unsigned FHIR bundle",
+        )
+        return False
+
     cap = max_attempts if max_attempts is not None else settings().webhook_max_attempts
 
     payload = fhir_json.encode("utf-8")
-    sig = _compute_signature(secret, payload) if secret else ""
+    sig = _compute_signature(secret, payload)
 
     result = _post_with_retry(
         url=url,
@@ -486,7 +499,7 @@ def _fmt_partial_identity(identity: dict) -> str:
 
 
 def _do_crisis_alert(*, thread_id: str, patient_name: str, matched_phrases: list[str],
-                     partial_identity: dict | None = None, message_preview: str = "") -> None:
+                     partial_identity: dict | None = None) -> None:
 
     identity_line = (
         patient_name
@@ -497,11 +510,9 @@ def _do_crisis_alert(*, thread_id: str, patient_name: str, matched_phrases: list
         ":rotating_light: *CRISIS LANGUAGE DETECTED — IMMEDIATE ATTENTION REQUIRED*",
         f"Patient: {identity_line}",
         f"Session: `{thread_id}`",
+        f"Detected: {', '.join(matched_phrases)}",
+        "_Open the clinician dashboard to view the full session._",
     ]
-    if message_preview:
-        lines.append(f'Patient wrote: "{message_preview[:120]}"')
-    lines.append(f"Detected: {', '.join(matched_phrases)}")
-    lines.append("_Open the clinician dashboard to view the full session._")
     slack_alert(webhook_url=settings().slack_webhook_url, text="\n".join(lines),
                 thread_id=thread_id, event_type="slack_crisis")
 
@@ -512,13 +523,15 @@ def dispatch_crisis_alert(
     patient_name: str,
     matched_phrases: list[str],
     partial_identity: dict | None = None,
-    message_preview: str = "",
 ) -> None:
     """
     Fire crisis Slack alert in a background thread.
 
-    partial_identity and message_preview are included when identity has not
-    yet been collected — gives staff enough context to act without a name.
+    partial_identity is included only when name has not yet been collected,
+    so staff can identify the patient by phone/DOB.  The patient's verbatim
+    message is intentionally NOT sent — the clinician dashboard has it, and
+    Slack channels are a poor place for raw self-harm disclosure to live.
+
     Patient safety: the 988 Lifeline message reaches the patient immediately
     regardless of Slack latency.
     """
@@ -526,7 +539,6 @@ def dispatch_crisis_alert(
         "thread_id": thread_id, "patient_name": patient_name,
         "matched_phrases": matched_phrases,
         "partial_identity": partial_identity or {},
-        "message_preview": message_preview,
     })
 
 
@@ -534,22 +546,128 @@ def dispatch_crisis_alert(
 # Dead-letter retry worker
 # ---------------------------------------------------------------------------
 
+def _resolve_dispatch_url(event_type: str) -> str:
+    """Re-derive the target URL for an event_type from current settings."""
+    cfg = settings()
+    if event_type.startswith("slack_"):
+        return cfg.slack_webhook_url or ""
+    if event_type == "fhir_completion":
+        return cfg.completion_webhook_url or ""
+    return ""
+
+
+def _build_replay_headers(event_type: str, thread_id: str, payload: bytes) -> dict:
+    """Re-derive the request headers (and signature) for a replay."""
+    if event_type.startswith("slack_"):
+        return {"Content-Type": "application/json"}
+    if event_type == "fhir_completion":
+        secret = settings().completion_webhook_secret
+        headers = {
+            "Content-Type": "application/fhir+json",
+            "X-Thread-Id": thread_id,
+        }
+        # Recompute the signature against the *current* secret so a rotation
+        # doesn't lock dead-lettered bundles out of the EHR.
+        if secret:
+            headers["X-Signature"] = _compute_signature(secret, payload)
+        return headers
+    return {}
+
+
+def _replay_delivery(row: dict) -> bool:
+    """
+    Single-shot HTTP replay of one exhausted delivery row.
+
+    Updates the existing row in place: success → 'success', failure →
+    back to 'exhausted' with attempts incremented.  The dead-letter
+    cycle runs hourly, so the next sweep picks the row back up if it's
+    still under the lifetime cap.
+    """
+    from . import sqlite_db as db
+
+    delivery_id = row["delivery_id"]
+    event_type  = row["event_type"]
+    thread_id   = row.get("thread_id") or ""
+    payload     = row.get("payload_body")
+    prior       = int(row.get("attempts") or 0)
+
+    if not payload:
+        # Pre-migration row — body was never persisted, so replay is impossible.
+        # Mark as permanently exhausted with a distinct error so the worker
+        # stops re-selecting it and ops can grep for it.
+        db.update_webhook_delivery(
+            delivery_id, status="exhausted", attempts=prior,
+            last_http_status=None, last_error="dead_letter_no_payload_body",
+            next_retry_at=None,
+        )
+        log_event("webhook_dead_letter_skipped", level="warning",
+                  delivery_id=delivery_id, thread_id=thread_id,
+                  event_type=event_type, reason="no_payload_body")
+        return False
+
+    url = _resolve_dispatch_url(event_type)
+    if not url:
+        db.update_webhook_delivery(
+            delivery_id, status="exhausted", attempts=prior,
+            last_http_status=None,
+            last_error=f"dead_letter_url_unset_for_{event_type}",
+            next_retry_at=None,
+        )
+        log_event("webhook_dead_letter_skipped", level="warning",
+                  delivery_id=delivery_id, thread_id=thread_id,
+                  event_type=event_type, reason="url_unset")
+        return False
+
+    headers = _build_replay_headers(event_type, thread_id, payload)
+    attempt = prior + 1
+
+    try:
+        req = urllib.request.Request(url, data=payload, method="POST", headers=headers)
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            ok = 200 <= resp.status < 300
+            db.update_webhook_delivery(
+                delivery_id,
+                status="success" if ok else "exhausted",
+                attempts=attempt,
+                last_http_status=resp.status,
+                last_error=None if ok else f"http_{resp.status}",
+                next_retry_at=None,
+            )
+            log_event(
+                "webhook_dead_letter_replay",
+                level="info" if ok else "warning",
+                delivery_id=delivery_id, thread_id=thread_id,
+                event_type=event_type, attempt=attempt,
+                http_status=resp.status, ok=ok,
+            )
+            return ok
+    except Exception as exc:
+        db.update_webhook_delivery(
+            delivery_id, status="exhausted", attempts=attempt,
+            last_http_status=None, last_error=str(exc)[:300],
+            next_retry_at=None,
+        )
+        log_event(
+            "webhook_dead_letter_replay",
+            level="warning",
+            delivery_id=delivery_id, thread_id=thread_id,
+            event_type=event_type, attempt=attempt,
+            error=str(exc)[:200], ok=False,
+        )
+        return False
+
+
 def retry_exhausted_webhooks() -> int:
     """
-    Re-queue webhook deliveries that exhausted all original retry attempts.
+    Replay webhook deliveries that exhausted their original retry attempts.
 
-    Call this periodically (e.g. at process startup and hourly) to give
-    transient downstream failures a second chance without operator intervention.
+    Selects rows whose body was persisted, age >= dead_letter_retry_after_hours,
+    and lifetime attempts < dead_letter_max_lifetime_attempts.  Each row is
+    re-POSTed once via _replay_delivery; success closes the row, failure leaves
+    it 'exhausted' so the next hourly sweep picks it up (until the lifetime cap).
 
-    Design:
-      • Reads exhausted deliveries older than `dead_letter_retry_after_hours`
-        and below the lifetime attempt cap from the DB.
-      • Resets each row to 'pending' so the existing _post_with_retry loop
-        handles the actual HTTP call — no duplicate delivery logic needed here.
-      • Dispatches in a background thread to avoid blocking the caller.
-      • Emits a structured log event so the retry is observable in the audit log.
-
-    Returns the number of deliveries re-queued.
+    Dispatched in a daemon thread so a slow downstream never blocks the caller.
+    Returns the number of candidates queued for replay.
     """
     from . import sqlite_db as db
 
@@ -561,20 +679,10 @@ def retry_exhausted_webhooks() -> int:
     if not candidates:
         return 0
 
-    def _requeue_and_dispatch(rows: list) -> None:
+    def _replay_all(rows: list) -> None:
         for row in rows:
-            delivery_id = row["delivery_id"]
-            thread_id   = row["thread_id"]
-            event_type  = row["event_type"]
-            db.requeue_webhook_delivery(delivery_id)
-            log_event(
-                "webhook_dead_letter_requeued",
-                delivery_id=delivery_id,
-                thread_id=thread_id,
-                event_type=event_type,
-                prior_attempts=row["attempts"],
-            )
+            _replay_delivery(row)
 
-    _dispatch_in_thread(_requeue_and_dispatch, {"rows": list(candidates)})
+    _dispatch_in_thread(_replay_all, {"rows": list(candidates)})
     return len(candidates)
 
