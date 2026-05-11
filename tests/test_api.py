@@ -1,6 +1,50 @@
 import pytest
-from unittest.mock import patch, MagicMock
 from pydantic import BaseModel
+
+from app.llm import LLMProvider, LLMResult, set_provider
+
+
+class _StubProvider(LLMProvider):
+    """
+    Test double that returns a pre-configured LLMResult on every call.
+
+    Used in TestLLMFallback to drive run_json_step deterministically without
+    network access.  Plug it in via set_provider(); the registry's circuit
+    breaker is reset automatically on swap.
+    """
+    def __init__(self, result: LLMResult) -> None:
+        self._result = result
+
+    def generate_text(self, *, system, prompt, temperature=0.2, max_tokens=900,
+                      response_mime_type="application/json", cache_key=None):
+        return self._result
+
+    def validate(self) -> None:
+        return None
+
+    @property
+    def model_name(self) -> str:
+        return "stub-model"
+
+    @property
+    def input_cost_per_million(self) -> float:
+        return 0.0
+
+    @property
+    def output_cost_per_million(self) -> float:
+        return 0.0
+
+
+@pytest.fixture
+def restore_provider():
+    """
+    Save / restore the registry's provider so swapping in a stub for one
+    test doesn't leak into the next.
+    """
+    import app.llm.registry as reg
+    original = reg._provider
+    yield
+    reg._provider = original
 
 
 # Idempotency
@@ -48,57 +92,46 @@ class SimpleSchema(BaseModel):
 
 
 class TestLLMFallback:
-    def test_uses_fallback_when_api_fails(self):
-        from app.llm import run_json_step, LLMResult
+    def test_uses_fallback_when_api_fails(self, restore_provider):
+        from app.llm import run_json_step
 
-        fallback = {"value": "fallback", "is_complete": False}
-
-        with patch("app.llm.get_gemini") as mock_gemini:
-            mock_gemini.return_value.generate_text.return_value = LLMResult(
-                ok=False, text="", error="api_error"
-            )
-            obj, meta = run_json_step(
-                system="test",
-                prompt="test",
-                schema=SimpleSchema,
-                fallback=fallback,
-            )
+        set_provider(_StubProvider(LLMResult(ok=False, text="", error="api_error")))
+        obj, meta = run_json_step(
+            system="test",
+            prompt="test",
+            schema=SimpleSchema,
+            fallback={"value": "fallback", "is_complete": False},
+        )
 
         assert obj.value == "fallback"
         assert meta["fallback_used"] is True
 
-    def test_uses_fallback_when_json_invalid(self):
-        from app.llm import run_json_step, LLMResult
+    def test_uses_fallback_when_json_invalid(self, restore_provider):
+        from app.llm import run_json_step
 
-        fallback = {"value": "fallback", "is_complete": False}
-
-        with patch("app.llm.get_gemini") as mock_gemini:
-            mock_gemini.return_value.generate_text.return_value = LLMResult(
-                ok=True, text="not valid json at all"
-            )
-            obj, meta = run_json_step(
-                system="test",
-                prompt="test",
-                schema=SimpleSchema,
-                fallback=fallback,
-            )
+        set_provider(_StubProvider(LLMResult(ok=True, text="not valid json at all")))
+        obj, meta = run_json_step(
+            system="test",
+            prompt="test",
+            schema=SimpleSchema,
+            fallback={"value": "fallback", "is_complete": False},
+        )
 
         assert obj.value == "fallback"
         assert meta["fallback_used"] is True
 
-    def test_parses_valid_json_correctly(self):
-        from app.llm import run_json_step, LLMResult
+    def test_parses_valid_json_correctly(self, restore_provider):
+        from app.llm import run_json_step
 
-        with patch("app.llm.get_gemini") as mock_gemini:
-            mock_gemini.return_value.generate_text.return_value = LLMResult(
-                ok=True, text='{"value": "parsed", "is_complete": true}'
-            )
-            obj, meta = run_json_step(
-                system="test",
-                prompt="test",
-                schema=SimpleSchema,
-                fallback={"value": "fallback", "is_complete": False},
-            )
+        set_provider(_StubProvider(LLMResult(
+            ok=True, text='{"value": "parsed", "is_complete": true}'
+        )))
+        obj, meta = run_json_step(
+            system="test",
+            prompt="test",
+            schema=SimpleSchema,
+            fallback={"value": "fallback", "is_complete": False},
+        )
 
         assert obj.value == "parsed"
         assert obj.is_complete is True

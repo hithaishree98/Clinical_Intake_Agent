@@ -156,14 +156,9 @@ def app_client(tmp_db_dir):
     _settings = _get_settings()
     _settings.app_db_path = db_path
     _settings.checkpoint_db_path = cp_path
-    # Force a fresh connection — a previous unit test may have left _db_conn
-    # pointing at its own tmp_path DB.
-    if _db._db_conn is not None:
-        try:
-            _db._db_conn.close()
-        except Exception:
-            pass
-    _db._db_conn = None
+    # Force fresh connections — a previous unit test may have left per-thread
+    # connections pointing at its own tmp_path DB.
+    _db.close_all_connections()
 
     from starlette.testclient import TestClient
     from app.main import app
@@ -585,13 +580,13 @@ class TestClinicianEndpoints:
         assert resp.status_code == 200
 
     def test_analytics_requires_clinician_token(self, app_client):
-        resp = app_client.get("/analytics")
+        resp = app_client.get("/admin/analytics")
         assert resp.status_code == 401
 
     def test_analytics_returns_metrics(self, app_client):
         token = self._get_token(app_client)
         resp = app_client.get(
-            "/analytics",
+            "/admin/analytics",
             headers={"Authorization": f"Bearer {token}"},
         )
         assert resp.status_code == 200

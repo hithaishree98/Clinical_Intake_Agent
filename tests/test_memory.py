@@ -1,3 +1,4 @@
+import pytest
 from app.memory import merge_summary, format_for_prompt
 
 
@@ -77,3 +78,51 @@ def test_format_for_prompt_returning_patient():
     assert "RETURNING_PATIENT" in out
     assert "penicillin" in out
     assert "lisinopril" in out
+
+
+# ---------------------------------------------------------------------------
+# DB persistence round-trip (upsert_patient_summary / get_patient_summary)
+# ---------------------------------------------------------------------------
+
+class TestPatientSummaryRoundTrip:
+    def test_upsert_and_retrieve(self, tmp_db):
+        from app import sqlite_db as db
+
+        visit = {
+            "identity": {"name": "Jane Doe"},
+            "chief_complaint": "headache",
+            "allergies": ["penicillin"],
+            "medications": [{"name": "lisinopril", "dose": "10mg"}],
+            "pmh": ["hypertension"],
+        }
+        merged = merge_summary(None, visit)
+        db.upsert_patient_summary("patient-123", merged)
+        retrieved = db.get_patient_summary("patient-123")
+
+        assert retrieved is not None
+        assert retrieved["visit_count"] == 1
+        assert "penicillin" in retrieved["allergies"]
+        assert "hypertension" in retrieved["conditions"]
+        assert retrieved["recent_complaints"][-1]["cc"] == "headache"
+
+    def test_second_upsert_overwrites_previous(self, tmp_db):
+        from app import sqlite_db as db
+
+        visit1 = {"identity": {}, "chief_complaint": "headache",
+                  "allergies": ["penicillin"], "pmh": [], "medications": []}
+        visit2 = {"identity": {}, "chief_complaint": "fever",
+                  "allergies": ["sulfa"], "pmh": [], "medications": []}
+
+        merged1 = merge_summary(None, visit1)
+        db.upsert_patient_summary("patient-456", merged1)
+
+        merged2 = merge_summary(merged1, visit2)
+        db.upsert_patient_summary("patient-456", merged2)
+
+        retrieved = db.get_patient_summary("patient-456")
+        assert retrieved["visit_count"] == 2
+        assert set(retrieved["allergies"]) == {"penicillin", "sulfa"}
+
+    def test_missing_patient_returns_none(self, tmp_db):
+        from app import sqlite_db as db
+        assert db.get_patient_summary("nonexistent-patient") is None

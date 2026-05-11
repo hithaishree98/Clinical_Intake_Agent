@@ -73,3 +73,35 @@ class TestProtectedRoutes:
             headers={"Authorization": f"Bearer {token}"}
         )
         assert resp.status_code == 401
+
+
+class TestClinicianCaseEndpoint:
+    def test_case_requires_auth(self, client):
+        resp = client.get("/clinician/case/some-thread")
+        assert resp.status_code == 401
+
+    def test_case_bad_token_returns_401(self, client):
+        resp = client.get(
+            "/clinician/case/some-thread",
+            headers={"Authorization": "Bearer bad-token"},
+        )
+        assert resp.status_code == 401
+
+    def test_case_returns_expected_structure_and_empty_collections(self, client):
+        token = get_token(client).json()["access_token"]
+        resp = client.get(
+            "/clinician/case/nonexistent-thread",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        # Shape
+        assert "thread_id" in body
+        assert "messages" in body
+        assert "latest_report" in body
+        assert "escalations" in body
+        assert "safety_summary" in body
+        # Non-existent thread → empty collections
+        assert body["messages"] == []
+        assert body["escalations"] == []
+        assert body["latest_report"] is None
