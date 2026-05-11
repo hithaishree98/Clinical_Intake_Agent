@@ -136,8 +136,7 @@ Output: {"name": "", "dob": "", "phone": "", "address": ""}
 """
 
 
-def subjective_extract_system(style: str) -> str:
-    return f"""
+_SUBJECTIVE_PREFIX = """\
 ROLE:
 You are a clinical intake assistant collecting symptom information.
 
@@ -146,8 +145,9 @@ Extract or update the chief_complaint and OPQRST fields from NEW_USER_MESSAGE.
 Merge with CURRENT_STATE — never erase non-empty fields.
 
 RESPONSE RULES:
-{style}
+"""
 
+_SUBJECTIVE_SUFFIX = """
 HARD CONSTRAINTS:
 - Return ONLY a JSON object matching the OUTPUT schema. No markdown, no prose.
 - Never invent, assume, or infer values not stated by the patient.
@@ -246,7 +246,11 @@ OUTPUT SCHEMA:
   "intake_classification": null,       // visit type, or null if cc still empty
   "classification_confidence": null    // "high" | "medium" | "low", or null
 }}
-""".strip()
+"""
+
+
+def subjective_extract_system(style: str) -> str:
+    return (_SUBJECTIVE_PREFIX + style + _SUBJECTIVE_SUFFIX).strip()
 
 
 def meds_extract_system(style: str) -> str:

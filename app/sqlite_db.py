@@ -537,6 +537,8 @@ def get_stored_identity_by_name(name: str, dob: str = "") -> dict | None:
     base_url = (settings().ehr_fhir_url or "").rstrip("/")
     if not base_url:
         return None
+    if not base_url.startswith(("https://", "http://")):
+        return None
 
     params: dict = {"name": name, "_count": "1"}
     if dob:
@@ -1081,7 +1083,7 @@ def prune_old_checkpoints(days: int = 30) -> int:
         for table in ("checkpoints", "checkpoint_writes"):
             try:
                 cur = cp.execute(
-                    f"DELETE FROM {table} WHERE thread_id IN ({placeholders})",
+                    f"DELETE FROM {table} WHERE thread_id IN ({placeholders})",  # nosec B608 — table is a hardcoded literal from the loop above
                     thread_ids,
                 )
                 total_deleted += cur.rowcount
@@ -1105,7 +1107,7 @@ def reset_demo_data() -> None:
             "jobs", "session_state", "idempotency", "llm_failure_log",
             "webhook_deliveries",
         ]:
-            c.execute(f"DELETE FROM {table}")
+            c.execute(f"DELETE FROM {table}")  # nosec B608 — table is a hardcoded literal from the list above
         c.commit()
     _retry_db_operation(_reset)
 
@@ -1200,7 +1202,7 @@ def assign_experiment_variant(thread_id: str, experiment_id: str) -> str:
     variant = "a" if int(hashlib.sha256(thread_id.encode()).hexdigest()[:16], 16) % 2 == 0 else "b"
     col = f"sessions_{variant}"
     exec_one(
-        f"UPDATE prompt_experiments SET {col}={col}+1, updated_at=datetime('now')"
+        f"UPDATE prompt_experiments SET {col}={col}+1, updated_at=datetime('now')"  # nosec B608 — col is "sessions_a" or "sessions_b", not user input
         " WHERE experiment_id=?",
         (experiment_id,),
     )

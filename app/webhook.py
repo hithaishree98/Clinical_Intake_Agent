@@ -216,6 +216,8 @@ def _post_with_retry(
 
     if not url:
         return {"status": "no_url", "attempts": 0}
+    if not url.startswith(("https://", "http://")):
+        return {"status": "invalid_url_scheme", "attempts": 0}
 
     ph = _payload_hash(data)
     uh = _url_hash(url)
@@ -616,6 +618,17 @@ def _replay_delivery(row: dict) -> bool:
         log_event("webhook_dead_letter_skipped", level="warning",
                   delivery_id=delivery_id, thread_id=thread_id,
                   event_type=event_type, reason="url_unset")
+        return False
+    if not url.startswith(("https://", "http://")):
+        db.update_webhook_delivery(
+            delivery_id, status="exhausted", attempts=prior,
+            last_http_status=None,
+            last_error="dead_letter_invalid_url_scheme",
+            next_retry_at=None,
+        )
+        log_event("webhook_dead_letter_skipped", level="warning",
+                  delivery_id=delivery_id, thread_id=thread_id,
+                  event_type=event_type, reason="invalid_url_scheme")
         return False
 
     headers = _build_replay_headers(event_type, thread_id, payload)

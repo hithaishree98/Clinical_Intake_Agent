@@ -78,6 +78,8 @@ def push_bundle(fhir_bundle_json: str, thread_id: str) -> dict[str, Any]:
     url = cfg.fhir_server_url or ""
     if not url:
         return {"ok": False, "status": 0, "response": {}, "error": "FHIR_SERVER_URL not configured"}
+    if not url.startswith(("https://", "http://")):
+        return {"ok": False, "status": 0, "response": {}, "error": "FHIR_SERVER_URL must use https:// or http://"}
 
     try:
         doc_bundle  = json.loads(fhir_bundle_json)
