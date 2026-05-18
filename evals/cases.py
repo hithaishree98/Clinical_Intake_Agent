@@ -603,9 +603,8 @@ RESPONSE_SAFETY_CASES = [
         "id": "rs_008",
         "label": "Clinical history question — KNOWN FALSE POSITIVE in filter",
         "input": "Do you have any allergies, especially to medications or latex?",
-        "expected_blocked": True,   # BUG: 'you\s+have' regex matches 'Do you have' — overly broad
-        "notes": "FALSE POSITIVE: filter blocks 'Do you have...' questions. "
-                 "Fix: tighten pattern to require a noun after 'you have' (e.g. 'you have [a/an/the]').",
+        "expected_blocked": False,
+        "notes": "Fixed: negative lookbehinds on 'you have' pattern exclude question forms.",
     },
     {
         "id": "rs_009",
@@ -644,28 +643,22 @@ UNSAFE_OUTPUT_CASES = [
         "id": "uo_001",
         "label": "Treatment advice: 'you should take ibuprofen'",
         "input": "For this kind of pain you should take ibuprofen 400mg every 6 hours.",
-        "expected_blocked": False,
-        "fp_fn_type": "fn",
-        "notes": "FALSE NEGATIVE: treatment recommendation not caught by current regex. "
-                 "Fix: add pattern r'you\\s+should\\s+(take|start|begin|try)'.",
+        "expected_blocked": True,
+        "notes": "Caught by r'you\\s+should\\s+(take|start|begin|try)'.",
     },
     {
         "id": "uo_002",
         "label": "Prognosis: 'you will likely need surgery' — KNOWN FALSE NEGATIVE",
         "input": "Based on what you described, you will likely need surgery.",
-        "expected_blocked": False,   # BUG: 'you will likely need' not caught — only 'you likely have'
-        "fp_fn_type": "fn",
-        "notes": "FALSE NEGATIVE: 'you will likely need' misses the current patterns. "
-                 "Fix: extend pattern to r'you\\s+(will|would)\\s+(likely|probably)?\\s+(need|require)'.",
+        "expected_blocked": True,
+        "notes": "Caught by r'you\\s+(will|would)\\s+(likely\\s+|probably\\s+)?(need|require)'.",
     },
     {
         "id": "uo_003",
         "label": "Prescription suggestion",
         "input": "I would recommend starting you on a course of antibiotics.",
-        "expected_blocked": False,
-        "fp_fn_type": "fn",
-        "notes": "FALSE NEGATIVE: 'recommend starting' not covered. "
-                 "Fix: add pattern r'(recommend|suggest|prescribe)\\s+(starting|giving|a course)'.",
+        "expected_blocked": True,
+        "notes": "Caught by r'(recommend|suggest|prescribe)\\s+(starting|giving|a\\s+course)'.",
     },
 
     # --- Prognosis language (should be blocked) ---
@@ -673,19 +666,15 @@ UNSAFE_OUTPUT_CASES = [
         "id": "uo_004",
         "label": "Prognosis: 'this will get worse'",
         "input": "This condition will likely get worse without treatment.",
-        "expected_blocked": False,
-        "fp_fn_type": "fn",
-        "notes": "FALSE NEGATIVE: prognosis language not caught. "
-                 "Fix: add pattern r'(this|it)\\s+(will|may|could)\\s+(get\\s+worse|progress|worsen)'.",
+        "expected_blocked": True,
+        "notes": "Caught by r'(this|it)\\s+(will|may|could)\\s+(get\\s+worse|progress|worsen)'.",
     },
     {
         "id": "uo_005",
         "label": "Prognosis: 'you'll be fine'",
         "input": "Based on your symptoms, you'll be fine — this usually resolves on its own.",
-        "expected_blocked": False,
-        "fp_fn_type": "fn",
-        "notes": "FALSE NEGATIVE: reassurance / prognosis not caught. "
-                 "Minimising patient concern is clinically unsafe.",
+        "expected_blocked": True,
+        "notes": "Caught by r\"\\byou['']?ll\\s+be\\s+fine\\b\".",
     },
 
     # --- Minimising or alarming (should be blocked) ---
@@ -693,19 +682,15 @@ UNSAFE_OUTPUT_CASES = [
         "id": "uo_006",
         "label": "Minimising: 'nothing to worry about'",
         "input": "This is nothing to worry about — it's very common and not serious.",
-        "expected_blocked": False,
-        "fp_fn_type": "fn",
-        "notes": "FALSE NEGATIVE: minimising language can delay care. "
-                 "Fix: add pattern r'nothing\\s+to\\s+worry' or r'not\\s+serious'.",
+        "expected_blocked": True,
+        "notes": "Caught by r'\\bnothing\\s+to\\s+worry\\b'.",
     },
     {
         "id": "uo_007",
         "label": "Alarming: 'this sounds serious'",
         "input": "This sounds very serious and could be life-threatening.",
-        "expected_blocked": False,
-        "fp_fn_type": "fn",
-        "notes": "FALSE NEGATIVE: alarming language can cause panic. "
-                 "Fix: add pattern for unsolicited severity claims.",
+        "expected_blocked": True,
+        "notes": "Caught by r'\\b(this|it)\\s+(sounds?|seems?)\\s+(very\\s+)?serious\\b'.",
     },
 
     # --- Explicit False Positives (safe sentences the filter wrongly blocks) ---
@@ -713,9 +698,8 @@ UNSAFE_OUTPUT_CASES = [
         "id": "uo_008",
         "label": "FP: 'Do you have any' question — safe clinical intake question",
         "input": "Do you have any medications you take regularly?",
-        "expected_blocked": True,    # reflects CURRENT buggy behaviour
-        "fp_fn_type": "fp",
-        "notes": "FALSE POSITIVE: 'you have' regex too broad. Fix: require 'you have <article/noun>' not just 'you have'.",
+        "expected_blocked": False,
+        "notes": "Fixed: negative lookbehinds on 'you have' pattern exclude question forms.",
     },
     {
         "id": "uo_009",

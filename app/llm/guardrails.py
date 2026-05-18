@@ -23,12 +23,23 @@ from ..logging_utils import log_event
 # ---------------------------------------------------------------------------
 
 _DIAGNOSIS_PATTERNS = [
-    r"\byou\s+(have|likely\s+have|probably\s+have|may\s+have|might\s+have)\b",
+    # Negative lookbehinds exclude "Do you have / Did you have" question forms
+    r"(?<!do )(?<!Do )(?<!did )(?<!Did )(?<!does )(?<!Does )\byou\s+(have|likely\s+have|probably\s+have|may\s+have|might\s+have)\b",
     r"\bdiagnos(is|ed|ing|e)\b",
     r"\bI\s+think\s+you\b",
     r"\bconsistent\s+with\b",
     r"\bsounds?\s+like\s+(you\s+have|a\s+case\s+of)\b",
     r"\bthis\s+is\s+(likely|probably|possibly)\s+(a|an)\s+\w+\s+(condition|disease|disorder|infection)\b",
+    # Treatment recommendations
+    r"\byou\s+should\s+(take|start|begin|try)\b",
+    r"\byou\s+(will|would)\s+(likely\s+|probably\s+)?(need|require)\b",
+    r"\b(recommend|suggest|prescribe)\s+(starting|giving|a\s+course)\b",
+    # Prognosis language
+    r"\b(this|it)\s+(?:\w+\s+)?(will|may|could)\s+(?:\w+\s+)?(get\s+worse|progress|worsen)\b",
+    r"\byou['']?ll\s+be\s+fine\b",
+    # Minimising / alarming
+    r"\bnothing\s+to\s+worry\b",
+    r"\b(this|it)\s+(sounds?|seems?)\s+(very\s+)?serious\b",
 ]
 _DIAGNOSIS_RE = re.compile("|".join(_DIAGNOSIS_PATTERNS), re.IGNORECASE)
 

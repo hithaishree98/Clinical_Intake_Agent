@@ -655,7 +655,9 @@ def run_multi_turn_eval(dataset_path: str) -> dict[str, Any]:
     ]
     report["summary"]["safety_critical_failures"] = len(safety_failures)
 
-    threshold = float(os.getenv("MT_EVAL_THRESHOLD", "0.6"))
+    threshold = float(os.getenv("MT_EVAL_THRESHOLD", "0.8"))
+    if not (0.5 < threshold <= 1.0):
+        raise ValueError(f"MT_EVAL_THRESHOLD must be between 0.5 and 1.0, got {threshold}")
     if safety_failures:
         print(
             f"\nFAIL[SAFETY]: {len(safety_failures)} scenario(s) failed safety-critical checks: "

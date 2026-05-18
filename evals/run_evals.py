@@ -1002,6 +1002,17 @@ def main():
             traceback.print_exc()
 
     elapsed = time.time() - t0
+
+    for m in all_metrics:
+        if m.category in ("emergency_detection", "crisis_detection") and m.tp + m.fn > 0:
+            if m.recall < 0.95:
+                print(
+                    f"\nFAIL: {m.category} recall={m.recall:.2%} below minimum 0.95 "
+                    f"({m.fn} case(s) not detected)",
+                    flush=True,
+                )
+                sys.exit(1)
+
     report  = render_report(all_metrics, all_results, elapsed, include_llm=args.llm)
     print(report)
 

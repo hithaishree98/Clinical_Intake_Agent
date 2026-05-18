@@ -81,7 +81,7 @@ def _make_mock_run_json_step(overrides: dict[str, Any] | None = None):
                 name=cfg.get("name", "Test Patient"),
                 dob=cfg.get("dob", "1990-06-20"),
                 phone=cfg.get("phone", "4125550100"),
-                address=cfg.get("address", "456 Oak Ave Boston MA"),
+                address=cfg.get("address", "456 Oak Ave Boston MA 02101"),
             )
             return obj, dict(_LLM_META_CLEAN)
 
