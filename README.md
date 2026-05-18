@@ -2,7 +2,6 @@
 
 A conversational intake agent for clinical settings. The patient types or speaks, the system collects their identity, symptoms, allergies, medications, and history through natural conversation, triages urgency in real time, and outputs a clinician note + FHIR R4 bundle.
 
-> **Demo**: _add 30–60s screen recording — chest pain emergency → escalation → clinician dashboard → FHIR bundle_
 
 ## Problem
 
@@ -33,7 +32,7 @@ Slack alerts · HMAC-signed FHIR webhook
 ```
 
 ## Flow
-
+```
 Patient opens the app and clicks New Session
          ↓
 guard_node — runs on every message, regardless of which phase intake is in
@@ -94,48 +93,34 @@ Clinician opens the portal
   Go to /dashboard and enter the clinician password in the auth bar at the top, then click Auth to load case notes
   Click View Escalations to see all flagged cases
   Click an escalation to populate the resolve form, add a nurse note, and click Resolve
+```
 
+## Key Features
 
-## Technical decisions 
+- **Real-time safety detection** — crisis and emergency phrases checked before every node, not just at intake entry. Once a session is flagged it stays flagged; all subsequent messages return the safety response immediately.
+- **Session resumption** — LangGraph checkpoints the full graph state after every node. A server restart mid-intake is transparent to the patient.
+- **Cross-visit memory** — allergies and conditions union across visits; medications replace each visit; crisis flags never drop. Returning patients aren't re-asked things already on file.
+- **Voice intake** — mic button sends audio to Groq Whisper; transcript flows through the same chat pipeline with a hallucination filter before it reaches the patient flow.
+- **Clinician dashboard** — view all escalations, resolve with nurse notes, pull full session transcript and FHIR bundle per case.
+- **Three-level LLM degradation** — primary call → repair on validation failure → hardcoded fallback. The patient always gets a response.
+- **FHIR R4 output** — clinician note + bundle with Patient, Condition, AllergyIntolerance, MedicationStatement, and Observation resources, built from validated structured state.
 
-**Guard node runs before every node, not just at entry.**
-Crisis and emergency detection aren't a filter at the front door. Guard_node is wired into the graph so it runs before consent, identity, subjective, history — every step. Once a session is flagged it stays flagged; all subsequent messages return the safety response immediately regardless of which phase intake is in.
+## Data
 
-**Two-tier crisis detection to keep LLM calls cheap.**
-The first pass is keyword/regex — handles obvious cases at zero cost. The LLM only comes in when the first pass finds nothing but soft distress signals are present (hopelessness, burden language, passive ideation). Same pattern for intent classification.
+- **app.db** (SQLite WAL): sessions, messages, reports, escalations, LLM usage, webhooks, patient memory
+- **checkpoints.db**: LangGraph conversation state — this is what enables session resumption after a server restart
+- **Dead-letter table**: exhausted webhook deliveries stored here for manual replay
 
-**Three levels of LLM degradation so the session never crashes.**
-Primary call → Pydantic validation. If that fails but the model responded, a repair call sends the exact validation error back to the model in a "REPAIR REQUIRED" prompt. If that also fails, a hardcoded fallback dict. The patient always gets a response.
+All log events run through a PHI redaction pass before writing to stdout — names, DOBs, and phone numbers are replaced with `[REDACTED]` before any log aggregation sees them.
 
-**OPQRST completeness is scored deterministically, not by the LLM.**
-Each field has a weight (chief complaint 0.25, onset 0.20, severity 0.20, etc). Score below 0.75 for ED or 0.60 for clinic and the system asks a targeted gap-fill question — no LLM involved. After two failed quality checks it switches to an "I have X, still need Y" summary so the patient isn't stuck in a loop.
+## Architecture
 
-**Circuit breaker on the LLM so load spikes don't cascade.**
-After 5 consecutive failures the circuit opens and /chat returns 503 without spending a token. After 60 seconds it half-opens and lets one probe through. A successful probe closes it; a failure resets the timer.
+Full node descriptions, design decisions, and pipeline: [SystemDesign.md](SystemDesign.md)
 
-**Correction routing to specific fields, not just sections.**
-If a patient says "I want to change my medications", they go directly to the medications step, not the top of clinical history. The system recognizes section-level corrections via regex across identity, symptom, and history sub-fields, and routes back to the right step without losing anything else collected.
+## Testing
 
-**Safety preflight before report generation.**
-Before generating a clinician note, a weighted scoring pass runs over the session state. Hard blocks — missing chief complaint, incomplete clinical history — prevent the report from being written entirely and create an escalation record so the clinician knows why. Review signals (active emergency, identity mismatch, low extraction quality) raise the score and can flag the case for mandatory clinician review.
+Manual test scenarios, test coverage, and eval categories: [TestingAndEvals.md](TestingAndEvals.md)
 
-**Cross-visit memory with field-level merge rules.**
-Allergies and conditions union across visits. Medications replace each visit. Last five chief complaints kept as a rolling list. Crisis flags are never dropped. On the next visit this summary is injected into prompts so returning patients aren't re-asked things the system already knows.
-
-**Session resumption after restart.**
-LangGraph checkpoints the full graph state to SQLite after every node. If the server restarts mid-intake, the next request with the same thread_id picks up from exactly the interrupted node — the patient doesn't start over. This works as long as checkpoints.db is on a persistent volume, which is why it's kept separate from app.db rather than bundled together.
-
-**Prompt caching via Gemini's CachedContent API — infrastructure built, not yet active.**
-The infrastructure is there — cache registry, TTL, hash invalidation on prompt changes, fallback to inline if creation fails. What's not active yet: Gemini requires a 2,048-token minimum and none of the current prompts clear it. In future if we add more examples  that activates caching on the node that runs most often.
-
-**Outbound webhook idempotency via payload hash.**
-A SHA-256 hash of the payload is used as an idempotency key for outbound FHIR webhooks so the same notification is never delivered twice. Failed deliveries retry with exponential backoff; exhausted deliveries go to a dead-letter table for manual replay.
-
-**Voice hallucination filter on Whisper output.**
-Whisper occasionally hallucinates YouTube caption phrases ("thanks for watching", "[music]") on silent or low-audio clips. These are filtered out before the transcript reaches the chat pipeline, and the patient gets a "didn't catch that" prompt instead.
-
-**Medication name spelling correction.**
-The LLM silently corrects common misspellings ("lisonopril" → "lisinopril", "metfornim" → "metformin"). Unrecognizable names trigger a re-prompt rather than storing garbage in the record.
 
 ## Quick start
 
@@ -160,13 +145,6 @@ docker compose up --build
 - Clinician dashboard: `/dashboard` → enter clinician password → click Auth
 - Admin panel: linked from dashboard
 
-## Data
-
-- **app.db** (SQLite WAL): sessions, messages, reports, escalations, LLM usage, webhooks, patient memory
-- **checkpoints.db**: LangGraph conversation state — this is what enables session resumption after a server restart
-- **Dead-letter table**: exhausted webhook deliveries stored here for manual replay
-
-All log events run through a PHI redaction pass before writing to stdout — names, DOBs, and phone numbers are replaced with `[REDACTED]` before any log aggregation sees them.
 
 ## Tech stack
 

@@ -1,254 +1,173 @@
-# Architecture and Design Decisions
+# System Design
 
-## High Level Architecture
-```
-┌─────────────────────────────────────────────────────────────┐
-│                        Browser                               │
-└────────────────────┬────────────────────────────────────────┘
-                     │ HTTP (REST, FormData)
-                     ▼
-┌─────────────────────────────────────────────────────────────┐
-│                      FastAPI                                 │
-│  ┌─────────────┐  ┌──────────────┐  ┌────────────────────┐ │
-│  │ Rate Limiter│  │  JWT Auth    │  │ Idempotency Layer  │ │
-│  │  (slowapi)  │  │  (clinician) │  │  (thread+msg_id)   │ │
-│  └─────────────┘  └──────────────┘  └────────────────────┘ │
-│                    Background Task Queue                     │
-└───────────────────────┬─────────────────────────────────────┘
-                        │
-                        ▼
-┌─────────────────────────────────────────────────────────────┐
-│                  LangGraph State Machine                     │
-│                                                              │
-│  route() ──► consent_node                                    │
-│          ──► identity_node                                   │
-│          ──► identity_review_node                            │
-│          ──► subjective_node ──► [red flag → handoff_node]   │
-│          ──► clinical_history_node                           │
-│          ──► confirm_node                                    │
-│          ──► report_node                                     │
-│          ──► handoff_node (emergency terminal)               │
-└──────────┬──────────────────────┬───────────────────────────┘
-           │                      │
-           ▼                      ▼
-┌──────────────────┐   ┌─────────────────────────────────────┐
-│  Gemini 2.5      │   │          SQLite (WAL mode)           │
-│  Flash Lite      │   │                                      │
-│                  │   │  app.db            checkpoints.db    │
-│  extract.py      │   │  ├─ sessions       └─ LangGraph      │
-│  (regex only,    │   │  ├─ messages           snapshots     │
-│   no LLM)        │   │  ├─ reports                         │
-│                  │   │  ├─ escalations                      │
-│  fhir_builder.py │   │  ├─ jobs                            │
-│  (pure Python,   │   │  ├─ mock_ehr                        │
-│   no LLM)        │   │  ├─ idempotency                     │
-│                  │   │  ├─ session_state                   │
-│  memory.py       │   │  ├─ patient_summary                 │
-│  (cross-visit    │   │  ├─ llm_usage                       │
-│   merge, no LLM) │   │  └─ emergency_phrases               │
-└──────────────────┘   └─────────────────────────────────────┘
-           │
-           ▼
-┌──────────────────────────────┐
-│   Outbound Integrations      │
-│   Slack · FHIR webhook       │
-└──────────────────────────────┘
-```
+The system is a conversational intake agent. The patient types or speaks, the system collects identity, symptoms, allergies, medications, and history through natural conversation, triages urgency in real time, and outputs a clinician note and FHIR R4 bundle.
 
-## Why LangGraph here?
+The architectural principle: the LLM handles language understanding and extraction. A fixed LangGraph state machine controls flow, phase transitions, and safety checks. The model has no ability to skip a phase, route around a validation gate, or suppress an escalation. Those are all code.
 
-I had used LangChain in a previous RAG project and wanted to explore something that could handle more complex workflows, that's what led me to LangGraph.
+---
 
-But before just picking it up, I was confused as to what makes it different from LangChain or even plain if/else, and whether it was genuinely the right fit for this project or just a more complicated way to do the same thing.
+## Intake flow
 
-Here's what I figured out.
+Each session goes through these phases in order:
 
-LangChain is built for workflows that run start to finish without stopping. You give it a task, it chains multiple LLM steps together and returns a result. No waiting for user input in the middle.
+**Consent** — shown before any data is collected. Patient must explicitly agree; declining ends the session with no data retained. Configurable — can be disabled if consent is handled at registration.
 
-That works well for something like this: user uploads a document → LLM summarises it → LLM extracts key points → LLM formats a report → done. The whole thing runs start to finish automatically, no human input needed in the middle.
+**Identity** — patient provides name, DOB, phone, and address in free text. LLM extracts and normalises into a typed schema. Patient ID is derived from SHA-256(name|dob) and the record is checked for a prior visit. After three failed extraction attempts, the system directs the patient to the front desk.
 
-If/else can handle simple conversations but falls apart the moment we have multiple stages. We need to manually track which phase the patient is in on every single message, build a decision tree with 7 branches, and figure out what happens when the server restarts mid-intake, which without state persistence means the patient loses everything and starts over. Letting someone go back and correct a previous answer would mean writing all that backtracking logic yourself.
+**Identity review** — for returning patients: stored details shown alongside what was just provided, patient chooses keep or update; a discrepancy creates a nurse-review escalation. For new patients: extracted details read back, patient confirms or corrects; correction routes back to identity.
 
-LangGraph is specifically helpful here - multi-stage conversations where you pause after each stage, wait for the human, and resume exactly where you left off. Each phase is its own isolated node. State is checkpointed to the database automatically after every step. If the connection drops after the allergy phase, the patient resumes at medications, not the beginning.
+**Symptom assessment** — LLM extracts chief complaint and full OPQRST in one call. At the same time it classifies the visit: `emergency_visit`, `routine_checkup`, `specialist_referral`, `mental_health`, or `pediatric`. A deterministic quality scorer evaluates completeness (0–1 scale); below threshold it asks a targeted gap-fill for the specific missing field. After two retries the session advances regardless — the patient is never stuck.
 
-For a clinical intake that's collecting allergy and medication data, that reliability isn't optional. If a patient completes the allergy phase and the server crashes before the next step saves, those allergies cannot be lost. That's not a convenience argument, it's a patient safety one.
+**Clinical history** — sequences through allergies → medications → PMH → recent results. Questions adapt to the visit classification: mental health explicitly asks for psychiatric medications and supplements, pediatric is parent-addressed throughout, emergency uses short urgent phrasing. Returning patients get "anything new?" — "no" preserves the prior record. Mid-sequence corrections route to the named step without losing other answers.
 
-One thing LangGraph makes easy to enforce is that the LLM has no control over the flow. It extracts information inside a phase but the decision of what phase comes next, when a phase is complete, and when to escalate is all deterministic code. That separation is important in a clinical context where you can't have a model deciding when enough has been collected.
+**Confirm** — natural-language paragraph summary of everything collected. Patient confirms or names what to change. Corrections route directly to the named section — identity, symptoms, or a specific history step — without resetting the rest. Session doesn't advance until confirmed.
 
-## System design concepts in this project
+**Report generation** — LLM generates a plain-text clinician note. System builds a FHIR R4 bundle (Patient, Condition, AllergyIntolerance, MedicationStatement, Observation). Both saved to the database. Slack notification sent, FHIR bundle posted to the configured webhook and pushed to the EHR server in background threads so delivery latency doesn't slow the patient-facing response. Patient memory upserted for next visit.
 
-**Circuit Breaker over Exponential Backoff**
+---
 
-I had used exponential backoff for LLM call failures before.
+## Safety and escalation
 
-In exponential backoff instead of retrying immediately it waits 1 second, then 2 then 4 then 8. The idea is to give API time to recover before sending requests again. If we have multiple clients sending request for this API, all the requests go through the full retry sequence of waiting, retrying, waiting, retrying before getting the fallback. But in case there's a Gemini outage then every request is still considered with complete retries with backoff before getting a response.
+`guard_node` runs before every node on every message. There is no code path that bypasses it.
 
-The circuit breaker solves this. It tracks consecutive Gemini failures across all requests. After 5 failures it stops sending requests entirely and returns fallback immediately for requests after that. After 60 seconds it allows one request through, if that succeeds it detects the external service is working again and allows requests as usual else it closes again.
+**Emergency detection** matches each message against a configurable phrase list loaded from the database with a 60-second TTL — clinicians can add phrases without a server restart. Matching applies negation guards ("I don't have chest pain"), historical guards ("I used to have chest pain years ago"), and reactivation detection ("it stopped and then came back"). A match routes to `handoff_node`, disables chat input, and dispatches a Slack alert.
 
-In production with multiple workers this matters more. Without a circuit breaker every worker independently retries every failing request. With one, the pattern is detected quickly and all workers stop retrying until the service recovers.
+**Crisis detection** is two-tier. Tier 1 is keyword and regex — runs always, zero cost. Tier 2 is a lightweight LLM scorer that runs only when Tier 1 finds soft distress signals but no definitive keyword ("no point", "hopeless", "burden to everyone"). Confirmed crisis routes to `handoff_node` with the 988 Lifeline message but chat input stays enabled — the patient can keep typing. Once a crisis or emergency flag is set on a session it cannot be cleared.
 
-This project runs as a single-process SQLite app, so the circuit breaker doesn't have multiple workers to protect. I built it this way because the pattern is the same regardless of scale, and if this moved to system with 4 workers behind a load balancer, it would work without changes. 
+| Kind | Trigger | Session state | Slack alert |
+|---|---|---|---|
+| `emergency` | Emergency phrase detected | Ends, input disabled | Yes |
+| `crisis` | Suicidal/self-harm language | Continues, input enabled | No |
+| `identity_review` | Returning patient details mismatch | Continues | No |
+| `human_review` | SafetyChecker score above threshold | Report flagged, not blocked | No |
 
-**Retry with Full Jitter**
+**SafetyChecker preflight** runs before report generation. Hard blocks prevent the note from being written at all: missing chief complaint, missing patient name, incomplete clinical history. Review signals raise the score without blocking alone: active emergency flag, crisis detected, identity unverified, low extraction quality. Reports above the review threshold include `X-Pending-Review: true` on the FHIR endpoint so a consuming EHR knows it needs clinician sign-off before acting on the data.
 
-For transient errors (429, timeout, 503) the system retries with jitter. It waits for a random amount of time between 0 and the cap before retrying.
+**Output guardrails** run after every LLM reply. Six regex patterns catch diagnosis language ("you have X", "consistent with", "diagnos\*"). Any match replaces the entire reply with a safe response and logs the event — the model cannot route around this.
 
-Without jitter, if 10 patients hit a rate limit at the same moment, all 10 retry at the same moment causing a second rate limit. Randomness spreads them out so they stop hitting the API simultaneously.
+**validate_node** is a silent routing gate between phase transitions. It checks required fields are actually populated before the session advances. Either it passes and routes forward, or routes back to the source phase with a targeted gap message. Never shown to the patient.
 
-**Per-Request LLM Timeout**
+---
 
-The circuit breaker handles failures, but a slow response is not a failure. If Gemini takes 45 seconds to respond, the circuit breaker sees nothing wrong. The patient is just staring at a spinner.
+## Patient experience
 
-Each LLM call has a 15-second timeout enforced via a thread pool. If Gemini doesn't respond in time, it's treated as a transient error and the retry/fallback logic kicks in. The patient gets a fallback response instead of waiting indefinitely.
+**Corrections anywhere** — a patient can change any previously given answer at any phase, including from the confirm screen. Corrections route directly to the named step without resetting anything else. If the patient says "go back" without specifying what, the system shows a short menu.
 
-The google-genai SDK doesn't reliably respect HTTP-level timeouts (it overrides the httpx client timeout internally), so the timeout is enforced externally using `concurrent.futures.ThreadPoolExecutor` with `future.result(timeout=15)`.
+**Returning patients** — the prior summary (allergies, conditions, medications, last five complaints, crisis flags) is injected into the identity review prompt. Returning patients get a warm acknowledgment, not a raw comparison table. Clinical history questions are phrased as "anything new?" — "no" preserves the prior record. Crisis flags never drop between visits.
 
-**Graceful Degradation**
+**Voice** — the mic button sends audio to `POST /transcribe` (Groq Whisper), which returns a transcript. A hallucination filter rejects empty transcripts or ones matching known Whisper hallucination phrases ("Thanks for watching"). The browser then posts the transcript to `POST /chat` — voice goes through the exact same pipeline as typed input. On identity and clinical history turns a confirm strip appears so the patient can review before submitting, since Whisper commonly mistranscribes phone numbers and medication names.
 
-Three layers inside run_json_step:
+**Quick replies** at binary-gate phases (consent, identity review, confirm) — the API response includes labelled buttons. Selections bypass intent classification and go directly to the graph.
 
-If Gemini responded and the JSON is valid, return real data.
+**Quality retry loop** — if OPQRST completeness is below threshold, the system asks one targeted gap-fill for the specific missing field. After two retries the session advances. 
 
-If Gemini responded but the JSON failed validation, send a repair prompt back to Gemini naming the exact error and showing it its own bad output. One attempt only.
+**Dosage follow-up** — if medications are given without dosage, the system asks once with warm phrasing. If the patient says they don't know, accepted on the second attempt. No third ask.
 
-If Gemini didn't respond at all, or repair also failed, use the hardcoded fallback. This preserves whatever data was already collected in state, returns a safe generic question to the patient, and keeps is_complete = False so the phase doesn't accidentally advance.
+---
 
-If the failure happens at report generation specifically, the report still generates directly from state data without Gemini. Allergies and medications are always included and clearly marked.
+## Architecture
 
-**Dual State Persistence**
+When a message comes in it hits the FastAPI layer first. Before the graph is invoked:
+- Session token checked
+- Prompt injection filter (regex blocks "ignore previous instructions", "you are now a", etc.)
+- Circuit breaker checked — if open, returns a "try again shortly" message without touching the LLM
+- Max session turns checked
+- Per-session cost cap checked against cumulative LLM spend for the thread
 
-State is stored in two places: LangGraph checkpoints (checkpoints.db) and a session_state table (app.db). This looks redundant but solves different problems.
+If all pass, `graph.invoke()` is called. Every message enters through `guard_node` first, then routes to the current phase node based on `current_phase` in state. After each patient-facing node the graph pauses (LangGraph `interrupt_after`) and the API returns the reply. State is checkpointed to `checkpoints.db` after every node.
 
-LangGraph checkpoints are opaque blobs. They're serialized snapshots of the full graph state, and the only way to read them is to replay through LangGraph's checkpointer API. That works for resuming a conversation, but it's slow and awkward for the API layer that just needs to know "what phase is this session in?" to return it in a response.
-
-The session_state table stores a compact snapshot of the fields the API actually needs that is current_phase, identity, triage, clinical_step, etc. When `GET /resume/{thread_id}` is called, it reads one row instead of deserializing a checkpoint. During normal flow, the phase comes from the graph output in the `/chat` response; the session_state table is the fallback for resumption after a crash.
-
-LangGraph checkpoints are the source of truth for conversation continuity. The session_state table is a read-optimized projection for the API layer.
-
-**Background Report Generation**
-
-Report generation runs as a background task with a job queue (queued → running → done → failed) instead of blocking the HTTP response.
-
-The report step makes an LLM call that can take 3-8 seconds. In a synchronous flow, the patient's browser would be waiting on that response with the connection held open. With a single user that's fine. But with 10 patients finishing intake around the same time, 10 worker threads are blocked on LLM calls, and new requests start queueing.
-
-The background job approach returns immediately with a job_id, and the frontend polls `/jobs/{job_id}` until it's done. The worker thread is freed up to handle other requests. If the report generation fails, the job status shows the error instead of the patient getting a generic 500.
-
-This is also why the job table tracks status and error. If a report fails at 2 AM, a clinician can see it failed and why, instead of just having a missing report with no explanation.
-
-**Idempotency Layer**
-
-Every chat message includes a client_msg_id and a SHA256 hash of the message content. If the same client_msg_id arrives twice for the same thread, the server returns the cached response instead of processing it again.
-
-This handles a few real scenarios: the patient double-clicks send, the browser retries on a timeout, or a mobile client on flaky connection sends the same request twice. Without idempotency, a double-send during the allergy phase could process "penicillin" twice, or worse, advance the phase twice and skip medications entirely.
-
-The SHA256 hash is there to catch a different edge case: client_msg_id reuse. If a client reuses an ID with different content (bug or tampering), the server returns 409 instead of silently returning stale data.
-
-**Outbound Notifications**
-
-Two notification channels, each demonstrating a different integration pattern:
-
-Slack is for internal team alerts. Emergency escalations, crisis detections, and intake completions all post to the configured Slack channel so the care team gets immediate visibility without polling the dashboard.
-
-The FHIR webhook is a different pattern entirely. It's a cryptographically signed payload delivery. The FHIR R4 Bundle is POSTed with an HMAC-SHA256 signature in the X-Signature header. The receiving system (an EHR, a data pipeline, a compliance logger) can verify the signature to confirm the payload wasn't tampered with in transit and actually came from this system. This is how real healthcare integrations work — you can't just POST patient data to an endpoint without authentication and integrity verification.
-
-Both are fire-and-forget. A webhook failure is logged but never blocks the patient flow. If Slack is down, the patient still completes their intake.
-
-**Guardrails Architecture**
-
-Every patient message passes through multiple safety layers before and after the LLM sees it. The order matters.
+**LLM pipeline** — three levels of degradation per call so the session always continues:
 
 ```
-Patient message arrives
-    │
-    ▼
-1. Prompt injection check (extract.py, runs in /chat before graph)
-   Regex scan for "ignore previous instructions", "you are now a..."
-   Blocked messages get a neutral response, never reach the LLM
-    │
-    ▼
-2. guard_node (LangGraph, runs before EVERY business node)
-   Two-tier crisis detection on every message, every phase:
-     Tier 1 — keyword/regex: "want to die", "kill myself" → instant 988 response
-     Tier 2 — LLM classifier: soft distress ("I can't take it anymore") →
-              CrisisScore schema → if is_crisis_risk=True, confidence high/medium → escalate
-   Creates escalation, fires Slack alert, routes to END.
-   Identity is never required — "Unknown patient" alert if pre-identity.
-    │
-    ▼
-3. Emergency red flag detection (in subjective_node, before LLM)
-   Phrase matching with negation awareness ("no chest pain" ≠ "chest pain")
-   Triggers immediate handoff to 911 + clinician notification
-    │
-    ▼
-4. LLM processes the message (llm.py)
-   Gemini extracts structured data from natural language
-    │
-    ▼
-5. Diagnosis language filter (extract.py)
-   Regex scan on LLM output for "you have", "consistent with", etc.
-   If triggered, replaces LLM reply with a safe generic response
-   intake assistants cannot diagnose
-    │
-    ▼
-Safe response delivered to patient
+Level 1: Primary call → JSON extract → Pydantic schema validation
+              ↓ (validation fails)
+Level 2: Repair call — sends the exact validation error back to the model
+              ↓ (repair also fails, or primary call failed entirely)
+Level 3: Hardcoded fallback dict — session continues, failure logged
 ```
 
-Layer 1 runs before any clinical logic because injected prompts shouldn't interact with the system at all.
+The circuit breaker tracks consecutive LLM failures. After five it opens; `/chat` returns a brief message without spending a token. After 60 seconds it moves to HALF_OPEN, lets one probe through, closes on success.
 
-Layer 2 (`guard_node`) runs before every business node. This is architecturally guaranteed — it is wired at `START` in the LangGraph graph, so it is impossible to add a new business node and accidentally skip crisis detection. Previously crisis detection was called inside individual nodes; if a new node was added without adding the check, it was silently unsafe. Moving it to `guard_node` eliminates that class of bug structurally.
+Every LLM call goes through the `LLMProvider` interface. Current implementation is `GeminiProvider` (Gemini Flash). Swapping backends means implementing one class and calling `set_provider()`. The circuit breaker, retry logic, cost accounting, and logging all work against the interface, not the implementation.
 
-Crisis runs before emergency because the response is different. A crisis gets the 988 Lifeline and a compassionate message. An emergency gets "call 911." Ordering them wrong would send a suicidal patient a 911 message instead of crisis resources.
+**Storage** — two SQLite files in WAL mode:
+- `app.db` — sessions, messages, reports, escalations, patient memory, LLM usage, webhook deliveries, idempotency cache, emergency phrases, prompt experiments
+- `checkpoints.db` — LangGraph's internal graph state only. Kept separate because LangGraph's internal schema changes with library upgrades and shouldn't require coordinating with application migrations.
 
-Layer 3 (emergency) runs before the LLM because the emergency check is deterministic and faster. If someone says "I'm having a seizure", there's no reason to wait for Gemini to extract OPQRST fields before escalating.
+---
 
-Layer 5 runs after the LLM because it's guarding against the LLM's own output. The prompt tells Gemini not to diagnose, but LLMs don't always follow instructions. The regex filter is the safety net.
+## Design decisions
 
-The emergency phrases (layer 3) are stored in the database, not hardcoded. Clinicians can add or remove phrases through the admin API without a redeploy. If a new drug interaction creates a new emergency pattern, it can be added immediately.
+**Fixed state machine, not an agent** — LangGraph gives a fixed, auditable node sequence. The LLM operates inside each node and extracts structured information from what the patient said. It has no ability to decide which node runs next, skip phases, or override safety checks. Every routing decision is Python code — testable and auditable in a way that prompt-based routing is not.
 
-**Layer-2 Patient Memory**
+**Intake classification in the same call as symptom extraction** — visit type is extracted in the same LLM call as the chief complaint, not a separate call. This drives two things downstream: clinical history question phrasing per (step, classification) pair, and the OPQRST completeness threshold (0.75 for ED, 0.60 for clinic).
 
-Each completed intake writes a cross-visit summary to the `patient_summary` table. On the next visit, that summary is loaded and injected into LLM prompts so returning patients get context-aware questions rather than a clean slate.
+**Deterministic OPQRST quality scoring** — completeness is a weighted formula, no LLM involved. Each field has an assigned weight; the scorer returns a 0–1 value. Gap-fill questions are built deterministically from the first missing field in priority order. The threshold is easy to audit and the retry path has no LLM cost.
 
-The merge rules are field-specific:
-- Allergies union across visits — a known allergen can never be silently dropped.
-- Medications replace each visit — patients stop and start medications; unioning them forever would pollute the list with drugs they no longer take.
-- Chronic conditions union — hypertension diagnosed two visits ago is still relevant.
-- Recent chief complaints are capped at 5 — a rolling window that keeps the prompt injection small without losing recent visit context.
+**Two-tier detection for intent and crisis** — same pattern for both. Deterministic first pass (regex/keyword) handles obvious cases at zero cost. LLM brought in only when the first pass is inconclusive. Safety-critical logic stays in code.
 
-This sits in `memory.py` rather than `sqlite_db.py` because merge logic is domain logic. It doesn't know how the data is stored; `sqlite_db.py` doesn't know how data should be combined. Separating them lets each be tested and modified independently.
+**Cross-visit memory with field-level merge rules** — memory merges per field type rather than a whole replace: allergies and conditions union across visits (they don't go away), medications replace each visit (patients start and stop them), last five chief complaints as a rolling list, crisis flags never drop.
 
-## What I'd change for production
+**System-prompt caching** — per-schema-type cache registry in `GeminiProvider`, 55-minute client TTL, SHA-256 hash invalidation on prompt change. None of the current prompts clear Gemini's 2,048-token minimum so the code path is built but not yet active.
 
-This project is built as a single-process app with SQLite. That's appropriate for a demo and for proving the architecture works end to end. Here's what would change if this needed to handle real patient load.
+**Session resumption** — no cookies. `/start` returns a `thread_id` (UUID) and a `session_token` (random 64-char hex). The browser stores both in localStorage. Every `/chat` call sends `thread_id` in the form body and `session_token` in the Authorization header. State is never held in memory — after every node LangGraph writes the full graph state to `checkpoints.db`. On the next `/chat` call it passes the thread_id back and LangGraph picks up exactly where it left off. A server restart between two patient messages is transparent.
 
-**Database: SQLite → PostgreSQL**
+`GET /resume/{thread_id}` is for browser refreshes — reads from `app.db`, not checkpoints.db, and returns the current phase and a short context message without invoking the graph.
 
-SQLite is single-writer. With WAL mode and busy_timeout it handles moderate concurrency, but under real load writes would bottleneck. PostgreSQL handles concurrent writes natively, supports row-level locking.
+**Idempotent outbound webhooks** — SHA-256 hash of the payload as the idempotency key so the same FHIR bundle is never delivered twice. Exhausted deliveries go to a dead-letter record for manual replay.
 
-The LangGraph checkpointer would switch from SqliteSaver to PostgresSaver. The application DB queries are standard SQL and would migrate with minimal changes.
+**Permanent vs transient error classification** — the circuit breaker distinguishes permanent errors (bad API key, auth failure) from transient ones (timeout, 503). Permanent errors fast-fail immediately and open the breaker — retrying an auth failure is pointless and burns time. Transient errors retry with exponential backoff and random jitter before failing. This prevents the breaker from opening on a single network hiccup while still catching a genuinely broken provider.
 
-**Database migrations: Alembic** ✅ already implemented
+**Report node runs synchronously** — `patient.py` checks `if phase == "report"` and runs `_run_report_inline()` in the same `/chat` request rather than backgrounding it. The patient gets the complete clinician note back in the same response that triggered report generation. Backgrounding it would require either polling or a server-push mechanism.
 
-Every schema change is a versioned migration file with an `upgrade()` and `downgrade()`. The CI pipeline runs `alembic upgrade head` before starting the app. A baseline migration (`001_baseline_schema.py`) captures all tables so the `alembic_version` table tracks history from the first deployment. The previous approach — `CREATE TABLE IF NOT EXISTS` at startup with hand-written `ALTER TABLE` checks — had no version tracking, making it impossible to know whether a given deployment was at the same schema as production.
+**Skip-ahead after corrections in clinical history** — `_next_clinical_step_needed()` walks the step order forward from the corrected step and returns the first step whose state field is still `None`. It only re-asks unanswered steps. This is what prevents re-asking medications after a patient corrects allergies — the answered fields are still in state and are skipped over.
 
-**Task queue: BackgroundTasks → Celery + Redis**
+**Incoming `/chat` idempotency — key plus hash** — `/chat` takes a `client_msg_id` from the browser. On a cache hit, it also compares a SHA-256 hash of the message body. If the same `client_msg_id` arrives with a different message, it returns 409 rather than silently returning the cached response for the wrong message. A client can safely retry on network timeout; it cannot use the same key to substitute a different message.
 
-FastAPI's BackgroundTasks runs in the same process. If the process crashes, queued tasks are lost. Celery with Redis gives durable task queues, retries with backoff, dead-letter handling, and worker scaling independent of the web process.
+**Repair call only fires on parse failure, not API failure** — if the LLM API call fails entirely (timeout, error), repair is skipped and the session goes straight to the hardcoded fallback. Repair only runs when the model returned a response but the JSON failed schema validation. Trying to repair an empty or error response wastes a token and always fails.
 
-Report generation would become a Celery task. The job table already tracks status, so the frontend polling logic wouldn't change at all.
+**Guard node once-set behaviour** — when `crisis_detected` is already `true` in state, guard_node skips re-running detection and immediately returns the safety message and routes to handoff. Detection logic runs once — the first time the flag is set — and subsequent messages are a simple state read. A later message cannot clear the flag or route around it.
 
-**Circuit breaker: in-memory → Redis-backed**
+---
 
-The current circuit breaker tracks failures in a Python object. It works within a single process but if there are 4 workers, each has its own breaker with its own failure count. Worker A might have the breaker open while workers B, C, D are still hammering a dead API.
+## Operations
 
-A Redis-backed breaker shares state across all workers. After 5 total failures (not 5 per worker), every worker stops sending requests simultaneously. The recovery probe also coordinates so only one worker tests the API, not all four.
+**Health endpoints:**
+- `GET /health` — always 200, for process supervisors
+- `GET /ready` — 503 if SQLite is unreachable, the graph failed to compile, or the circuit breaker is open. Use this for load balancer readiness checks.
 
-**Horizontal scaling**
+All log events pass through `log_event()` which runs PHI redaction before writing to stdout. Names, DOBs, and phone numbers are replaced with `[REDACTED]`.
 
-With PostgreSQL and Redis in place, the web layer becomes stateless. Multiple FastAPI instances behind a load balancer, each connecting to the same database and the same Redis. Session affinity isn't needed because all state lives in the database.
+**Admin panel** (`/admin/*`, requires clinician JWT):
+- `GET /admin/analytics` — LLM cost today, average per session, primary/repair/fallback rates, cache hit rate, circuit breaker state, last 7 days
+- `GET/POST/DELETE /admin/emergency-phrases` — live phrase management; changes take effect within 60 seconds via the TTL cache, no server restart needed
+- `GET /admin/webhooks` — webhook delivery log, per-entry retry counts and HTTP status
+- `POST /admin/demo/reset` — wipe all session data and re-seed mock EHR patients
+- `GET/POST/PATCH /admin/experiments` — prompt A/B experiment management
 
-The LLM timeout and circuit breaker patterns are already designed for this. The idempotency layer already uses the database, so it works across instances without modification.
+**Clinician dashboard** (`/clinician/*`, requires clinician JWT):
+- `POST /clinician/token` — exchange the clinician password for a short-lived JWT; only endpoint that doesn't require a prior token
+- `GET /clinician/pending` — all unresolved escalations across all sessions
+- `POST /clinician/resolve` — mark resolved, attach nurse note, session returns to active
+- `GET /clinician/case/{thread_id}` — full transcript, clinician note, all escalations with reasons and safety score
+- `GET /clinician/report/{thread_id}/fhir` — FHIR R4 bundle as `application/fhir+json`; includes `X-Pending-Review: true` header if the report needs clinician sign-off before EHR ingestion
 
-**Authentication hardening**
+---
 
-Patient sessions would also need authentication once real PHI is involved. The current model (anonymous sessions with a UUID) is acceptable for intake but not for accessing or modifying existing medical records.
+## Limitations and future work
+
+**What the system cannot do:**
+- No physical examination, vital signs, diagnostic tests, or prescriptions
+- Does not provide a diagnosis — output is clinical description language only
+- SQLite is single-instance; contention begins at ~50 concurrent sessions
+- Standard Gemini API is not HIPAA BAA eligible — Vertex AI required for a covered deployment
+- Drug name normalisation (RxNorm) is stubbed — strips whitespace only
+- Single clinician password, no role separation (nurse, physician, admin)
+
+**Production path:**
+- Replace SQLite with PostgreSQL, swap `SqliteSaver` for LangGraph's `PostgresSaver`
+- Vertex AI for HIPAA eligibility
+- Wire `normalize_drug_name()` to the RxNorm API
+- Send session links via SMS or email so resumption works across devices
+- Role-based access with scoped JWT claims
+- Appointment scheduling integration so the clinician note is available before the visit
