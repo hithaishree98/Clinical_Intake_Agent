@@ -1,17 +1,8 @@
 """
-memory.py — Layer-2 patient memory merge logic.
+memory.py — Cross-visit patient memory merge logic.
 
-Separated from sqlite_db.py because merging is domain logic, not storage.
-Each field has its own merge rule:
-
-  identity           → replace (most recent wins)
-  allergies          → union, dedup case-insensitive, cap at 20
-  medications        → replace with current meds from this visit
-                       (patients stop/start meds — re-asserting the list
-                        each visit is safer than unioning forever)
-  conditions         → union (chronic conditions accumulate)
-  recent_complaints  → append (CC, date), keep last 5
-  flags              → union, no cap (crisis history is important)
+identity → replace; allergies/conditions → union; medications → replace;
+recent_complaints → rolling last 5; flags → union, never dropped.
 """
 from __future__ import annotations
 
@@ -36,34 +27,22 @@ def _dedup_lower(items: list[str]) -> list[str]:
 
 
 def merge_summary(prior: dict | None, visit: dict) -> dict:
-    """
-    Merge a completed visit's validated state into the prior Layer-2 summary.
-
-    `visit` is expected to look like ReportInputState.model_dump():
-      { identity, chief_complaint, allergies, medications, pmh,
-        recent_results, triage, crisis_detected (optional) }
-    """
+    """Merge a completed visit's ReportInputState dump into the prior summary."""
     prior = prior or {}
     prior_visits = int(prior.get("visit_count") or 0)
 
-    # identity — replace (most recent reflects current contact info)
     identity = visit.get("identity") or prior.get("identity") or {}
 
-    # allergies — union, dedup, capped
     allergies = _dedup_lower(
         list(prior.get("allergies") or []) + list(visit.get("allergies") or [])
     )[:_MAX_ALLERGIES]
 
-    # medications — replace with this visit's current list
-    # (medications are transient; re-asserted every visit)
     medications = list(visit.get("medications") or [])
 
-    # conditions — union from PMH
     conditions = _dedup_lower(
         list(prior.get("conditions") or []) + list(visit.get("pmh") or [])
     )[:_MAX_CONDITIONS]
 
-    # recent_complaints — append with date, keep last N
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     new_cc = (visit.get("chief_complaint") or "").strip()
     prior_complaints = list(prior.get("recent_complaints") or [])
@@ -71,7 +50,6 @@ def merge_summary(prior: dict | None, visit: dict) -> dict:
         prior_complaints.append({"cc": new_cc, "date": today})
     recent_complaints = prior_complaints[-_MAX_RECENT_COMPLAINTS:]
 
-    # flags — add crisis history if relevant
     flags = list(prior.get("flags") or [])
     if visit.get("crisis_detected"):
         flags.append({"flag": "prior_crisis_escalation", "date": today})

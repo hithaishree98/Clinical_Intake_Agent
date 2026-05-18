@@ -1,19 +1,4 @@
-"""
-schemas.py — Pydantic output schemas for every LLM step.
-
-Design rules:
-  1. No bare Dict[str, str] for structured data — use typed nested models so
-     Pydantic rejects extra keys and enforces field names at parse time.
-  2. All string fields carry explicit max_length so oversized LLM output
-     triggers the run_json_step repair cycle rather than silently polluting state.
-  3. Enum fields use Literal types — invalid LLM values fail validation and
-     trigger repair before the fallback fires.
-  4. Validators remove empty-name medications and strip whitespace so garbage
-     entries can never reach the database.
-  5. ReportInputState is the canonical validated snapshot consumed by report_node
-     and fhir_builder — both generate artifacts from this model, never from raw
-     IntakeState, proving provenance from validated structured state.
-"""
+"""schemas.py — Pydantic output schemas for every LLM step."""
 from __future__ import annotations
 
 import re as _re
@@ -90,19 +75,7 @@ class MedsOut(BaseModel):
 # ---------------------------------------------------------------------------
 
 class CrisisScore(BaseModel):
-    """
-    Result of the LLM borderline-crisis classifier.
-
-    Used only when keyword/regex detection (Tier 1) did not fire but the
-    message contains soft distress signals that warrant LLM interpretation.
-    The LLM determines whether the language represents genuine suicidal or
-    self-harm ideation versus figurative speech (e.g. "kill this headache").
-
-    confidence semantics:
-      high   — LLM is certain about the verdict
-      medium — LLM is reasonably confident; borderline cases here still escalate
-      low    — LLM is uncertain; logged as soft_distress_flagged but no escalation
-    """
+    """LLM Tier-2 crisis classifier result. low confidence → log only, no escalation."""
     is_crisis_risk: bool                                                  = False
     confidence:     Literal["high", "medium", "low"]                     = "low"
     reasoning:      Annotated[str, Field(default="", max_length=300)]    = ""
@@ -113,22 +86,7 @@ class CrisisScore(BaseModel):
 # ---------------------------------------------------------------------------
 
 class IntentOut(BaseModel):
-    """
-    Result of the LLM short-message intent classifier.
-
-    Used when a message is too ambiguous for fast-path keyword matching:
-    "I think so", "not really", "hmm yeah", "I suppose".
-
-    intent semantics:
-      confirm      — patient is agreeing / saying yes in any form
-      decline      — patient is disagreeing / saying no in any form
-      provide_info — patient is giving information (name, date, symptom, etc.)
-      correction   — patient wants to go back and fix something
-      unclear      — cannot determine; caller should prompt for clarification
-
-    correcting_section is only populated when intent == "correction":
-      identity, symptoms, history, or none.
-    """
+    """LLM short-message intent classifier result."""
     intent:             Literal["confirm", "decline", "provide_info", "correction", "unclear"] = "unclear"
     correcting_section: Literal["identity", "symptoms", "history", "none"]                    = "none"
 
@@ -146,18 +104,7 @@ _DATE_FORMATS = [
 
 
 class IdentityOut(BaseModel):
-    """
-    Output schema for LLM identity extraction.
-
-    Validators normalise at the schema boundary so callers always receive:
-      name  — Title Case
-      dob   — ISO 8601 (YYYY-MM-DD) or ""
-      phone — 10 digits or ""
-      address — stripped or ""
-
-    Any value that fails normalisation is silently set to "" so identity_node
-    asks the patient again rather than storing bad data.
-    """
+    """LLM identity extraction. Validators normalise to Title Case / ISO 8601 / 10-digit phone."""
     name:    str = ""
     dob:     str = ""
     phone:   str = ""
@@ -228,20 +175,7 @@ class IdentityOut(BaseModel):
 # ---------------------------------------------------------------------------
 
 class ListExtractOut(BaseModel):
-    """
-    Structured extraction of a list of short clinical items from a patient
-    free-text turn.  Used for allergies, past medical history, and
-    recent_results — fields that previously used a naive regex split on
-    "," / ";" / "and" and corrupted multi-clause sentences like
-    "yes I'm allergic to peanuts and pollen".
-
-    The LLM prompt configures the *kind* of list (allergy / condition / lab
-    result), but the schema is shared so one call site handles all three.
-
-    items_complete = True   → caller advances to the next clinical step
-    items_complete = False  → caller stays on this step and asks the question
-                              in `reply` (already capped + safety-checked).
-    """
+    """Shared schema for allergy / PMH / results list extraction."""
     items: List[Annotated[str, Field(max_length=200)]]            = Field(default_factory=list)
     items_complete: bool                                          = True
     reply: Annotated[str, Field(default="", max_length=400)]      = ""
@@ -283,17 +217,7 @@ class IdentityFields(BaseModel):
 # ---------------------------------------------------------------------------
 
 class ReportInputState(BaseModel):
-    """
-    Validated state snapshot consumed by report_node and fhir_builder.
-
-    Both the clinician note and the FHIR bundle are generated from this model,
-    never from raw IntakeState dicts.  This ensures:
-      - All string fields are bounded (no unbounded LLM text leaks into artifacts)
-      - Medications without a name are silently dropped
-      - Empty/whitespace-only allergies, PMH, and results entries are filtered
-      - List lengths are capped to prevent flooding artifacts with noise
-      - Provenance from validated structured state is explicit and auditable
-    """
+    """Validated state snapshot consumed by report_node and fhir_builder."""
     identity:        IdentityFields                                          = Field(default_factory=IdentityFields)
     chief_complaint: Annotated[str, Field(default="", max_length=300)]      = ""
     opqrst:          OPQRSTFields                                            = Field(default_factory=OPQRSTFields)

@@ -1,23 +1,4 @@
-"""
-safety.py — Pre-report safety checks and structured escalation reason trail.
-
-Two responsibilities:
-
-  1. SafetyChecker.compute(state)
-     Scores the session against a weighted risk rubric and enforces hard-block
-     rules before report_node is allowed to generate the clinician note.
-     Returns a PreflightResult with ok=False whenever any hard block fires.
-
-  2. build_reason_trail(kind, state, ...)
-     Produces a standardised, clinician-readable payload for every
-     db.create_escalation() call.  Clinicians see *why* a case was escalated,
-     not just that it was.
-
-Why a dedicated module:
-  nodes.py decides *when* to escalate; safety.py decides *what to record*.
-  Keeping them separate means the scoring logic can be unit-tested in isolation
-  (see evals/run_evals.py  human_review_threshold category).
-"""
+"""safety.py — Pre-report safety scoring and structured escalation reason trail."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -32,10 +13,6 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 REVIEW_THRESHOLD: float = 50.0
-"""
-Sessions whose safety_score >= REVIEW_THRESHOLD are flagged for human review.
-Hard-block violations (missing required fields) always block *regardless* of score.
-"""
 
 
 # ---------------------------------------------------------------------------
@@ -60,26 +37,7 @@ class PreflightResult:
 # ---------------------------------------------------------------------------
 
 class SafetyChecker:
-    """
-    Scores a session and enforces hard-block rules before report generation.
-
-    Score weights (additive):
-      Hard blocks — fires a blocking_reason AND adds to score:
-        chief_complaint_missing        +35
-        patient_name_missing           +30
-        clinical_history_incomplete    +25   (allergies/meds/PMH not collected)
-
-      Review signals — add to score, do not block alone:
-        emergency_flag_active          +50   (score alone crosses threshold)
-        crisis_detected_in_session     +40
-        identity_unverified            +20
-        identity_mismatch_flagged      +15
-        extraction_quality_low         +20
-        extraction_retried             +10
-        ed_mode_baseline               +10
-
-    REVIEW_THRESHOLD = 50.
-    """
+    """Scores a session against a weighted risk rubric; enforces hard-block rules before report generation."""
 
     # Weight table — used both here and in eval assertions
     WEIGHTS: Dict[str, float] = {
@@ -213,21 +171,7 @@ def build_reason_trail(
     override_reasons: Optional[List[str]] = None,
     extra_data: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """
-    Build a standardised, clinician-readable escalation payload.
-
-    Returned dict is stored as escalation payload_json and surfaced in
-    GET /clinician/case/{thread_id}.  Every escalation record contains:
-
-      kind               type of escalation
-      severity           derived from kind
-      triggered_at_phase phase when escalation fired
-      reasons            list of reason strings (code: human text)
-      safety_score       session safety score at time of escalation
-      review_required    whether human review is indicated
-      context            key clinical snapshot (name, CC, triage risk, …)
-      [extra fields]     kind-specific data (red_flags, matched_phrases, …)
-    """
+    """Build a clinician-readable escalation payload for db.create_escalation()."""
     preflight = SafetyChecker.compute(state)
 
     # Build kind-specific reasons if none were explicitly supplied

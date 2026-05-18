@@ -43,16 +43,8 @@ class _CacheEntry:
 
 class GeminiProvider(LLMProvider):
     """
-    Google Gemini Flash / Flash-Lite backend with explicit system-prompt caching.
-
-    Each unique system prompt (keyed by cache_key, one per schema type) gets a
-    Gemini CachedContent object on first use.  Subsequent calls within the 55-
-    minute client TTL reference the cache name instead of re-sending the prompt
-    bytes, cutting input-token costs on every turn after the first.
-
-    Fallback: if cache creation fails for any reason (quota, network, model
-    version mismatch), generate_text falls back to sending system_instruction
-    inline — behaviour is identical, just without the cost saving.
+    Gemini Flash backend with per-schema-type system-prompt caching.
+    Falls back to inline system_instruction if cache creation fails.
     """
 
     def __init__(self) -> None:

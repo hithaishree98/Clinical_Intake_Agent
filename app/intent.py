@@ -1,27 +1,4 @@
-"""
-intent.py — Single source of truth for patient-message intent classification.
-
-Before this module existed, intent logic was scattered across:
-  - extract.py: is_yes / is_no / is_ack / is_consent_accepted / is_consent_declined
-  - nodes.py:  _HARD_YES / _HARD_NO / _classify_intent / _CORRECTION_RE / _IDENTITY_FIELDS_RE / ...
-
-That fragmentation produced two real bugs:
-  1. is_no("no problem")  matched via prefix and discarded substantive content
-  2. The same patient message could be classified differently in different
-     phases because each phase used a different helper.
-
-This module consolidates everything into one classifier returning a single
-QuickReply enum.  Callers either:
-  - Use parse_quick_reply(text) for a deterministic, free, exact-token match
-  - Use classify_intent(text, state) when LLM disambiguation is warranted
-
-UI integration:
-  Phases that ask binary questions (consent, identity_review, confirm) emit
-  quick_replies in their response so the frontend renders buttons.  Button
-  clicks send the canonical reply string ("Yes", "No", etc.) which always
-  matches parse_quick_reply at zero LLM cost.  Free-text remains supported
-  for accessibility.
-"""
+"""intent.py — Single source of truth for patient-message intent classification."""
 from __future__ import annotations
 
 import re
@@ -121,16 +98,8 @@ _RESULTS_FIELDS_RE  = re.compile(r"\b(tests?|labs?|lab\s+work|imaging|results?|s
 
 def parse_quick_reply(text: str) -> Optional[QuickReply]:
     """
-    Exact-token match against YES / NO / ACK.
-
-    Returns None if the message doesn't match exactly.  Callers should then
-    fall back to classify_intent() (LLM) for short ambiguous messages, or
-    treat the message as PROVIDE_INFO for substantive input.
-
-    Important: prefix matching ("yes I have chest pain") is NOT done here.
-    A previous version used startswith("yes ") / startswith("no ") and
-    misclassified substantive messages as binary replies, discarding the
-    actual content.  Use classify_intent() to handle ambiguous text.
+    Exact-token match against YES / NO / ACK. Returns None on no match.
+    No prefix matching — "yes I have chest pain" must reach classify_intent().
     """
     t = _norm(text)
     if not t:
@@ -149,34 +118,9 @@ def parse_quick_reply(text: str) -> Optional[QuickReply]:
 
 def is_bare_acknowledgment(text: str) -> bool:
     """
-    True when the message is a single short acknowledgment with no actual
-    information.  Used by clinical-history nodes to decide whether to
-    re-show the prompt vs. send the message to the LLM extractor.
-
-    Returns True for:
-      - exact YES_TOKENS  ("yes", "ok", "sure", "go ahead")
-      - exact ACK_TOKENS  ("thanks", "got it", "sounds good")
-    Both signal "the patient acknowledged but didn't answer yet".
-
-    Returns False for:
-      - NO_TOKENS ("no") — in clinical history this means "no allergies /
-        no PMH / no recent tests" and must reach the LLM extractor which
-        produces an empty list, not a re-prompt.
-      - Anything substantive ("ok I have penicillin", "yes I'm allergic
-        to peanuts") — these carry real content and must go to the LLM
-        extractor.  A previous "is_ack" with startswith matching
-        misclassified those as bare acks and re-prompted, discarding the
-        patient's answer.
-
-    Trade-off (multi-word acks):
-      Pure exact match means "ok thanks" / "ok sure" / "yeah ok thanks"
-      do NOT short-circuit and instead get sent to the LLM extractor,
-      costing one extra LLM call for a non-answer.  This is intentional:
-      the alternative (prefix matching) caused real data loss on inputs
-      like "ok I have penicillin allergy".  The LLM call is small
-      (max_tokens=300) and the prompt's Example D handles the case
-      gracefully (returns items_complete=False, asks the question
-      again), so the UX is unchanged at modest extra cost.
+    True when the message is a short acknowledgment with no actual information.
+    Returns False for NO_TOKENS ("no" means "no allergies" and must reach the extractor).
+    Exact-match only — prefix matching ("ok I have penicillin") caused data loss.
     """
     return parse_quick_reply(text) in (QuickReply.YES, QuickReply.ACK)
 
@@ -207,23 +151,10 @@ _INTENT_MAX_WORDS_FOR_LLM = 8
 
 def classify_intent(user: str, thread_id: str = "") -> IntentOut:
     """
-    Two-tier classifier:
-      Tier 1 (free): parse_quick_reply for exact tokens; fast-path long
-                     messages to PROVIDE_INFO.
-      Tier 2 (LLM):  short ambiguous messages ("I think so", "not really",
-                     "hmm yeah") go through an LLM with the IntentOut schema.
-
-    Returns an IntentOut model so callers can dispatch on .intent and
-    .correcting_section.
-
-    thread_id is used only for token-usage accounting (so per-session cost
-    queries stay accurate).  Pass "" if you don't have one — accounting
-    just isn't recorded for that call.
+    Two-tier: parse_quick_reply for exact tokens, LLM for short ambiguous messages.
+    thread_id is for token-usage accounting only.
     """
-    # Imports inside the function to avoid a circular import at module load:
-    # nodes.py imports intent.py, and intent's LLM path imports run_json_step
-    # which transitively touches schemas/prompts that some node modules also
-    # use during graph construction.
+    # Lazy imports avoid a circular import: nodes → intent → run_json_step → schemas.
     from . import sqlite_db as db
     from .llm import run_json_step
     from .prompts import intent_classify_system
@@ -257,11 +188,6 @@ def classify_intent(user: str, thread_id: str = "") -> IntentOut:
         cache_key="intent_classify",
     )
 
-    # Token-usage accounting matches the convention in nodes._track_llm_failure:
-    # record any non-zero usage, even when thread_id is empty.  Empty-thread
-    # rows are filtered out at the analytics layer (cost queries are filtered
-    # by thread_id).  Doing it here would make this call site silently differ
-    # from every other LLM call site.
     inp    = meta.get("input_tokens") or 0
     out    = meta.get("output_tokens") or 0
     cached = meta.get("cached_input_tokens") or 0
@@ -274,7 +200,3 @@ def classify_intent(user: str, thread_id: str = "") -> IntentOut:
     return obj
 
 
-# Note: parse_quick_reply / classify_intent are the only intent helpers in
-# this codebase.  Earlier versions kept loose-prefix is_yes / is_no / is_ack
-# in extract.py for backwards compatibility, but those have been removed —
-# every call site goes through this module.

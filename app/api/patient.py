@@ -25,9 +25,7 @@ def _issue_session_token() -> str:
     return secrets.token_hex(32)
 
 
-# Keys excluded from the persisted state snapshot.
-# "messages" is stored separately in the messages table; omitting it keeps
-# the snapshot compact and prevents double-storage of conversation history.r
+# "messages" stored separately in messages table; exclude to prevent double-storage.
 _SNAPSHOT_EXCLUDE: frozenset[str] = frozenset({"messages"})
 
 
@@ -37,31 +35,7 @@ def _compact_snapshot(output: dict) -> dict:
 
 
 def _quick_replies_for_state(output: dict) -> list[dict]:
-    """
-    Return the quick-reply button list appropriate for the current state.
-
-    Why surface buttons:
-      The binary-gate phases (consent, identity_review, confirm) are the
-      single biggest source of avoidable LLM intent-classification calls.
-      A patient who clicks a button doesn't need an LLM to disambiguate
-      "I think so" — they just chose YES or NO.  Free-text typing still
-      works because we always include the input box.
-
-    Where buttons are shown:
-      - consent             — the AI-disclosure agreement gate
-      - identity_review     — confirming or correcting captured identity
-      - confirm             — pre-report summary acknowledgement
-      - validate→confirm    — the confirm summary appears here too because
-                              clinical_history_node returns with phase=validate
-                              while emitting the summary; the next user reply
-                              re-enters the graph at validate_node which
-                              forwards to confirm_node.
-
-    Where buttons are NOT shown:
-      - identity / subjective / clinical_history extraction turns — these
-        are fundamentally free-text (name, dob, symptoms, drug names) and
-        the LLM is doing real value-add extraction.
-    """
+    """Return quick-reply buttons for binary-gate phases (consent, identity_review, confirm)."""
     phase = output.get("current_phase")
     target = output.get("validation_target_phase")
 

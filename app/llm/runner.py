@@ -1,28 +1,7 @@
 """
-runner.py — The provider-agnostic completion runner.
+runner.py — Provider-agnostic completion runner.
 
-This is what business code calls when it wants a structured LLM response.
-It does NOT depend on any specific provider; it routes through the registry.
-
-Responsibilities (in call order):
-  1. Circuit-breaker check          — short-circuit when backend is degraded
-  2. Token-budget check             — log if the prompt is unusually large
-  3. Retry with exponential full-jitter backoff
-  4. Truncate oversize responses    — bounded by base.MAX_RESPONSE_CHARS
-  5. JSON extract                   — strip markdown fences, find first JSON
-  6. Pydantic schema validation
-  7. One repair attempt on validation failure (cheap; usually succeeds)
-  8. Hardcoded fallback             — guarantees the session continues
-  9. Cost accounting                — full + cached token rates per provider
- 10. Structured meta dict           — for logging and analytics
-
-Why this design:
-  - The runner is the only place that knows about retries, repair, fallback,
-    and cost.  Provider implementations are pure SDK adapters.
-  - Replacing the provider only requires implementing LLMProvider — the
-    runner needs no changes.
-  - A failed validation is more common (and cheaper to fix) than a network
-    failure, so the repair loop is in the runner, not in the provider.
+Circuit-breaker → retry → JSON extract → schema validation → repair → hardcoded fallback.
 """
 from __future__ import annotations
 
@@ -39,15 +18,7 @@ from .base import LLMProvider, LLMResult, MAX_RESPONSE_CHARS, is_transient_error
 from .registry import get_provider, _get_breaker
 
 
-# ---------------------------------------------------------------------------
-# Token-budget guard (R5)
-# ---------------------------------------------------------------------------
-# Rough estimator — 1 token ≈ 4 chars for English-ish text.  Used only for
-# logging warnings, not enforcement, since true token counts are
-# tokenizer-specific.  Real enforcement happens via provider max_tokens
-# and provider-side billing.
-
-_TOKEN_BUDGET_WARN_INPUT = 8_000   # log a warning above this estimated input size
+_TOKEN_BUDGET_WARN_INPUT = 8_000   # estimated token threshold for oversized-prompt warnings
 
 def _estimate_tokens(text: str) -> int:
     return max(1, len(text or "") // 4)
@@ -125,11 +96,6 @@ def _retry_provider_call(
     op: str,
     max_retries: Optional[int] = None,
 ) -> LLMResult:
-    """
-    Wrap a single provider.generate_text call with:
-      - circuit-breaker gate
-      - exponential full-jitter retry on transient errors only
-    """
     if not _get_breaker().allow_request():
         log_event("circuit_breaker_rejected", level="warning", op=op)
         return LLMResult(False, "", "circuit_breaker_open")
@@ -228,22 +194,8 @@ def run_json_step(
     provider: Optional[LLMProvider] = None,
 ) -> Tuple[BaseModel, dict]:
     """
-    Three-level degradation:
-      Level 1: primary call → JSON extract → schema validation
-      Level 2: repair prompt (only when LLM responded but content was bad)
-      Level 3: hardcoded fallback dict (session always continues)
-
-    Returns (parsed_or_fallback_model, meta_dict).
-
-    meta_dict keys (used for logging and analytics):
-      llm_ok, llm_error, latency_ms, parse_ok, parse_error,
-      repair_used, fallback_used, raw_preview, cleaned_preview,
-      input_tokens, output_tokens, cached_input_tokens,
-      cost_usd, model
-
-    cache_key flows to the provider for any prefix-cache it may support.
-    Defaults to the schema class name when not supplied — repeated calls
-    against the same schema share cache entries naturally.
+    Three-level degradation: primary call → repair → hardcoded fallback.
+    Returns (model_instance, meta_dict) with token counts and cost.
     """
     provider = provider or get_provider()
     cache_key = cache_key or schema.__name__

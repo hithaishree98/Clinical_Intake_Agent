@@ -3,13 +3,6 @@ import threading
 import time
 from typing import Dict, List
 
-# Note: is_yes / is_no / is_ack and the YES / NO / ACKS token sets used to
-# live here.  They were superseded by app.intent (parse_quick_reply,
-# is_bare_acknowledgment) which provides exact-token matching without the
-# prefix-based footgun that misclassified "yes I have chest pain" and
-# "ok I have penicillin allergy" as bare acknowledgments and discarded
-# the substantive content.  Use app.intent for any new intent checks.
-
 # Default phrases used when the DB table is empty or hasn't been seeded yet.
 DEFAULT_EMERGENCY_PHRASES = [
     "chest pain",
@@ -25,10 +18,7 @@ DEFAULT_EMERGENCY_PHRASES = [
 ]
 
 
-# Common contractions expanded before tokenisation so the negation token set
-# (no/not/denies/...) sees "not" inside "haven't", "doesn't", etc.  Without
-# this expansion "haven't had chest pain in years" slipped past the negation
-# guard and fired a false-positive emergency escalation.
+# Expand contractions so "haven't" etc. expose "not" for negation matching.
 _CONTRACTIONS_RE = re.compile(
     r"\b(haven|hadn|doesn|don|didn|isn|wasn|aren|weren|won|wouldn|couldn|shouldn|can)['’]?t\b",
     re.IGNORECASE,
@@ -90,18 +80,9 @@ def detect_emergency_red_flags(chief_complaint: str, opqrst: Dict[str, str], fre
 
     NEGATIONS = {"no", "not", "denies", "deny", "without", "never"}
     HISTORICAL = {"history of", "previously", "years ago", "year ago", "months ago", "month ago", "last year", "in the past"}
-    # Resolution markers: when one of these appears AFTER the matched phrase,
-    # the patient is describing a symptom that has already gone away.  Without
-    # this guard "chest pain has stopped", "chest pain resolved an hour ago",
-    # "chest pain is gone now" all triggered an emergency escalation because
-    # the existing negation check only inspects the LEFT window of the phrase.
+    # RESOLVED: phrase in right window → past episode, skip. REACTIVATION cancels RESOLVED.
     RESOLVED = {"resolved", "stopped", "gone", "ended", "passed",
                 "subsided", "subsiding", "resolving"}
-    # Reactivation markers cancel a RESOLVED hit: "chest pain stopped but it's
-    # back now" should still fire the emergency.  False negatives here are far
-    # worse than false positives — a patient with active chest pain who got
-    # missed is a patient-safety incident.  When in doubt we let the flag fire
-    # and the clinician triages.
     REACTIVATION = {"but", "again", "back", "returned", "recurred", "recurring"}
 
     toks = blob.split()
@@ -125,11 +106,6 @@ def detect_emergency_red_flags(chief_complaint: str, opqrst: Dict[str, str], fre
                 if any(h in neighborhood for h in HISTORICAL):
                     return False
 
-                # Symptom-resolution language in the right window: the patient
-                # is describing a past episode, not a current emergency — UNLESS
-                # the same window also contains reactivation language ("but it's
-                # back", "started again"), in which case the symptom is current
-                # and we let the flag fire.
                 if any(w in right for w in RESOLVED) and not any(w in right for w in REACTIVATION):
                     return False
 
@@ -146,11 +122,7 @@ def detect_emergency_red_flags(chief_complaint: str, opqrst: Dict[str, str], fre
 
 
 def normalize_drug_name(name: str) -> str:
-    """Return the patient-supplied drug name unchanged.
-
-    RxNorm canonicalisation is planned for production (swap in RxCUI lookup
-    when a real customer requires EHR drug-interaction matching).
-    """
+    """Return the patient-supplied drug name unchanged (RxNorm lookup not yet wired)."""
     return (name or "").strip()
 
 
@@ -263,15 +235,7 @@ CRISIS_RESOURCE = (
 
 
 def detect_crisis(text: str) -> List[str]:
-    """
-    Tier-1 crisis detection: exact phrase + regex matching.
-
-    Returns list of matched phrases (empty = no match).
-    Fast, zero-latency, high-precision for explicit self-harm language.
-
-    For borderline cases (hopelessness, passive ideation, burden language)
-    use llm_crisis_score() after checking has_soft_distress().
-    """
+    """Tier-1: exact phrase + regex match. Returns matched phrases (empty = none)."""
     t = (text or "").lower()
     matched: List[str] = [p for p in _CRISIS_PHRASES if p in t]
 
@@ -284,20 +248,10 @@ def detect_crisis(text: str) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# Tier-2: LLM-in-the-loop crisis scoring for borderline cases
-#
-# Architecture:
-#   Tier 1  detect_crisis()       — keyword/regex, explicit phrases, ~0 ms
-#   Tier 2  llm_crisis_score()    — LLM classifier, borderline ideation, ~500 ms
-#
-# The soft-distress gate (has_soft_distress) prevents unnecessary LLM calls
-# for ordinary clinical messages.  The LLM handles what keywords cannot:
-#   false negatives  "I wonder if there's any point"  (no keyword match)
-#   false positives  "kill this headache"              (keyword but figurative)
+# Tier-2: LLM crisis scoring for borderline cases (soft distress signals)
 # ---------------------------------------------------------------------------
 
-# Soft distress signals: present → run LLM classifier; absent → skip LLM call.
-# These are necessary but not sufficient for crisis — the LLM decides.
+# Present → run LLM classifier; absent → skip LLM call.
 _SOFT_DISTRESS_SIGNALS: List[str] = [
     "no point",         "what's the point",  "whats the point",
     "can't see the point", "dont see the point", "don't see the point",
@@ -320,32 +274,15 @@ _SOFT_DISTRESS_SIGNALS: List[str] = [
 
 
 def has_soft_distress(text: str) -> bool:
-    """
-    Fast heuristic gate: returns True if the message contains any soft
-    distress signal that warrants LLM crisis scoring.
-
-    Called before llm_crisis_score() to avoid unnecessary LLM calls for
-    routine clinical messages.
-    """
+    """Gate before llm_crisis_score() — True if any soft distress signal is present."""
     t = (text or "").lower()
     return any(signal in t for signal in _SOFT_DISTRESS_SIGNALS)
 
 
 def llm_crisis_score(text: str) -> "CrisisScore":
     """
-    Tier-2 LLM crisis classifier for borderline cases.
-
-    Should only be called when:
-      - detect_crisis() returned empty (Tier 1 did not fire), AND
-      - has_soft_distress() returned True (soft signals present)
-
-    Returns a CrisisScore with:
-      is_crisis_risk=True, confidence high/medium → caller should escalate
-      is_crisis_risk=True, confidence low         → log soft_distress_flagged only
-      is_crisis_risk=False                        → no action needed
-
-    Fails safe: any LLM error returns is_crisis_risk=False, confidence=low
-    so that hard-trigger detection (Tier 1) continues to be the reliable path.
+    Tier-2 LLM classifier for borderline cases (soft distress, figurative language).
+    Fails safe: LLM errors return is_crisis_risk=False so Tier-1 stays the reliable path.
     """
     from .llm import run_json_step
     from .schemas import CrisisScore

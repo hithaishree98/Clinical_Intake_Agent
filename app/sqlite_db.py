@@ -13,28 +13,15 @@ from typing import Literal
 from .logging_utils import log_event
 from .settings import get_settings as settings
 
-# Per-thread connections.  SQLite WAL mode supports many concurrent readers
-# and one writer; the only contention point is at the SQLite layer itself,
-# bounded by busy_timeout=10s.  Routing every read through a single Python
-# mutex (the previous design) was the throughput ceiling for /jobs polling
-# plus chat traffic — unnecessary, since WAL already gives us per-row safety.
-#
-# Each thread that touches the DB lazily opens its own connection.  We keep
-# a registry so tests and shutdown paths can close every open connection
-# (otherwise sqlite3 leaves -wal/-shm files behind on Windows).
+# Per-thread connections. Registry kept so shutdown/tests can close all connections
+# (sqlite3 leaves -wal/-shm files behind on Windows if connections aren't closed).
 _local = threading.local()
 _open_connections: list[sqlite3.Connection] = []
 _open_connections_lock = threading.Lock()
 
 
 def conn() -> sqlite3.Connection:
-    """
-    Return this thread's SQLite connection, opening it on first call.
-
-    Caller is responsible for committing writes (or using transaction()).
-    Connections are closed by close_all_connections() at process shutdown
-    or test teardown.
-    """
+    """Return this thread's SQLite connection, opening lazily on first call."""
     c = getattr(_local, "conn", None)
     if c is not None:
         return c
@@ -51,13 +38,7 @@ def conn() -> sqlite3.Connection:
 
 
 def close_all_connections() -> None:
-    """
-    Close every per-thread SQLite connection opened so far.
-
-    Used by lifespan shutdown and the tmp_db test fixture.  After this call
-    the next conn() invocation in any thread will open a fresh connection
-    pointing at the (possibly newly-configured) app_db_path.
-    """
+    """Close all per-thread connections. Called at shutdown and in test teardown."""
     with _open_connections_lock:
         for c in _open_connections:
             try:
@@ -81,14 +62,7 @@ def transaction():
 
 
 def _retry_db_operation(func, max_retries: int = 3):
-    """
-    Retry a DB operation on SQLITE_BUSY.
-
-    With per-thread connections plus busy_timeout=10s, contention is rare —
-    SQLite waits internally before raising.  This wrapper catches the
-    residual cases (e.g. a long-running write transaction holding the file
-    lock past the timeout) so callers don't see transient errors.
-    """
+    """Retry on SQLITE_BUSY — catches residual lock contention past busy_timeout."""
     for attempt in range(max_retries):
         try:
             return func()
@@ -103,13 +77,7 @@ _init_lock = threading.Lock()
 
 
 def init_schema() -> None:
-    """
-    Create all tables and indexes on first run.
-
-    Direct DDL — no Alembic dependency.  Safe to call on every startup:
-    every statement uses CREATE TABLE/INDEX IF NOT EXISTS.
-    Guarded by _init_lock so concurrent calls don't contend.
-    """
+    """Create all tables/indexes on first run. Safe to call on every startup."""
     def _create():
         with _init_lock:
             c = conn()

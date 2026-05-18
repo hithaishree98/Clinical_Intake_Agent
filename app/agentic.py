@@ -1,14 +1,4 @@
-"""
-agentic.py — Agent-level decision helpers.
-
-  1. Intake classification   — embedded in SubjectiveOut (single extraction call)
-  2. Extraction quality      — score OPQRST completeness and build gap-fill questions
-  3. Validation messaging    — targeted messages when validate_node blocks a transition
-  4. Clinical question tuning — adapt questions by intake classification
-
-Follow-up question selection is handled by the extraction LLM's own `reply` field,
-which is already prompted to ask exactly one relevant question when is_complete=False.
-"""
+"""agentic.py — OPQRST quality scoring, gap-fill questions, and clinical question tuning."""
 from __future__ import annotations
 
 from typing import Dict, List

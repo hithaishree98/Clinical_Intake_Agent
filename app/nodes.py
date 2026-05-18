@@ -78,9 +78,6 @@ RESPONSE_RULES = (
 # ---------------------------------------------------------------------------
 
 def last_user(state: IntakeState) -> str:
-    # Scan within the window only — the most recent user message is always
-    # inside the last `messages_window_size` turns, so there is no need to
-    # walk the full (potentially unbounded) history list.
     msgs = _window_messages(state)
     for m in reversed(msgs):
         if m["role"] == "user":
@@ -89,18 +86,7 @@ def last_user(state: IntakeState) -> str:
 
 
 def _window_messages(state: IntakeState) -> list:
-    """
-    Return the last N messages from state, where N = settings.intake.messages_window_size.
-
-    Rationale: the messages list grows with every turn via LangGraph's operator.add
-    reducer.  On a 50-turn intake that is 50 dicts passed verbatim into every LLM
-    prompt.  Capping to the recent window keeps token usage predictable (O(1)
-    instead of O(n)) without losing any data — the full history is always persisted
-    in the messages DB table and the checkpointer.
-
-    Only the windowed slice is sent to the LLM; older turns are never discarded
-    from state itself.
-    """
+    """Return the last N messages for LLM prompts; full history stays in DB."""
     n = settings().intake.messages_window_size
     msgs = state.get("messages") or []
     return msgs[-n:] if len(msgs) > n else msgs
@@ -116,19 +102,6 @@ def _summary_identity(x: Dict[str, str]) -> str:
 
 
 
-# ---------------------------------------------------------------------------
-# Intent classification — see app/intent.py.
-#
-# This file used to define `_classify_intent`, `_HARD_YES`, `_HARD_NO`,
-# `_INTENT_MAX_WORDS_FOR_LLM`, and the four correction regexes.  Those have
-# moved to app/intent.py so every phase classifies patient messages through
-# one well-tested path.  Old in-file copies are gone — call classify_intent()
-# (imported above) directly with the thread_id for token-usage accounting.
-#
-# A thin local adapter is kept so existing call sites that pass `state`
-# rather than `thread_id` continue to read naturally.
-# ---------------------------------------------------------------------------
-
 def _classify_intent(user: str, state: IntakeState) -> IntentOut:
     """Adapter: route an in-node call to intent.classify_intent with thread_id."""
     return classify_intent(user, (state or {}).get("thread_id", ""))
@@ -140,41 +113,17 @@ def _classify_intent(user: str, state: IntakeState) -> IntentOut:
 
 def guard_node(state: IntakeState):
     """
-    Centralised safety and intent pre-processor.
-
-    Runs automatically BEFORE every interactive node via LangGraph routing.
-    Responsibilities:
-      1. Crisis detection (Tier 1 keyword + Tier 2 LLM) with full side effects
-         (DB escalation, Slack webhook). Crisis → routes to handoff regardless
-         of current phase. Identity is never required for a safety response.
-      2. (Future) global abuse/prompt-injection detection.
-
-    Returns a state patch. If no crisis is detected, returns {} so the router
-    can proceed to the normal business node. The node itself does not ask the
-    patient any question — it either intercepts (crisis) or is transparent.
-
-    Why this is a node and not a function called inside each business node:
-      - A dedicated node means adding a new business node tomorrow never
-        accidentally skips safety.
-      - Side effects (DB writes, webhooks) happen in exactly one place.
-      - Testable in isolation without running the full state machine.
+    Runs before every node. Detects crisis/emergency and intercepts the session.
+    Returns {} (structural no-op) when nothing fires.
     """
     user = last_user(state).strip()
-    # LangGraph 0.2.x rejects an empty {} from a node — every return must
-    # write at least one declared state field.  When the guard has nothing
-    # to do (no user message, or no crisis), we re-write `crisis_detected`
-    # to its current value: a structural no-op that satisfies the framework
-    # without altering semantics.  Pulled into a constant so both early-exit
-    # paths use the same idiom.
+    # LangGraph requires at least one state field — re-write crisis_detected to its
+    # current value as a structural no-op when the guard has nothing to do.
     _guard_noop = {"crisis_detected": bool(state.get("crisis_detected"))}
 
     if not user:
-        return _guard_noop   # nothing to check — first turn or empty message
+        return _guard_noop
 
-    # Once a crisis fired, every subsequent message would otherwise re-run
-    # detection, file another escalation row, and re-page Slack.  We've
-    # already alerted clinicians; keep replying with the safety message
-    # and let the graph route to END via route_after_guard.
     if state.get("crisis_detected"):
         return {
             "crisis_detected":         True,
@@ -313,21 +262,10 @@ def guard_node(state: IntakeState):
 
 
 def _try_correction(user: str, state: IntakeState) -> dict | None:
-    """
-    Detect patient intent to correct previously entered information from any node.
-
-    Returns a state-patch dict with the corrected phase + a helpful message,
-    or None if the message is not a correction intent.
-
-    Design: runs AFTER crisis check, BEFORE normal extraction, in every
-    interactive node. Only fires when the message contains an explicit correction
-    signal (go back, change my X, I said the wrong X) so it never accidentally
-    intercepts normal intake answers.
-    """
+    """Return a state-patch routing to the corrected phase, or None if no correction intent."""
     if not _CORRECTION_RE.search(user):
         return None
 
-    # Determine what they want to change
     if _IDENTITY_FIELDS_RE.search(user):
         return {
             "current_phase": "identity",
@@ -343,12 +281,6 @@ def _try_correction(user: str, state: IntakeState) -> dict | None:
                 "No problem — what would you like to change about your symptoms?"}],
         }
     if _HISTORY_FIELDS_RE.search(user):
-        # Route to the specific clinical step the patient named.  Previously
-        # this always reset to allergies regardless of which field they
-        # mentioned — "change my medications" cleared only allergies, so
-        # _next_clinical_step_needed found medications still in state and
-        # skipped it, leaving the old data unchanged and looping back to
-        # confirm.
         if _ALLERGY_FIELDS_RE.search(user):
             return {
                 "current_phase": "clinical_history",
