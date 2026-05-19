@@ -69,6 +69,10 @@ def _retry_db_operation(func, max_retries: int = 3):
         except sqlite3.OperationalError as e:
             msg = str(e).lower()
             if ("locked" in msg or "busy" in msg) and attempt < max_retries - 1:
+                import logging
+                logging.getLogger("intake").warning(
+                    '{"event": "db_retry", "attempt": %d, "error": "%s"}', attempt + 1, msg
+                )
                 time.sleep(0.1 * (2 ** attempt))
                 continue
             raise

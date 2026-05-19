@@ -164,7 +164,11 @@ def start_session(request: Request, mode: str = Form("clinic"), clinic_id: str =
 
     graph = request.app.state.graph
     t0 = time.time()
-    output = graph.invoke(initial_state, config)
+    try:
+        output = graph.invoke(initial_state, config)
+    except Exception as exc:
+        log_event("session_start_error", level="error", thread_id=thread_id, error=str(exc))
+        raise HTTPException(status_code=500, detail="Failed to start session. Please try again.")
     db.save_session_state(thread_id, _compact_snapshot(output))
     log_event("session_ready", thread_id=thread_id, duration_ms=int((time.time() - t0) * 1000))
 
@@ -194,8 +198,12 @@ def resume_session(request: Request, thread_id: str, authorization: str = Header
     if sess["status"] in ("done", "escalated", "expired"):
         raise HTTPException(status_code=410, detail=f"Session already {sess['status']}.")
 
-    state_row  = db.get_session_state(thread_id)
-    state_data = ((state_row or {}).get("state") or {})
+    try:
+        state_row  = db.get_session_state(thread_id)
+        state_data = ((state_row or {}).get("state") or {})
+    except Exception as exc:
+        log_event("session_resume_error", level="error", thread_id=thread_id, error=str(exc))
+        raise HTTPException(status_code=500, detail="Failed to resume session. Please try again.")
     phase      = state_data.get("current_phase", "identity")
     resume_msg = _build_resume_context(phase, state_data)
     response = {

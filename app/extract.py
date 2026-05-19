@@ -248,35 +248,8 @@ def detect_crisis(text: str) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# Tier-2: LLM crisis scoring for borderline cases (soft distress signals)
+# Tier-2: LLM crisis scoring
 # ---------------------------------------------------------------------------
-
-# Present → run LLM classifier; absent → skip LLM call.
-_SOFT_DISTRESS_SIGNALS: List[str] = [
-    "no point",         "what's the point",  "whats the point",
-    "can't see the point", "dont see the point", "don't see the point",
-    "wonder if there's any", "wonder if there is any",
-    "hopeless",         "no hope",           "feel hopeless",
-    "worthless",        "feel worthless",    "i'm worthless",
-    "burden",           "i'm a burden",      "im a burden",
-    "better off without me",                 "better off without",
-    "everyone would be better off",
-    "tired of living",  "tired of life",     "tired of everything",
-    "wish i wasn't here", "wish i was dead", "wish i wasn't alive",
-    "don't want to be here", "dont want to be here",
-    "just want it to stop",  "want it all to stop",  "want everything to stop",
-    "no reason to",     "no reason anymore",
-    "giving up",        "given up on",       "feel like giving up",
-    "no future",        "don't have a future", "cant see a future",
-    "nothing matters",  "nothing will get better", "never get better",
-    "not worth it",     "no reason to get up",
-]
-
-
-def has_soft_distress(text: str) -> bool:
-    """Gate before llm_crisis_score() — True if any soft distress signal is present."""
-    t = (text or "").lower()
-    return any(signal in t for signal in _SOFT_DISTRESS_SIGNALS)
 
 
 def llm_crisis_score(text: str) -> "CrisisScore":
@@ -298,7 +271,9 @@ def llm_crisis_score(text: str) -> "CrisisScore":
             max_tokens=80,   # CrisisScore is 3 tiny fields — 80 tokens is ample and bounds latency
         )
         return obj
-    except Exception:
+    except Exception as exc:
+        from .logging_utils import log_event
+        log_event("crisis_llm_failure", level="warning", error=str(exc))
         # Never let a Tier-2 failure silence Tier-1 or crash the node.
         return CrisisScore(is_crisis_risk=False, confidence="low", reasoning="llm_error")
 

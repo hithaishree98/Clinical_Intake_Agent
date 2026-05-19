@@ -2,7 +2,6 @@
 
 A conversational intake agent for clinical settings. The patient types or speaks, the system collects their identity, symptoms, allergies, medications, and history through natural conversation, triages urgency in real time, and outputs a clinician note + FHIR R4 bundle.
 
-
 ## Problem
 
 Clinical intake today is a paper form or a dropdown tablet. Neither produces structured output an EHR can actually ingest, and neither can detect mid-conversation that a patient is describing a cardiac event.
@@ -32,6 +31,7 @@ Slack alerts · HMAC-signed FHIR webhook
 ```
 
 ## Flow
+
 ```
 Patient opens the app and clicks New Session
          ↓
@@ -93,6 +93,11 @@ Clinician opens the portal
   Go to /dashboard and enter the clinician password in the auth bar at the top, then click Auth to load case notes
   Click View Escalations to see all flagged cases
   Click an escalation to populate the resolve form, add a nurse note, and click Resolve
+
+  ![alt text](image.png)
+  c:\Users\hitha\Downloads\localhost_8000_dashboard.png
+  c:\Users\hitha\Downloads\localhost_8000_admin.png
+
 ```
 
 ## Key Features
@@ -121,20 +126,19 @@ Full node descriptions, design decisions, and pipeline: [SystemDesign.md](System
 
 Manual test scenarios, test coverage, and eval categories: [TestingAndEvals.md](TestingAndEvals.md)
 
-
 ## Quick start
 
 Requires Docker and Docker Compose.
 
 Copy `.env.example` → `.env` and fill in:
 
-| Variable | Required | Notes |
-|---|---|---|
-| `GEMINI_API_KEY` | Yes | |
-| `JWT_SECRET` | Yes | any strong random string |
-| `CLINICIAN_PASSWORD` | Yes | for dashboard auth |
-| `SLACK_WEBHOOK_URL` | No | Slack alerts on escalations |
-| `GROQ_API_KEY` | Voice only | Whisper transcription |
+| Variable             | Required   | Notes                       |
+| -------------------- | ---------- | --------------------------- |
+| `GEMINI_API_KEY`     | Yes        |                             |
+| `JWT_SECRET`         | Yes        | any strong random string    |
+| `CLINICIAN_PASSWORD` | Yes        | for dashboard auth          |
+| `SLACK_WEBHOOK_URL`  | No         | Slack alerts on escalations |
+| `GROQ_API_KEY`       | Voice only | Whisper transcription       |
 
 ```sh
 docker compose up --build
@@ -144,7 +148,6 @@ docker compose up --build
 - HAPI FHIR server: http://localhost:8080 (takes ~90s on first boot)
 - Clinician dashboard: `/dashboard` → enter clinician password → click Auth
 - Admin panel: linked from dashboard
-
 
 ## Tech stack
 

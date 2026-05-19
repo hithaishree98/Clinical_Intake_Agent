@@ -9,7 +9,7 @@
 ### 1. Happy path
 
 1. Click **New Session** → "Yes, I consent"
-2. Type: `Jane Doe, March 15 1985, 412-555-0199, 123 Main St Pittsburgh PA`
+2. Type: `Janet Doe, March 15 1985, 412-555-0199, 123 Main St Pittsburgh PA`
 3. The system reads back the extracted details → type "yes" to confirm
 4. Type: `I have a throbbing headache, 7 out of 10, worse when I bend over, started this morning`
 5. Answer each clinical history question (allergies, medications, PMH, recent results) — type "none" for anything that doesn't apply
@@ -18,6 +18,8 @@
 Expected flow: after confirm the system says it's generating the clinician note. The full note appears in the chat — it should contain the name, symptoms, and history you entered. The status shows as complete.
 
 What to check in the note: name is correct, headache severity and onset are there, allergies/medications match what you said. If a field you gave is missing from the note, extraction failed.
+
+![alt text](image.png)
 
 ---
 
@@ -32,6 +34,8 @@ Log in to `/dashboard` with the clinician password → click View Escalations. T
 
 What to check: the escalation fired during the subjective phase, after identity was already collected. This confirms the safety check runs on every message, not just at session start.
 
+![alt text](image-1.png)
+![alt text](image-4.png)
 ---
 
 ### 3. Crisis detection
@@ -43,6 +47,8 @@ Expected: the 988 Lifeline message appears. Unlike the emergency scenario, the *
 
 The distinction to verify: emergency disables input and ends the session. Crisis does not — the patient stays in the same phase and can continue.
 
+![alt text](image-2.png)
+![alt text](image-3.png)
 ---
 
 ### 4. Correction from the confirm screen
@@ -56,6 +62,10 @@ The thing to watch for: if medications gets asked again after you re-enter aller
 
 Also try: `"I want to edit my allergies"`, `"actually I do have an allergy"`, `"can we go back to allergies"` — each should produce the same routing.
 
+![alt text](image-5.png)
+![alt text](image-6.png)
+![alt text](image-7.png)
+![alt text](image-8.png)
 ---
 
 ### 5. Server restart mid-intake

@@ -25,9 +25,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
-from starlette.responses import Response as StarletteResponse
 
 from . import sqlite_db as db
 from .api.deps import limiter, RateLimitExceeded, _rate_limit_exceeded_handler
@@ -49,21 +47,23 @@ STATIC_DIR = BASE_DIR / "static"
 # Request correlation middleware
 # ---------------------------------------------------------------------------
 
-class CorrelationMiddleware(BaseHTTPMiddleware):
+class CorrelationMiddleware:
     """
     Propagate (or generate) X-Request-Id on every request.
 
-    • If the client sends X-Request-Id or X-Correlation-Id, that value is reused
-      so client logs and server logs share a common ID.
-    • If no ID is supplied, a new UUID is generated.
-    • The ID is stored in a ContextVar so log_event() picks it up automatically
-      without any manual threading — structured logs always contain the ID.
-    • The ID is echoed back on the response so clients can match server log lines
-      to specific requests.
-    • Request start and end are logged with method, path, status, and duration_ms
-      so slow or failing endpoints are immediately visible in the log stream.
+    Pure ASGI middleware — avoids BaseHTTPMiddleware's child-task isolation so
+    ContextVars set inside endpoint handlers (e.g. set_trace_id) are visible
+    here when the http_response line is logged.
     """
-    async def dispatch(self, request: StarletteRequest, call_next):
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
+
+        request = StarletteRequest(scope, receive)
         req_id = (
             request.headers.get("X-Request-Id")
             or request.headers.get("X-Correlation-Id")
@@ -74,18 +74,27 @@ class CorrelationMiddleware(BaseHTTPMiddleware):
         t0 = time.perf_counter()
         log_event("http_request", method=request.method, path=request.url.path)
 
-        response: StarletteResponse = await call_next(request)
+        status_code = 500
+
+        async def send_with_header(message):
+            nonlocal status_code
+            if message["type"] == "http.response.start":
+                status_code = message["status"]
+                headers = list(message.get("headers", []))
+                headers.append((b"x-request-id", req_id.encode()))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_with_header)
 
         duration_ms = int((time.perf_counter() - t0) * 1000)
-        response.headers["X-Request-Id"] = req_id
         log_event(
             "http_response",
             method=request.method,
             path=request.url.path,
-            status=response.status_code,
+            status=status_code,
             duration_ms=duration_ms,
         )
-        return response
 
 
 # ---------------------------------------------------------------------------

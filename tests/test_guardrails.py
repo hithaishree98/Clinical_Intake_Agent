@@ -175,41 +175,6 @@ class TestEmergencyRedFlags:
 
 
 # ---------------------------------------------------------------------------
-# Soft-distress gate (extract.py: has_soft_distress)
-# ---------------------------------------------------------------------------
-
-class TestSoftDistress:
-    def test_hopeless_detected(self):
-        from app.extract import has_soft_distress
-        assert has_soft_distress("I feel hopeless") is True
-
-    def test_worthless_detected(self):
-        from app.extract import has_soft_distress
-        assert has_soft_distress("I'm worthless") is True
-
-    def test_no_point_detected(self):
-        from app.extract import has_soft_distress
-        assert has_soft_distress("there's no point anymore") is True
-
-    def test_burden_language_detected(self):
-        from app.extract import has_soft_distress
-        assert has_soft_distress("I feel like I'm a burden") is True
-
-    def test_giving_up_detected(self):
-        from app.extract import has_soft_distress
-        assert has_soft_distress("I feel like giving up") is True
-
-    def test_routine_clinical_complaint_not_detected(self):
-        from app.extract import has_soft_distress
-        assert has_soft_distress("my back hurts really badly") is False
-        assert has_soft_distress("fever and chills for 3 days") is False
-
-    def test_empty_string_not_detected(self):
-        from app.extract import has_soft_distress
-        assert has_soft_distress("") is False
-
-
-# ---------------------------------------------------------------------------
 # Allergy and list extraction edge cases (extract.py)
 # ---------------------------------------------------------------------------
 

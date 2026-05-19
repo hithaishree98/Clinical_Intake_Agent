@@ -223,7 +223,13 @@
 </main>
 
 <script>
-  let clinicianToken = null;
+  let clinicianToken = sessionStorage.getItem('clinicianToken') || null;
+
+  function _showDashboard() {
+    document.getElementById('auth-required').style.display = 'none';
+    document.getElementById('auth-bar').style.display = 'none';
+    document.getElementById('dashboard-content').style.display = 'block';
+  }
 
   async function authenticate() {
     const pwd = document.getElementById('clinicianPwd').value;
@@ -235,12 +241,17 @@
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || 'Auth failed');
       clinicianToken = data.access_token;
-      document.getElementById('auth-required').style.display = 'none';
-      document.getElementById('auth-bar').style.display = 'none';
-      document.getElementById('dashboard-content').style.display = 'block';
+      sessionStorage.setItem('clinicianToken', clinicianToken);
+      _showDashboard();
       await refresh();
       setInterval(refresh, 30_000);
     } catch (e) { showError(e.message); }
+  }
+
+  // Restore session on page load if already authenticated
+  if (clinicianToken) {
+    _showDashboard();
+    refresh().then(() => setInterval(refresh, 30_000));
   }
 
   async function refresh() {
@@ -279,7 +290,7 @@
     try {
       const data = await fetchJSON('/clinician/pending');
       const tbody = document.getElementById('esc-body');
-      const escs = data.escalations || [];
+      const escs = Array.isArray(data) ? data : (data.escalations || []);
       if (!escs.length) {
         tbody.innerHTML = '<tr><td colspan="7" style="color:var(--muted);text-align:center">No pending escalations.</td></tr>';
         return;
@@ -375,6 +386,14 @@
 
   async function fetchJSON(url) {
     const res = await fetch(url, { headers: { Authorization: 'Bearer ' + clinicianToken } });
+    if (res.status === 401) {
+      clinicianToken = null;
+      sessionStorage.removeItem('clinicianToken');
+      document.getElementById('auth-required').style.display = 'block';
+      document.getElementById('auth-bar').style.display = 'block';
+      document.getElementById('dashboard-content').style.display = 'none';
+      throw new Error('Session expired — please re-authenticate.');
+    }
     if (!res.ok) throw new Error(`${url}: ${res.status}`);
     return res.json();
   }

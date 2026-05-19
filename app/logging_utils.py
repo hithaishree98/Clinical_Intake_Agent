@@ -9,8 +9,6 @@ logger = logging.getLogger("intake")
 
 _trace_id_ctx: ContextVar[str | None] = ContextVar("trace_id", default=None)
 _request_id_ctx: ContextVar[str | None] = ContextVar("request_id", default=None)
-_job_id_ctx: ContextVar[str | None] = ContextVar("job_id", default=None)
-_node_id_ctx: ContextVar[str | None] = ContextVar("node_id", default=None)
 
 def set_trace_id(trace_id: str) -> None:
     _trace_id_ctx.set(trace_id)
@@ -23,15 +21,6 @@ def set_request_id(request_id: str) -> None:
 
 def get_request_id() -> str | None:
     return _request_id_ctx.get()
-
-def set_job_id(job_id: str) -> None:
-    _job_id_ctx.set(job_id)
-
-def get_job_id() -> str | None:
-    return _job_id_ctx.get()
-
-def get_node_id() -> str | None:
-    return _node_id_ctx.get()
 
 
 # ---------------------------------------------------------------------------
@@ -94,15 +83,11 @@ def _base_payload(event: str, level: str, **fields) -> dict:
         "event": event,
         **{k: v for k, v in fields.items() if v is not None},
     }
-    trace_id  = get_trace_id()
+    trace_id   = get_trace_id()
     request_id = get_request_id()
-    job_id    = get_job_id()
-    node_id   = get_node_id()
 
     if trace_id   and "trace_id"   not in payload: payload["trace_id"]   = trace_id
     if request_id and "request_id" not in payload: payload["request_id"] = request_id
-    if job_id     and "job_id"     not in payload: payload["job_id"]     = job_id
-    if node_id    and "node_id"    not in payload: payload["node_id"]    = node_id
 
     return payload
 

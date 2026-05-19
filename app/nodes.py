@@ -53,7 +53,6 @@ from .extract import (
     extract_allergies_simple,
     extract_list_simple,
     detect_crisis,
-    has_soft_distress,
     llm_crisis_score,
     _is_none_response,
     CRISIS_RESOURCE,
@@ -170,38 +169,37 @@ def guard_node(state: IntakeState):
             "messages": [{"role": "assistant", "text": CRISIS_RESOURCE}],
         }
 
-    # ── Tier 2: LLM classifier for soft distress signals ─────────────────
-    if has_soft_distress(user):
-        score = llm_crisis_score(user)
-        if score.is_crisis_risk and score.confidence in ("high", "medium"):
-            log_event("crisis_detected_tier2", level="warning",
-                      thread_id=thread_id,
-                      confidence=score.confidence, reasoning=score.reasoning)
-            db.create_escalation(
-                thread_id=thread_id, kind="crisis",
-                payload=build_reason_trail(
-                    "crisis", state,
-                    extra_data={"matched_phrases": [f"llm:{score.reasoning}"],
-                                "detection_tier": "llm",
-                                "llm_confidence": score.confidence},
-                ),
-            )
-            webhook.dispatch_crisis_alert(
-                thread_id=thread_id, patient_name=patient_name,
-                matched_phrases=[f"llm_detected ({score.confidence}): {score.reasoning}"],
-                partial_identity=state.get("identity") or {},
-            )
-            return {
-                "crisis_detected":          True,
-                "human_review_required":    True,
-                "current_phase":            "handoff",
-                "validation_target_phase":  None,
-                "validation_errors":        [],
-                "messages": [{"role": "assistant", "text": CRISIS_RESOURCE}],
-            }
-        if score.is_crisis_risk and score.confidence == "low":
-            log_event("soft_distress_flagged", level="info",
-                      thread_id=thread_id, reasoning=score.reasoning)
+    # ── Tier 2: LLM classifier — runs on every message Tier 1 didn't catch ─
+    score = llm_crisis_score(user)
+    if score.is_crisis_risk and score.confidence in ("high", "medium"):
+        log_event("crisis_detected_tier2", level="warning",
+                  thread_id=thread_id,
+                  confidence=score.confidence, reasoning=score.reasoning)
+        db.create_escalation(
+            thread_id=thread_id, kind="crisis",
+            payload=build_reason_trail(
+                "crisis", state,
+                extra_data={"matched_phrases": [f"llm:{score.reasoning}"],
+                            "detection_tier": "llm",
+                            "llm_confidence": score.confidence},
+            ),
+        )
+        webhook.dispatch_crisis_alert(
+            thread_id=thread_id, patient_name=patient_name,
+            matched_phrases=[f"llm_detected ({score.confidence}): {score.reasoning}"],
+            partial_identity=state.get("identity") or {},
+        )
+        return {
+            "crisis_detected":          True,
+            "human_review_required":    True,
+            "current_phase":            "handoff",
+            "validation_target_phase":  None,
+            "validation_errors":        [],
+            "messages": [{"role": "assistant", "text": CRISIS_RESOURCE}],
+        }
+    if score.is_crisis_risk and score.confidence == "low":
+        log_event("soft_distress_flagged", level="info",
+                  thread_id=thread_id, reasoning=score.reasoning)
 
     # ── Emergency red flag detection — covers every phase ────────────────────
     # Centralised here so consent, identity, clinical_history, and confirm
@@ -261,9 +259,14 @@ def guard_node(state: IntakeState):
 # ---------------------------------------------------------------------------
 
 
-def _try_correction(user: str, state: IntakeState) -> dict | None:
-    """Return a state-patch routing to the corrected phase, or None if no correction intent."""
-    if not _CORRECTION_RE.search(user):
+def _try_correction(user: str, state: IntakeState, require_verb: bool = True) -> dict | None:
+    """Return a state-patch routing to the corrected phase, or None if no correction intent.
+
+    require_verb=False skips the correction-verb gate — use in confirm_node where the
+    system already presented a change menu, so a bare field name ("allergies") is
+    unambiguous correction intent.
+    """
+    if require_verb and not _CORRECTION_RE.search(user):
         return None
 
     if _IDENTITY_FIELDS_RE.search(user):
@@ -1616,6 +1619,19 @@ def clinical_history_node(state: IntakeState):
                 "clinical_step": "pmh",
             }
 
+        if _is_none_response(user):
+            new_state = {**state, "pmh": []}
+            next_step = _next_clinical_step_needed(new_state, starting_at="results")
+            if next_step == "done":
+                return {"pmh": [], **_clinical_history_done_patch(new_state)}
+            return {
+                "pmh": [],
+                "clinical_step": next_step,
+                "messages": [{"role": "assistant", "text":
+                    _question_for_clinical_step(next_step, cls)}],
+                "current_phase": "clinical_history",
+            }
+
         # LLM extraction.  Replaces extract_list_simple, which split sentences
         # like "had a heart attack in 2019 and gallbladder removed in 2021"
         # on the literal token "and" and stored the resulting fragments as
@@ -1810,8 +1826,9 @@ def confirm_node(state: IntakeState):
         }
 
     # Use the shared correction router — handles "change my X", "go back", etc.
-    # Also covers explicit correction intents from _classify_intent.
-    correction = _try_correction(user, state)
+    # require_verb=False: we already showed a correction menu, so a bare field name
+    # ("allergies", "medications") is unambiguous correction intent here.
+    correction = _try_correction(user, state, require_verb=False)
     if correction:
         return correction
 
@@ -2063,6 +2080,11 @@ def report_node(state: IntakeState):
     if fhir_json and settings().fhir_server_url:
         result = _fhir_push_bundle(fhir_bundle_json=fhir_json, thread_id=thread_id)
         fhir_push_ok = bool(result.get("ok"))
+        if fhir_push_ok:
+            log_event("fhir_push_success", thread_id=thread_id)
+        else:
+            log_event("fhir_push_failed", level="warning", thread_id=thread_id,
+                      error=result.get("error") or "unknown")
 
     patient_name = (identity or {}).get("name") or "unknown patient"
     webhook.dispatch_intake_complete(
