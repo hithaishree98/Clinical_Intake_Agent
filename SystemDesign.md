@@ -1,173 +1,176 @@
 # System Design
 
-The system is a conversational intake agent. The patient types or speaks, the system collects identity, symptoms, allergies, medications, and history through natural conversation, triages urgency in real time, and outputs a clinician note and FHIR R4 bundle.
+## The main idea
 
-The architectural principle: the LLM handles language understanding and extraction. A fixed LangGraph state machine controls flow, phase transitions, and safety checks. The model has no ability to skip a phase, route around a validation gate, or suppress an escalation. Those are all code.
+The LLM handles language — extracting structured data from what a patient says in natural speech. A LangGraph state machine controls everything else: which phase runs, when a phase ends, what constitutes a valid transition, and when to escalate. The model has no ability to decide what happens next. Every routing decision is Python code.
 
----
-
-## Intake flow
-
-Each session goes through these phases in order:
-
-**Consent** — shown before any data is collected. Patient must explicitly agree; declining ends the session with no data retained. Configurable — can be disabled if consent is handled at registration.
-
-**Identity** — patient provides name, DOB, phone, and address in free text. LLM extracts and normalises into a typed schema. Patient ID is derived from SHA-256(name|dob) and the record is checked for a prior visit. After three failed extraction attempts, the system directs the patient to the front desk.
-
-**Identity review** — for returning patients: stored details shown alongside what was just provided, patient chooses keep or update; a discrepancy creates a nurse-review escalation. For new patients: extracted details read back, patient confirms or corrects; correction routes back to identity.
-
-**Symptom assessment** — LLM extracts chief complaint and full OPQRST in one call. At the same time it classifies the visit: `emergency_visit`, `routine_checkup`, `specialist_referral`, `mental_health`, or `pediatric`. A deterministic quality scorer evaluates completeness (0–1 scale); below threshold it asks a targeted gap-fill for the specific missing field. After two retries the session advances regardless — the patient is never stuck.
-
-**Clinical history** — sequences through allergies → medications → PMH → recent results. Questions adapt to the visit classification: mental health explicitly asks for psychiatric medications and supplements, pediatric is parent-addressed throughout, emergency uses short urgent phrasing. Returning patients get "anything new?" — "no" preserves the prior record. Mid-sequence corrections route to the named step without losing other answers.
-
-**Confirm** — natural-language paragraph summary of everything collected. Patient confirms or names what to change. Corrections route directly to the named section — identity, symptoms, or a specific history step — without resetting the rest. Session doesn't advance until confirmed.
-
-**Report generation** — LLM generates a plain-text clinician note. System builds a FHIR R4 bundle (Patient, Condition, AllergyIntolerance, MedicationStatement, Observation). Both saved to the database. Slack notification sent, FHIR bundle posted to the configured webhook and pushed to the EHR server in background threads so delivery latency doesn't slow the patient-facing response. Patient memory upserted for next visit.
+The reason for this split: LLMs are good at understanding "I've had a throbbing headache since this morning, maybe a 7 out of 10" and turning it into structured OPQRST fields. They are bad at reliably enforcing that allergies were collected before the confirmation screen, or at detecting mid-conversation that a patient just described a stroke. Keeping those responsibilities separate means each part can be tested and audited independently.
 
 ---
 
-## Safety and escalation
+## How a message flows through the system
+
+When a patient sends a message:
+
+1. The FastAPI layer validates the session token, checks for prompt injection (`check_prompt_injection()` — four regex patterns for "ignore previous instructions", "you are now a", etc.), checks the per-session cost cap, and checks whether the LLM circuit breaker is open.
+2. If all checks pass, `graph.invoke()` is called with the current `thread_id`.
+3. LangGraph loads the full graph state from `checkpoints.db` and routes to `guard_node` first.
+4. `guard_node` runs crisis and emergency detection. If nothing fires, it routes to the current phase node based on `current_phase` in state.
+5. The phase node runs its LLM call(s), updates state, and returns.
+6. LangGraph checkpoints the updated state to `checkpoints.db` and pauses (the graph uses `interrupt_after` on every patient-facing node).
+7. The FastAPI layer reads the assistant reply from state and returns it.
+
+There is no conversation state held in memory. Every message starts from a checkpoint read and ends with a checkpoint write.
+
+---
+
+## Intake phases
+
+Sessions go through these phases in order. A session cannot skip a phase or move backward unless the patient explicitly requests a correction.
+
+### Consent
+
+Shown before any data is collected. The patient must explicitly agree — "yes", "sure", "I consent" all work. "No" or "I don't want to" ends the session immediately with no data retained. Intent classification (`_classify_intent`) handles the full range of natural-language responses; there's no keyword list here.
+
+Consent can be disabled in settings if it's handled at registration.
+
+### Identity
+
+The patient provides name, DOB, phone, and address in free text. The LLM extracts and normalises into a typed schema — it handles "March fifteenth, eighty-five" and "15/3/1985" equally. Only fields not yet in state get filled, so the patient can give all four at once or one at a time across turns.
+
+DOB validation runs after extraction: future dates and impossible ages get an immediate re-ask with a specific error. If all four fields still aren't collected after `max_identity_attempts` (default 3), the session directs the patient to the front desk.
+
+A stable `patient_id` is derived from SHA-256(name + DOB) once both fields are present. This is what links visits together for returning patients.
+
+### Identity review
+
+For returning patients: the system shows details on file and asks the patient to confirm or update. "Keep" → stored details used, session continues. "Update" → an `identity_review` escalation is created for nurse follow-up, and the session continues with the patient's version.
+
+For new patients: the system reads back what it extracted and asks the patient to confirm or correct. Correction routes back to the identity phase to re-collect.
+
+Both branches use `_classify_intent` — it handles "yes that's right", "keep it", "looks good", "no update please" without a keyword list.
+
+### Symptom assessment
+
+One LLM call extracts chief complaint and full OPQRST simultaneously and also classifies the visit: `emergency_visit`, `routine_checkup`, `specialist_referral`, `mental_health`, or `pediatric`. That classification drives question phrasing in clinical history and the completeness threshold for the quality gate.
+
+A deterministic quality scorer evaluates OPQRST completeness (0–1 scale). Threshold is 0.75 for ED mode, 0.60 for clinic. If below threshold, the system asks a targeted gap-fill for the first missing field. After two retries (`max_quality_retries = 2`) the session advances regardless — the patient is never stuck here.
+
+If the LLM flags its own extraction as low confidence (`extraction_confidence = "low"`), a deterministic gap-fill replaces the LLM's generated question for that turn. This prevents the model from asking something sensible-sounding when it clearly didn't understand what the patient said.
+
+### Clinical history
+
+Sequences through four steps: allergies → medications → past medical history → recent labs/imaging. The step order is fixed but the system skips ahead past steps already collected — so if a patient corrects their allergies from the confirm screen, it only re-asks allergies and jumps back to confirm without re-asking medications, PMH, and results.
+
+All four steps use LLM extraction to parse lists from natural speech. "Penicillin and I think latex too" becomes two separate allergy entries; "heart attack in 2019 and gallbladder out in 2021" becomes two separate PMH entries rather than one long string.
+
+For medications specifically: if a medication name is extracted but frequency is missing, the system asks a follow-up once with warm phrasing. If the patient doesn't know, it's accepted on the second attempt. No third ask.
+
+For optional steps (allergies, PMH, recent results), intent classification (`_classify_intent`) detects decline responses — "no", "nope", "I don't have any", "nothing comes to mind" — before sending the message to the LLM list extractor. A clear decline accepts empty immediately and moves on; the LLM is not called.
+
+Questions adapt to the visit classification: mental health explicitly asks about psychiatric medications and supplements; pediatric addresses the parent throughout; emergency uses shorter, more urgent phrasing.
+
+### Confirm
+
+The system shows a natural-language summary of everything collected. The patient confirms or says what to change. Corrections route directly to the named step — "I need to change my allergies" routes to the allergies step, not back to the start. `_classify_intent` handles confirm; `_try_correction` handles routing to the right step. The session doesn't advance until the patient explicitly confirms.
+
+### Report generation
+
+The LLM generates a plain-text clinician note. A FHIR R4 bundle is built from the same validated state (Patient, Condition, AllergyIntolerance, MedicationStatement, Observation resources). If the LLM report fails, a deterministic template generates the note instead — the session always completes.
+
+The note is saved to `app.db`. A Slack notification is sent. The FHIR bundle is dispatched to the configured webhook (HMAC-signed) and, if `FHIR_SERVER_URL` is set, pushed directly to the EHR server. Both the webhook and EHR push are best-effort — failure doesn't block the patient from getting a response.
+
+Patient memory is upserted: allergies and conditions union across visits, medications replace, the last five chief complaints roll forward, and crisis flags never drop.
+
+---
+
+## Safety
 
 `guard_node` runs before every node on every message. There is no code path that bypasses it.
 
-**Emergency detection** matches each message against a configurable phrase list loaded from the database with a 60-second TTL — clinicians can add phrases without a server restart. Matching applies negation guards ("I don't have chest pain"), historical guards ("I used to have chest pain years ago"), and reactivation detection ("it stopped and then came back"). A match routes to `handoff_node`, disables chat input, and dispatches a Slack alert.
+### Crisis detection
 
-**Crisis detection** is two-tier. Tier 1 is keyword and regex — runs always, zero cost. Tier 2 is a lightweight LLM scorer that runs only when Tier 1 finds soft distress signals but no definitive keyword ("no point", "hopeless", "burden to everyone"). Confirmed crisis routes to `handoff_node` with the 988 Lifeline message but chat input stays enabled — the patient can keep typing. Once a crisis or emergency flag is set on a session it cannot be cleared.
+Two-tier. Tier 1 is a phrase/regex scan — runs always, zero cost. Tier 2 is a lightweight LLM scorer that runs unconditionally on every message that Tier 1 doesn't catch. If the LLM returns `is_crisis_risk=True` with `high` or `medium` confidence, the session escalates. `low` confidence is logged as a soft distress signal but doesn't escalate.
 
-| Kind | Trigger | Session state | Slack alert |
-|---|---|---|---|
-| `emergency` | Emergency phrase detected | Ends, input disabled | Yes |
-| `crisis` | Suicidal/self-harm language | Continues, input enabled | No |
-| `identity_review` | Returning patient details mismatch | Continues | No |
-| `human_review` | SafetyChecker score above threshold | Report flagged, not blocked | No |
+The reason Tier 2 runs on every message rather than just "suspicious" ones: a soft-distress phrase list to gate the LLM was removed. A patient saying "I feel like dying, I don't know" matches no crisis phrase but the LLM classifies it correctly. A gate based on phrases would have missed it.
 
-**SafetyChecker preflight** runs before report generation. Hard blocks prevent the note from being written at all: missing chief complaint, missing patient name, incomplete clinical history. Review signals raise the score without blocking alone: active emergency flag, crisis detected, identity unverified, low extraction quality. Reports above the review threshold include `X-Pending-Review: true` on the FHIR endpoint so a consuming EHR knows it needs clinician sign-off before acting on the data.
+Once `crisis_detected` is set to `True` in state, it cannot be cleared. Subsequent messages return the safety response immediately without re-running detection.
 
-**Output guardrails** run after every LLM reply. Six regex patterns catch diagnosis language ("you have X", "consistent with", "diagnos\*"). Any match replaces the entire reply with a safe response and logs the event — the model cannot route around this.
+### Emergency detection
 
-**validate_node** is a silent routing gate between phase transitions. It checks required fields are actually populated before the session advances. Either it passes and routes forward, or routes back to the source phase with a targeted gap message. Never shown to the patient.
+A configurable phrase list loaded from the database with a 60-second TTL — phrases can be added via the admin panel without a server restart. Matching applies negation guards ("I don't have chest pain"), historical guards ("had chest pain years ago"), and reactivation detection ("stopped but came back").
 
----
+**There is no LLM fallback for emergency detection.** Phrases not in the list won't fire. This is a known gap — "significant difficulty breathing" would miss if "significant" isn't how the list is phrased. Adding an LLM tier matching the crisis architecture is the right fix.
 
-## Patient experience
+| Kind | Trigger | Input after detection |
+|---|---|---|
+| `crisis` | Suicidal/self-harm language (LLM or phrase) | Stays enabled — patient can keep typing |
+| `emergency` | Emergency phrase match | Disabled — session ends |
+| `identity_review` | Returning patient details mismatch | Normal — escalation is background |
+| `human_review` | SafetyChecker score above threshold | Normal — report flagged for clinician sign-off |
 
-**Corrections anywhere** — a patient can change any previously given answer at any phase, including from the confirm screen. Corrections route directly to the named step without resetting anything else. If the patient says "go back" without specifying what, the system shows a short menu.
+### SafetyChecker preflight
 
-**Returning patients** — the prior summary (allergies, conditions, medications, last five complaints, crisis flags) is injected into the identity review prompt. Returning patients get a warm acknowledgment, not a raw comparison table. Clinical history questions are phrased as "anything new?" — "no" preserves the prior record. Crisis flags never drop between visits.
+Runs before report generation. Hard blocks prevent the note from being written: missing chief complaint, missing patient name, clinical history marked incomplete. Review signals raise the score without blocking alone — active emergency flag, crisis detected, identity unverified, OPQRST completeness below threshold. Reports above the review threshold get `X-Pending-Review: true` on the FHIR endpoint so a consuming EHR knows it needs sign-off.
 
-**Voice** — the mic button sends audio to `POST /transcribe` (Groq Whisper), which returns a transcript. A hallucination filter rejects empty transcripts or ones matching known Whisper hallucination phrases ("Thanks for watching"). The browser then posts the transcript to `POST /chat` — voice goes through the exact same pipeline as typed input. On identity and clinical history turns a confirm strip appears so the patient can review before submitting, since Whisper commonly mistranscribes phone numbers and medication names.
+### Output guardrails
 
-**Quick replies** at binary-gate phases (consent, identity review, confirm) — the API response includes labelled buttons. Selections bypass intent classification and go directly to the graph.
-
-**Quality retry loop** — if OPQRST completeness is below threshold, the system asks one targeted gap-fill for the specific missing field. After two retries the session advances. 
-
-**Dosage follow-up** — if medications are given without dosage, the system asks once with warm phrasing. If the patient says they don't know, accepted on the second attempt. No third ask.
+Every LLM reply goes through `validate_llm_response()` before the patient sees it. Six regex patterns catch diagnosis language ("you have X", "consistent with", "this indicates"). A match replaces the entire reply with a safe response and logs the event.
 
 ---
 
-## Architecture
+## Storage
 
-When a message comes in it hits the FastAPI layer first. Before the graph is invoked:
-- Session token checked
-- Prompt injection filter (regex blocks "ignore previous instructions", "you are now a", etc.)
-- Circuit breaker checked — if open, returns a "try again shortly" message without touching the LLM
-- Max session turns checked
-- Per-session cost cap checked against cumulative LLM spend for the thread
+Two SQLite files in WAL mode:
 
-If all pass, `graph.invoke()` is called. Every message enters through `guard_node` first, then routes to the current phase node based on `current_phase` in state. After each patient-facing node the graph pauses (LangGraph `interrupt_after`) and the API returns the reply. State is checkpointed to `checkpoints.db` after every node.
+**`app.db`** — everything the application owns: sessions, messages, reports, escalations, LLM usage, webhook delivery log, dead-letter records, patient memory summaries, emergency phrases, prompt experiment assignments, idempotency cache.
 
-**LLM pipeline** — three levels of degradation per call so the session always continues:
+**`checkpoints.db`** — LangGraph's internal graph state only. Kept separate because LangGraph's internal schema changes with library upgrades and shouldn't require coordinating with application migrations. This is what enables session resumption — every node write is checkpointed here, so a server restart mid-intake is transparent to the patient.
+
+SQLite connections are per-thread, opened lazily on first use. `PRAGMA journal_mode=WAL` and `PRAGMA busy_timeout=10000` are set on every connection. This handles concurrent reads fine; concurrent writes start contending around 50 sessions. PostgreSQL is the path forward when you need scale.
+
+---
+
+## LLM pipeline
+
+Every LLM call goes through `run_json_step()` which handles the full degradation chain:
 
 ```
-Level 1: Primary call → JSON extract → Pydantic schema validation
-              ↓ (validation fails)
-Level 2: Repair call — sends the exact validation error back to the model
-              ↓ (repair also fails, or primary call failed entirely)
-Level 3: Hardcoded fallback dict — session continues, failure logged
+Level 1 — Primary call: prompt → LLM → JSON parse → Pydantic validation
+           ↓ (parse fails or validation fails)
+Level 2 — Repair call: sends the validation error back to the model for one retry
+           ↓ (repair also fails, or primary call failed entirely)
+Level 3 — Hardcoded fallback dict: session continues, failure logged
 ```
 
-The circuit breaker tracks consecutive LLM failures. After five it opens; `/chat` returns a brief message without spending a token. After 60 seconds it moves to HALF_OPEN, lets one probe through, closes on success.
+Repair only runs on parse/validation failures — if the API call itself fails (timeout, auth error), the fallback is used immediately. Trying to repair an empty response wastes a token and always fails.
 
-Every LLM call goes through the `LLMProvider` interface. Current implementation is `GeminiProvider` (Gemini Flash). Swapping backends means implementing one class and calling `set_provider()`. The circuit breaker, retry logic, cost accounting, and logging all work against the interface, not the implementation.
+The circuit breaker (`CircuitBreaker` in `app/llm/circuit_breaker.py`) wraps all LLM calls. After 5 consecutive failures it opens; `/chat` returns a brief error without spending a token. After 60 seconds it moves to half-open, lets one probe through, and closes on success. Both thresholds are configurable in `settings.py`.
 
-**Storage** — two SQLite files in WAL mode:
-- `app.db` — sessions, messages, reports, escalations, patient memory, LLM usage, webhook deliveries, idempotency cache, emergency phrases, prompt experiments
-- `checkpoints.db` — LangGraph's internal graph state only. Kept separate because LangGraph's internal schema changes with library upgrades and shouldn't require coordinating with application migrations.
+The `LLMProvider` interface (`app/llm/base.py`) abstracts the backend. The current implementation is `GeminiProvider` (Gemini Flash). Swapping backends means implementing the interface and calling `set_provider()` — the circuit breaker, degradation logic, cost accounting, and token tracking all sit above the interface and work unchanged.
 
 ---
 
-## Design decisions
+## Design decisions worth explaining
 
-**Fixed state machine, not an agent** — LangGraph gives a fixed, auditable node sequence. The LLM operates inside each node and extracts structured information from what the patient said. It has no ability to decide which node runs next, skip phases, or override safety checks. Every routing decision is Python code — testable and auditable in a way that prompt-based routing is not.
+**Two SQLite files.** LangGraph's checkpoint schema changes with library upgrades. If it's in `app.db` alongside application migrations, a library upgrade becomes a database migration problem. Keeping them separate means LangGraph can be upgraded by dropping and recreating `checkpoints.db` — you lose in-flight sessions but not reports or patient data.
 
-**Intake classification in the same call as symptom extraction** — visit type is extracted in the same LLM call as the chief complaint, not a separate call. This drives two things downstream: clinical history question phrasing per (step, classification) pair, and the OPQRST completeness threshold (0.75 for ED, 0.60 for clinic).
+**Repair call only on parse failure, not API failure.** This is easy to get wrong. If the API times out, there's no response to repair — a repair call will also time out. The repair call is only useful when the model returned something but it failed schema validation. The runner checks `llm_ok` explicitly before deciding whether to attempt repair.
 
-**Deterministic OPQRST quality scoring** — completeness is a weighted formula, no LLM involved. Each field has an assigned weight; the scorer returns a 0–1 value. Gap-fill questions are built deterministically from the first missing field in priority order. The threshold is easy to audit and the retry path has no LLM cost.
+**Idempotency on `/chat` uses key plus body hash.** The browser sends a `client_msg_id` with each message. On a cache hit, the system also compares a SHA-256 hash of the message body. Same `client_msg_id` + different body → 409. This lets the browser safely retry on network timeout without worrying about a different message being associated with the same key accidentally.
 
-**Two-tier detection for intent and crisis** — same pattern for both. Deterministic first pass (regex/keyword) handles obvious cases at zero cost. LLM brought in only when the first pass is inconclusive. Safety-critical logic stays in code.
+**Classification in the same call as symptom extraction.** Visit type (emergency/routine/specialist/mental health/pediatric) is extracted in the same LLM call as chief complaint and OPQRST, not a separate call. The classification drives question phrasing downstream (clinical history questions are different for mental health vs pediatric) and sets the OPQRST completeness threshold. Doing it in one call keeps latency down and ensures the classification always has the symptom context.
 
-**Cross-visit memory with field-level merge rules** — memory merges per field type rather than a whole replace: allergies and conditions union across visits (they don't go away), medications replace each visit (patients start and stop them), last five chief complaints as a rolling list, crisis flags never drop.
+**The guard_node "once-set" behaviour.** When `crisis_detected` is already `True`, `guard_node` skips re-running detection and returns the safety response immediately. Detection runs exactly once — the first time the flag is set. This is important: it means a patient cannot send a later message that somehow routes around the flag, and it means repeated safety responses don't make additional escalation entries.
 
-**System-prompt caching** — per-schema-type cache registry in `GeminiProvider`, 55-minute client TTL, SHA-256 hash invalidation on prompt change. None of the current prompts clear Gemini's 2,048-token minimum so the code path is built but not yet active.
-
-**Session resumption** — no cookies. `/start` returns a `thread_id` (UUID) and a `session_token` (random 64-char hex). The browser stores both in localStorage. Every `/chat` call sends `thread_id` in the form body and `session_token` in the Authorization header. State is never held in memory — after every node LangGraph writes the full graph state to `checkpoints.db`. On the next `/chat` call it passes the thread_id back and LangGraph picks up exactly where it left off. A server restart between two patient messages is transparent.
-
-`GET /resume/{thread_id}` is for browser refreshes — reads from `app.db`, not checkpoints.db, and returns the current phase and a short context message without invoking the graph.
-
-**Idempotent outbound webhooks** — SHA-256 hash of the payload as the idempotency key so the same FHIR bundle is never delivered twice. Exhausted deliveries go to a dead-letter record for manual replay.
-
-**Permanent vs transient error classification** — the circuit breaker distinguishes permanent errors (bad API key, auth failure) from transient ones (timeout, 503). Permanent errors fast-fail immediately and open the breaker — retrying an auth failure is pointless and burns time. Transient errors retry with exponential backoff and random jitter before failing. This prevents the breaker from opening on a single network hiccup while still catching a genuinely broken provider.
-
-**Report node runs synchronously** — `patient.py` checks `if phase == "report"` and runs `_run_report_inline()` in the same `/chat` request rather than backgrounding it. The patient gets the complete clinician note back in the same response that triggered report generation. Backgrounding it would require either polling or a server-push mechanism.
-
-**Skip-ahead after corrections in clinical history** — `_next_clinical_step_needed()` walks the step order forward from the corrected step and returns the first step whose state field is still `None`. It only re-asks unanswered steps. This is what prevents re-asking medications after a patient corrects allergies — the answered fields are still in state and are skipped over.
-
-**Incoming `/chat` idempotency — key plus hash** — `/chat` takes a `client_msg_id` from the browser. On a cache hit, it also compares a SHA-256 hash of the message body. If the same `client_msg_id` arrives with a different message, it returns 409 rather than silently returning the cached response for the wrong message. A client can safely retry on network timeout; it cannot use the same key to substitute a different message.
-
-**Repair call only fires on parse failure, not API failure** — if the LLM API call fails entirely (timeout, error), repair is skipped and the session goes straight to the hardcoded fallback. Repair only runs when the model returned a response but the JSON failed schema validation. Trying to repair an empty or error response wastes a token and always fails.
-
-**Guard node once-set behaviour** — when `crisis_detected` is already `true` in state, guard_node skips re-running detection and immediately returns the safety message and routes to handoff. Detection logic runs once — the first time the flag is set — and subsequent messages are a simple state read. A later message cannot clear the flag or route around it.
+**Permanent vs transient error classification in the circuit breaker.** Auth failures (bad API key, 403) open the breaker immediately and don't retry — retrying a bad API key is pointless and burns time. Timeouts and 503s use exponential backoff with jitter before counting as a failure. This prevents a single network hiccup from opening the breaker while still catching a genuinely down provider.
 
 ---
 
-## Operations
+## Known gaps and pending work
 
-**Health endpoints:**
-- `GET /health` — always 200, for process supervisors
-- `GET /ready` — 503 if SQLite is unreachable, the graph failed to compile, or the circuit breaker is open. Use this for load balancer readiness checks.
-
-All log events pass through `log_event()` which runs PHI redaction before writing to stdout. Names, DOBs, and phone numbers are replaced with `[REDACTED]`.
-
-**Admin panel** (`/admin/*`, requires clinician JWT):
-- `GET /admin/analytics` — LLM cost today, average per session, primary/repair/fallback rates, cache hit rate, circuit breaker state, last 7 days
-- `GET/POST/DELETE /admin/emergency-phrases` — live phrase management; changes take effect within 60 seconds via the TTL cache, no server restart needed
-- `GET /admin/webhooks` — webhook delivery log, per-entry retry counts and HTTP status
-- `POST /admin/demo/reset` — wipe all session data and re-seed mock EHR patients
-- `GET/POST/PATCH /admin/experiments` — prompt A/B experiment management
-
-**Clinician dashboard** (`/clinician/*`, requires clinician JWT):
-- `POST /clinician/token` — exchange the clinician password for a short-lived JWT; only endpoint that doesn't require a prior token
-- `GET /clinician/pending` — all unresolved escalations across all sessions
-- `POST /clinician/resolve` — mark resolved, attach nurse note, session returns to active
-- `GET /clinician/case/{thread_id}` — full transcript, clinician note, all escalations with reasons and safety score
-- `GET /clinician/report/{thread_id}/fhir` — FHIR R4 bundle as `application/fhir+json`; includes `X-Pending-Review: true` header if the report needs clinician sign-off before EHR ingestion
-
----
-
-## Limitations and future work
-
-**What the system cannot do:**
-- No physical examination, vital signs, diagnostic tests, or prescriptions
-- Does not provide a diagnosis — output is clinical description language only
-- SQLite is single-instance; contention begins at ~50 concurrent sessions
-- Standard Gemini API is not HIPAA BAA eligible — Vertex AI required for a covered deployment
-- Drug name normalisation (RxNorm) is stubbed — strips whitespace only
-- Single clinician password, no role separation (nurse, physician, admin)
-
-**Production path:**
-- Replace SQLite with PostgreSQL, swap `SqliteSaver` for LangGraph's `PostgresSaver`
-- Vertex AI for HIPAA eligibility
-- Wire `normalize_drug_name()` to the RxNorm API
-- Send session links via SMS or email so resumption works across devices
-- Role-based access with scoped JWT claims
-- Appointment scheduling integration so the clinician note is available before the visit
+- Emergency detection needs an LLM tier matching the crisis architecture (phrase list + LLM fallback, not phrase list alone)
+- `identity_review_node` has no retry cap — a patient sending garbage responses will loop forever; it needs a `review_attempts` counter with a graceful exit
+- Clinical history steps (allergies, meds, PMH, results) have no per-step retry cap; a patient giving persistently unclear responses is stuck
+- System-prompt caching is implemented in `GeminiProvider` but not active — current prompts don't clear Gemini's 2,048-token minimum for cache eligibility
+- RxNorm normalisation is stubbed
