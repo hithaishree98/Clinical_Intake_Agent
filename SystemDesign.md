@@ -170,7 +170,6 @@ The `LLMProvider` interface (`app/llm/base.py`) abstracts the backend. The curre
 ## Known gaps and pending work
 
 - Emergency detection needs an LLM tier matching the crisis architecture (phrase list + LLM fallback, not phrase list alone)
-- `identity_review_node` has no retry cap — a patient sending garbage responses will loop forever; it needs a `review_attempts` counter with a graceful exit
 - Clinical history steps (allergies, meds, PMH, results) have no per-step retry cap; a patient giving persistently unclear responses is stuck
 - System-prompt caching is implemented in `GeminiProvider` but not active — current prompts don't clear Gemini's 2,048-token minimum for cache eligibility
 - RxNorm normalisation is stubbed
