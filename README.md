@@ -36,7 +36,7 @@ LLM abstraction layer (app/llm/)
 SQLite
     app.db         — sessions · messages · reports · escalations
                      llm_usage · webhook_deliveries · patient_summary
-                     idempotency · prompt_experiments · emergency_phrases
+                     idempotency · emergency_phrases
     checkpoints.db — LangGraph graph state (kept separate)
     ↓ hourly background loop
 Slack alerts (crisis) · HMAC-signed FHIR R4 webhook → EHR
