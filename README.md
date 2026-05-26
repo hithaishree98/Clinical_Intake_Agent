@@ -4,30 +4,43 @@ A conversational intake agent for clinical settings. The patient types or speaks
 
 ## Problem
 
-Clinical intake today is a paper form or a dropdown tablet. Neither produces structured output an EHR can actually ingest, and neither can detect mid-conversation that a patient is describing a cardiac event.
-
-I wanted to fix that but not by just handing everything to an LLM. An LLM alone will skip allergies, mark intake complete while required fields are missing, and treat an escalation as a routine follow-up. In healthcare those aren't acceptable failure modes. So the architecture is specifically designed to prevent them: the LLM handles language understanding and extraction. A fixed state machine controls flow, phase transitions, and safety checks.
+I wanted to build an intake agent that collects information from patient in natural language and navigates the state machine to produce a clinical note with enough structured information filled in for clinical review. Handed entirely to an LLM, this fails in ways healthcare can't tolerate: it skips allergies, marks intake complete while required fields are empty, or treats an escalation as a routine follow-up. The architecture is built to prevent exactly these failures. The LLM does only what it's good at understanding language and extracting structured data. A fixed state machine owns everything safety-critical: flow, phase transitions, and required-field and escalation checks.
 
 ## Architecture Overview
 
-I used LangGraph to build a fixed state machine, each phase of intake is a separate node with a single job. The LLM runs inside each node but has no control over flow, phase transitions, or safety checks. Those are all code.
+LangGraph drives a fixed state machine — each intake phase is a separate node with one job. The LLM runs inside each node but has no control over flow, phase transitions, or safety checks. Those are all deterministic code.
 
 ```
-Browser / Voice
+Browser / Voice (Groq Whisper STT, optional)
     ↓
-FastAPI — rate limiting · authentication · input validation
-         · cost cap · circuit breaker
+FastAPI — rate limiting (slowapi) · session-token + JWT auth
+         · idempotency check · per-session cost cap · CORS
     ↓
-LangGraph state machine — checkpointed to SQLite after every node
-    ├── guard_node — crisis + emergency screen, runs before every node
-    ├── consent → identity → identity_review → subjective
-          → clinical_history → confirm → report
-    └── handoff_node — reached on crisis or emergency; directs to 988 or 911
+guard_node — runs transparently before every node
+    ├── Tier 1: regex against emergency_phrases table (60 s cache)
+    └── Tier 2: LLM crisis scorer (CrisisScore schema)
+             → on crisis: escalation row + Slack webhook → handoff_node → END
     ↓
-SQLite — app.db (sessions, reports, escalations, LLM usage, webhooks, patient memory)
-       — checkpoints.db (LangGraph graph state, kept separate)
-    ↓ background threads
-Slack alerts · HMAC-signed FHIR webhook
+LangGraph state machine (IntakeState, SQLite-checkpointed)
+    consent → identity → identity_review → subjective
+           → validate_node (quality gate, no interrupt)
+           → clinical_history → confirm → report → END
+    └── handoff_node — crisis / emergency; directs patient to 988 or 911
+    ↓
+LLM abstraction layer (app/llm/)
+    provider call → retry → JSON extract → Pydantic validate
+                 → repair prompt → hardcoded fallback
+    circuit breaker — opens after 5 failures, 60 s recovery
+    prompt cache    — Gemini CachedContent, 55-min TTL
+    ↓
+SQLite
+    app.db         — sessions · messages · reports · escalations
+                     llm_usage · webhook_deliveries · patient_summary
+                     idempotency · prompt_experiments · emergency_phrases
+    checkpoints.db — LangGraph graph state (kept separate)
+    ↓ hourly background loop
+Slack alerts (crisis) · HMAC-signed FHIR R4 webhook → EHR
+    dead-letter retry with exponential backoff (2 s → 8 s → 30 s)
 ```
 
 ## Flow
