@@ -11,14 +11,14 @@ I wanted to build an intake agent that collects information from patient in natu
 LangGraph drives a fixed state machine, each intake phase is a separate node with one job. The LLM runs inside each node but has no control over flow, phase transitions, or safety checks. Those are all deterministic code.
 
 ```
-Browser / Voice (Groq Whisper STT, optional)
+Browser / Voice (Groq Whisper STT)
     ↓
-FastAPI — rate limiting (slowapi) · session-token + JWT auth
-         · idempotency check · per-session cost cap · CORS
+FastAPI — rate limiting · session-token + auth
+         · idempotency check · per-session cost cap 
     ↓
 guard_node — runs transparently before every node
-    ├── Tier 1: regex against emergency_phrases table (60 s cache)
-    └── Tier 2: LLM crisis scorer (CrisisScore schema)
+    ├── Tier 1: regex against emergency_phrases table 
+    └── Tier 2: LLM crisis scorer 
              → on crisis: escalation row + Slack webhook → handoff_node → END
     ↓
 LangGraph state machine (IntakeState, SQLite-checkpointed)
