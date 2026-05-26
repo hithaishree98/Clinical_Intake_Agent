@@ -31,7 +31,7 @@ LLM abstraction layer (app/llm/)
     provider call → retry → JSON extract → Pydantic validate
                  → repair prompt → hardcoded fallback
     circuit breaker — opens after 5 failures, 60 s recovery
-    prompt cache    — Gemini CachedContent, 55-min TTL
+    prompt cache    — Gemini CachedContent
     ↓
 SQLite
     app.db         — sessions · messages · reports · escalations
