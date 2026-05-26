@@ -8,7 +8,7 @@ I wanted to build an intake agent that collects information from patient in natu
 
 ## Architecture Overview
 
-LangGraph drives a fixed state machine — each intake phase is a separate node with one job. The LLM runs inside each node but has no control over flow, phase transitions, or safety checks. Those are all deterministic code.
+LangGraph drives a fixed state machine, each intake phase is a separate node with one job. The LLM runs inside each node but has no control over flow, phase transitions, or safety checks. Those are all deterministic code.
 
 ```
 Browser / Voice (Groq Whisper STT, optional)
